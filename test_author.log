@@ -1,0 +1,13 @@
+PIPELINE_TRANSPORT_NUM_CTX is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_NUM_CTX instead.
+PIPELINE_TRANSPORT_TEMPERATURE is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_TEMPERATURE instead.
+PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_MAX_STEPS instead.
+[boot] pid=25308 model=deepseek-v4.1-flash:cloud endpoint=http://localhost:11434 provider=ollama steps=120 timeout=8100.0s
+[step 0] bash: pwd && git status --short && git log --oneline -3 && ls
+[step 0] view_file: relay/src/store.rs
+[step 1] bash: ls relay relay/src relay/tests && cat relay/Cargo.toml && cat relay/src/lib.rs 2>/dev/null | head -40
+[step 1] view_file: relay/tests/store_forward_ttl.rs
+[step 2] bash: grep -n "RelayStore\|store::" relay/src/ws.rs | head -20; echo ---; grep -rn "Mailbox" --include=*.rs . | head
+[step 3] create_file: relay/tests/mailbox_queue.rs
+   [off-task nudge: relay/tests/mailbox_queue.rs not in assigned scope]
+[step 4] str_replace: relay/tests/mailbox_queue.rs
+   [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
