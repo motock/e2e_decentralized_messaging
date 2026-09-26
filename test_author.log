@@ -45,3 +45,5 @@ PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only v
    [churn nudge: 12+ edits to relay/tests/mailbox_queue.rs with no test run]
 [step 19] str_replace: relay/tests/mailbox_queue.rs
    [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
+[step 19] str_replace: relay/tests/mailbox_queue.rs
+   [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]

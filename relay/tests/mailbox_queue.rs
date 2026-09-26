@@ -256,6 +256,9 @@ fn relay_store_and_store_error_are_unchanged() {
         "pub fn count(",
         "pub fn has_method(",
     ] {
-        assert!(src.contains(needle), "store.rs must keep `{needle}` (prekey bundles depend on it)");
+        assert!(
+            src.contains(needle),
+            "store.rs must keep `{needle}` (prekey bundles depend on it)"
+        );
     }
 }
