@@ -15,3 +15,10 @@ PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only v
 [step 6] bash: wc -l relay/tests/mailbox_queue.rs; echo ---; cargo test -p relay --locked --test store_forward_ttl --test ws_bridge 2>&
 [step 7] str_replace: relay/tests/mailbox_queue.rs
    [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
+[step 8] bash: wc -l relay/tests/mailbox_queue.rs; cargo test -p relay --locked --test mailbox_queue 2>&1 | grep -E "^error|no \`Mailbo
+[step 9] bash: git show --stat --oneline HEAD | head
+[step 10] bash: git log --oneline -4; echo ---; git show --stat HEAD~1 | head; echo ---; git show HEAD | head -40; echo ---; ls .git/hoo
+[step 11] bash: git commit --amend -q -m "test(relay): add FIFO Mailbox queue acceptance tests (red)" -- relay/tests/mailbox_queue.rs 2>
+[step 12] bash: git show HEAD:relay/tests/mailbox_queue.rs | wc -l; git show HEAD:relay/tests/mailbox_queue.rs | grep -c "fn "; echo ---
+[step 13] str_replace: relay/tests/mailbox_queue.rs
+   [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
