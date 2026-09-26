@@ -226,7 +226,9 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
 #[test]
 fn mailbox_exposes_only_new_enqueue_and_dequeue() {
     let src = include_str!("../src/store.rs");
-    let start = src.find("impl Mailbox {").expect("impl Mailbox block must exist");
+    let start = src
+        .find("impl Mailbox {")
+        .expect("impl Mailbox block must exist");
     let rest = &src[start..];
     let end = rest.find("\n}").expect("impl Mailbox must be closed");
     let mut names: Vec<&str> = rest[..end]
