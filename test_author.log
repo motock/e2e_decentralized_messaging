@@ -93,3 +93,12 @@ PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only v
    [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
 [step 33] str_replace: relay/tests/mailbox_queue.rs
    [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
+[step 34] bash: rustfmt --edition 2021 --check relay/tests/mailbox_queue.rs && echo "FMT CLEAN"; wc -l relay/tests/mailbox_queue.rs; ech
+[step 35] bash: git add relay/tests/mailbox_queue.rs && git commit -q -m "test(relay): add FIFO Mailbox queue acceptance tests (red)" --
+[step 36] bash: git diff HEAD --stat -- relay/tests/mailbox_queue.rs; echo "diff-empty-means-committed"; git show HEAD:relay/tests/mailb
+[step 37] bash: git commit --amend -q -m "test(relay): add FIFO Mailbox queue acceptance tests (red)" 2>&1 | tail -2; git log --oneline 
+[step 38] bash: git show --stat HEAD | tail -5; echo "=== final red confirmation ==="; cargo test -p relay --locked --test mailbox_queue
+[step 39] bash: git status --short; echo "--- HEAD ---"; git log --oneline -1; echo "--- committed test file ---"; git show HEAD:relay/t
+   [read-heavy nudge: 6 reads in a row]
+[step 40] done rejected — worktree dirty, asking agent to commit
+[step 41] bash: git diff --stat; git add -A && git commit -q -m "chore: record test-authoring run log" && git status --short && git log 
