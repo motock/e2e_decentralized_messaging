@@ -160,9 +160,16 @@ fn mailbox_error_is_debug_and_partial_eq() {
 #[test]
 fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
     let src = include_str!("../src/store.rs");
-    let store_at = src.find("pub struct RelayStore").expect("RelayStore stays in store.rs");
-    let mailbox_at = src.find("pub struct Mailbox ").expect("Mailbox must be in store.rs");
-    assert!(mailbox_at > store_at, "Mailbox must be defined below RelayStore");
+    let store_at = src
+        .find("pub struct RelayStore")
+        .expect("RelayStore stays in store.rs");
+    let mailbox_at = src
+        .find("pub struct Mailbox ")
+        .expect("Mailbox must be in store.rs");
+    assert!(
+        mailbox_at > store_at,
+        "Mailbox must be defined below RelayStore"
+    );
 
     // Walk back over attribute/blank lines to the doc comment block.
     let mut preceding = src[..mailbox_at]
@@ -170,11 +177,18 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
         .rev()
         .skip_while(|l| l.trim_start().starts_with("#[") || l.trim().is_empty());
     assert!(
-        preceding.next().unwrap_or("").trim_start().starts_with("///"),
+        preceding
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("///"),
         "Mailbox must carry a doc comment explaining why it exists next to RelayStore"
     );
 
-    assert!(src.contains("pub enum MailboxError"), "MailboxError must be public");
+    assert!(
+        src.contains("pub enum MailboxError"),
+        "MailboxError must be public"
+    );
     assert!(
         src.contains("pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT"),
         "DEFAULT_MAX_ENVELOPES_PER_RECIPIENT must be a public const"
