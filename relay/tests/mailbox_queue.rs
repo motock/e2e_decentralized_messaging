@@ -240,6 +240,12 @@ fn relay_store_store_error_and_ws_rs_are_unchanged() {
 
     // This story must not switch ws.rs call sites over to Mailbox.
     let ws = include_str!("../src/ws.rs");
-    assert!(!ws.contains("Mailbox"), "ws.rs must not reference Mailbox yet");
-    assert!(ws.contains("RelayStore"), "ws.rs must keep using RelayStore");
+    assert!(
+        !ws.contains("Mailbox"),
+        "ws.rs must not reference Mailbox yet"
+    );
+    assert!(
+        ws.contains("RelayStore"),
+        "ws.rs must keep using RelayStore"
+    );
 }
