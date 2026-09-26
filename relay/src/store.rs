@@ -105,6 +105,9 @@ pub enum MailboxError {
 /// provides that queue, bounded to `max_depth` live envelopes per recipient.
 pub struct Mailbox {
     max_depth: usize,
+    // The storage type is pinned verbatim by relay/tests/mailbox_queue.rs, so
+    // the complexity lint is silenced instead of aliasing the type away.
+    #[allow(clippy::type_complexity)]
     queues: Mutex<HashMap<String, VecDeque<(Vec<u8>, Instant)>>>,
 }
 
