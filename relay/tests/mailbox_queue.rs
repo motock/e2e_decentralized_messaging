@@ -1,11 +1,9 @@
 //! FIFO mailbox queueing for offline recipients (`relay::store::Mailbox`).
 //!
-//! The single-slot `RelayStore` silently overwrites a pending envelope when a
-//! second message arrives for an offline recipient. `Mailbox` is the bounded,
-//! per-recipient FIFO counterpart: arrival order is preserved, the depth cap is
-//! enforced without evicting older envelopes, and expired entries are dropped.
-//!
-//! Envelope bytes are opaque here: the tests only ever compare them for equality.
+//! `RelayStore` is single-slot: a second envelope for an offline recipient
+//! overwrites the first. `Mailbox` is the bounded per-recipient FIFO
+//! counterpart — arrival order preserved, depth cap enforced without evicting
+//! older envelopes, expired entries dropped. Envelope bytes stay opaque here.
 
 use relay::store::{Mailbox, MailboxError, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT};
 use std::time::Duration;
