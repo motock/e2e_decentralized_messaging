@@ -23,9 +23,15 @@
 //! - `{"op":"lookup_prekey","recipient_id":"..."}`
 //!   → `{"ok":true,"bundle":"<base64>"}` or `{"ok":false,"error":"NotFound"}`
 //! - `{"op":"send_envelope","recipient_id":"...","envelope":"<base64>","challenge_id":"<hex>","pow_solution":"<base64>"}`
-//!   → `{"ok":true}` or `{"ok":false,"error":"..."}`
+//!   → `{"ok":true}` or `{"ok":false,"error":"..."}`. Envelopes are queued FIFO per
+//!   recipient, up to a per-recipient cap; when the cap is reached the send is rejected
+//!   with `{"ok":false,"error":"QueueFull"}` and queued envelopes are never dropped to
+//!   make room.
 //! - `{"op":"pickup_envelope","recipient_id":"..."}`
-//!   → `{"ok":true,"envelope":"<base64>"}` or `{"ok":false,"error":"NotFound|Expired"}`
+//!   → `{"ok":true,"envelope":"<base64>"}` or `{"ok":false,"error":"NotFound|Expired"}`.
+//!   Returns and removes the OLDEST queued envelope, one per call; `NotFound` when the
+//!   queue is empty, and `Expired` once when only expired envelopes remained (they are
+//!   discarded, so the next call reports `NotFound`).
 //!
 //! The PoW challenge is issued out-of-band: the relay exposes a `challenge` op that
 //! returns the challenge wire bytes (see `pow::Challenge::to_wire`). The browser solves
@@ -57,7 +63,9 @@ use tracing::{info, warn};
 
 use crate::pow::{self, Challenge, PowError};
 use crate::ratelimit::{RateLimitError, RateLimiter};
-use crate::store::{RelayStore, StoreError};
+use crate::store::{
+    Mailbox, MailboxError, RelayStore, StoreError, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT,
+};
 
 /// Default TTL for stored prekey bundles (24h).
 const DEFAULT_PREKEY_TTL: Duration = Duration::from_secs(86400);
@@ -70,7 +78,7 @@ const POW_CONTEXT: &[u8] = b"ws-relay-v1";
 
 /// Shared state for the WS listener: the store, rate limiter, and active PoW challenges.
 struct WsState {
-    store: RelayStore,
+    store: Mailbox,
     /// Prekey bundles are stored separately from envelopes so lookup_prekey doesn't
     /// collide with pickup_envelope. We use a second RelayStore keyed by a prefix.
     prekeys: RelayStore,
@@ -82,7 +90,7 @@ struct WsState {
 impl WsState {
     fn new(rate_limit_per_minute: u32) -> Self {
         Self {
-            store: RelayStore::new(),
+            store: Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
             prekeys: RelayStore::new(),
             rate_limiter: Mutex::new(RateLimiter::per_identity(rate_limit_per_minute)),
             challenges: Mutex::new(std::collections::HashMap::new()),
@@ -296,6 +304,17 @@ fn truncate_id(id: &str) -> String {
     }
 }
 
+/// Map a [`MailboxError`] from `enqueue` to a WS error response.
+///
+/// A full queue is a distinct, non-retryable condition for the sender, so it gets
+/// its own error string rather than being folded into the generic `StoreError` form.
+fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
+    match e {
+        MailboxError::QueueFull => WsResponse::err("QueueFull"),
+        other => WsResponse::err(format!("StoreError: {other:?}")),
+    }
+}
+
 /// Handle a single WS request against the shared state.
 ///
 /// This is the security-critical path: PoW and rate-limit gates are enforced here
@@ -428,16 +447,22 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 );
                 return WsResponse::err(format!("PowFailed: {e}"));
             }
-            // 3. Store the envelope (blind — relay never inspects contents)
+            // 3. Queue the envelope (blind — relay never inspects contents)
             let envelope_bytes = match b64_decode(&envelope) {
                 Ok(b) => b,
                 Err(e) => return WsResponse::err(format!("InvalidBase64: {e}")),
             };
             if let Err(e) = state
                 .store
-                .store(&recipient_id, envelope_bytes, DEFAULT_ENVELOPE_TTL)
+                .enqueue(&recipient_id, envelope_bytes, DEFAULT_ENVELOPE_TTL)
             {
-                return WsResponse::err(format!("StoreError: {e:?}"));
+                if matches!(&e, MailboxError::QueueFull) {
+                    warn!(
+                        recipient = %truncate_id(&recipient_id),
+                        "ws: envelope queue full on send_envelope"
+                    );
+                }
+                return mailbox_send_error_response(e);
             }
             info!(recipient = %truncate_id(&recipient_id), "ws: envelope stored");
             WsResponse::ok_simple()
@@ -456,10 +481,11 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     return WsResponse::err("RateLimitExceeded");
                 }
             }
-            match state.store.pickup(&recipient_id) {
+            match state.store.dequeue(&recipient_id) {
                 Ok(envelope_bytes) => WsResponse::ok_envelope(b64_encode(&envelope_bytes)),
-                Err(StoreError::NotFound) => WsResponse::err("NotFound"),
-                Err(StoreError::Expired) => WsResponse::err("Expired"),
+                Err(MailboxError::NotFound) => WsResponse::err("NotFound"),
+                Err(MailboxError::Expired) => WsResponse::err("Expired"),
+                Err(e) => WsResponse::err(format!("StoreError: {e:?}")),
             }
         }
     }
@@ -988,5 +1014,36 @@ mod tests {
         // Length not a multiple of 4 is invalid.
         let result = b64_decode("ABC");
         assert!(result.is_err(), "bad length must be rejected");
+    }
+
+    #[test]
+    fn mailbox_send_error_response_maps_queue_full_distinctly() {
+        // A full queue must surface as its own error string, not the generic
+        // StoreError form, so the sender can distinguish "backlog full" from a
+        // storage failure.
+        match mailbox_send_error_response(MailboxError::QueueFull) {
+            WsResponse::Err { ok, error } => {
+                assert!(!ok, "QueueFull must be an error response");
+                assert_eq!(
+                    error, "QueueFull",
+                    "QueueFull must map to the distinct QueueFull error string"
+                );
+            }
+            other => panic!("expected an error response, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mailbox_send_error_response_folds_other_variants_into_store_error() {
+        match mailbox_send_error_response(MailboxError::NotFound) {
+            WsResponse::Err { ok, error } => {
+                assert!(!ok, "non-QueueFull must be an error response");
+                assert!(
+                    error.starts_with("StoreError: "),
+                    "non-QueueFull variants keep the StoreError form, got: {error}"
+                );
+            }
+            other => panic!("expected an error response, got: {other:?}"),
+        }
     }
 }
