@@ -76,7 +76,11 @@ fn queue_accepts_up_to_max_depth_then_rejects_without_dropping() {
     assert_full(mb.enqueue("alice", env(4), LIVE));
 
     for tag in 1..=3u8 {
-        assert_eq!(mb.dequeue("alice").unwrap(), env(tag), "envelope {tag} must survive");
+        assert_eq!(
+            mb.dequeue("alice").unwrap(),
+            env(tag),
+            "envelope {tag} must survive"
+        );
     }
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
