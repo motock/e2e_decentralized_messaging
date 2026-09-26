@@ -249,5 +249,8 @@ fn ws_rs_is_untouched_by_this_story() {
         !ws.contains("Mailbox"),
         "this story must not switch ws.rs call sites to Mailbox"
     );
-    assert!(ws.contains("RelayStore"), "ws.rs must keep using RelayStore for now");
+    assert!(
+        ws.contains("RelayStore"),
+        "ws.rs must keep using RelayStore for now"
+    );
 }
