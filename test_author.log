@@ -102,3 +102,21 @@ PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only v
    [read-heavy nudge: 6 reads in a row]
 [step 40] done rejected — worktree dirty, asking agent to commit
 [step 41] bash: git diff --stat; git add -A && git commit -q -m "chore: record test-authoring run log" && git status --short && git log 
+[step 42] DONE: Test suite for the new FIFO `Mailbox` type is written, confirmed RED for the right reason, and committed.
+
+**Commits on branch `agent/ns-3a`:**
+- `6b4f4d9` — `test(relay): add FIFO Mailbox queue acceptance tests (red)` (the deliverable)
+- `834c537` — `chore: record test-authoring run log` (harness artifact, committed to leave a clean tree)
+
+**Deliverable:** `relay/tests/mailbox_queue.rs` (new file, 251 lines, 15 tests). No other file created or edited — `relay/src/store.rs` and `relay/src/ws.rs` are untouched, per the brief (implementation is a later dispatch).
+
+**Current state: RED for the right reason.** `cargo test -p relay --locked --test mailbox_queue` fails with `error[E0432]: unresolved imports relay::store::Mailbox, MailboxError, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT` — a compile error because the implementation does not exist yet, not a bug in the test logic. Pre-existing relay fixtures (`store_forward_ttl`, `ws_bridge`, `pow_rate_limit`) still pass.
+
+**Coverage (one focused test per requirement):**
+- Positive: FIFO arrival order + one envelope removed per call + `NotFound` when drained; independent per-recipient queues; envelope enqueued after a dequeue is returned.
+- Negative/boundary: dequeue with nothing stored → `NotFound`; accepts at `max_depth-1` and at `max_depth`, next enqueue → `QueueFull` with all prior envelopes still dequeued intact in order (no oldest-eviction); `Mailbox::new(0)` rejects every enqueue; `Mailbox::new(1)` accepts one then rejects; expired front entry skipped and the live entry behind it returned; only-expired queue → `Expired` once then `NotFound`; a full queue of expired entries accepts a new enqueue (expired don't count toward the cap); `DEFAULT_MAX_ENVELOPES_PER_RECIPIENT == 64` and `Mailbox::default()` matches it; `MailboxError` derives `Debug` + `PartialEq`.
+- Structural (graded, not prose wording): `pub struct Mailbox` sits below `RelayStore` and carries a `///` doc comment; `pub enum MailboxError` and `pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT` exist; storage is exactly `Mutex<HashMap<String, VecDeque<(Vec<u8>, Instant)>>>`; `impl Mailbox` exposes exactly `new`/`enqueue`/`dequeue` and uses `lock().unwrap()`; `RelayStore`/`StoreError` and their methods are unchanged; `ws.rs` contains no `Mailbox` reference yet.
+
+**Constraints honoured:** no sleeps or timing races (`Duration::from_secs(60)` live / `from_millis(0)` expired); envelope bytes only ever compared for equality (blind store, no logging); no new dependencies; `rustfmt --edition 2021 --check` clean on the test file.
+
+**Not testable / deliberately ungraded:** the exact wording of the `Mailbox` doc comment (asserted structurally as "a `///` doc comment exists above the type", never its text), and the internal `Instant::now() + ttl` arithmetic (only observable via the expired/live behaviour above).

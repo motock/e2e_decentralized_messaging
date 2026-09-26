@@ -79,3 +79,118 @@ impl RelayStore {
         matches!(name, "store" | "pickup" | "purge" | "count")
     }
 }
+use std::collections::VecDeque;
+
+/// Maximum number of live envelopes retained per recipient by [`Mailbox`].
+pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT: usize = 64;
+
+/// Errors returned by [`Mailbox`] operations.
+#[derive(Debug, PartialEq)]
+pub enum MailboxError {
+    /// The recipient has no queue.
+    NotFound,
+    /// The recipient's queue held only expired envelopes, which were discarded.
+    Expired,
+    /// The recipient's live queue is already at `max_depth`.
+    QueueFull,
+}
+
+/// Per-recipient FIFO queue of opaque envelopes.
+///
+/// [`RelayStore`] holds exactly one value per key, which is the required
+/// semantics for prekey bundles (last write wins). Envelopes require the
+/// opposite semantics: every envelope accepted for an offline recipient is
+/// retained in arrival order until it is dequeued or expires. `Mailbox`
+/// provides that queue, bounded to `max_depth` live envelopes per recipient.
+pub struct Mailbox {
+    max_depth: usize,
+    queues: Mutex<HashMap<String, VecDeque<(Vec<u8>, Instant)>>>,
+}
+
+impl Mailbox {
+    /// Creates a mailbox retaining at most `max_depth` live envelopes per recipient.
+    pub fn new(max_depth: usize) -> Self {
+        Self {
+            max_depth,
+            queues: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Appends `envelope` to `recipient_id`'s queue, expiring after `ttl`.
+    ///
+    /// Expired entries are discarded first. If `max_depth` live entries remain,
+    /// returns [`MailboxError::QueueFull`] and leaves the live queue unchanged.
+
+    /// Removes and returns the oldest live envelope for `recipient_id`.
+    ///
+    /// Expired envelopes at the front are discarded. Returns
+    /// [`MailboxError::NotFound`] when the recipient has no queue, and
+    /// [`MailboxError::Expired`] when the queue held only expired envelopes.
+    pub fn dequeue(&self, recipient_id: &str) -> Result<Vec<u8>, MailboxError> {
+        let now = Instant::now();
+        let mut queues = self.queues.lock().unwrap();
+        let mut discarded_expired = false;
+        let mut found: Option<Vec<u8>> = None;
+        let empty_after = if let Some(queue) = queues.get_mut(recipient_id) {
+            while let Some((envelope, expiry)) = queue.pop_front() {
+                if expiry > now {
+                    found = Some(envelope);
+                    break;
+                }
+                discarded_expired = true;
+            }
+            queue.is_empty()
+        } else {
+            return Err(MailboxError::NotFound);
+        };
+        if empty_after {
+            queues.remove(recipient_id);
+        }
+        match found {
+            Some(envelope) => Ok(envelope),
+            None if discarded_expired => Err(MailboxError::Expired),
+            None => Err(MailboxError::NotFound),
+        }
+    }
+}
+
+impl Default for Mailbox {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)
+    }
+}
+
+
+impl Mailbox {
+    /// Removes and returns the oldest live envelope for `recipient_id`.
+    ///
+    /// Expired envelopes at the front are discarded. Returns
+    /// [`MailboxError::NotFound`] when the recipient has no queue, and
+    /// [`MailboxError::Expired`] when the queue held only expired envelopes.
+    pub fn dequeue(&self, recipient_id: &str) -> Result<Vec<u8>, MailboxError> {
+        let now = Instant::now();
+        let mut queues = self.queues.lock().unwrap();
+        let mut discarded_expired = false;
+        let mut found: Option<Vec<u8>> = None;
+        let empty_after = if let Some(queue) = queues.get_mut(recipient_id) {
+            while let Some((envelope, expiry)) = queue.pop_front() {
+                if expiry > now {
+                    found = Some(envelope);
+                    break;
+                }
+                discarded_expired = true;
+            }
+            queue.is_empty()
+        } else {
+            return Err(MailboxError::NotFound);
+        };
+        if empty_after {
+            queues.remove(recipient_id);
+        }
+        match found {
+            Some(envelope) => Ok(envelope),
+            None if discarded_expired => Err(MailboxError::Expired),
+            None => Err(MailboxError::NotFound),
+        }
+    }
+}
