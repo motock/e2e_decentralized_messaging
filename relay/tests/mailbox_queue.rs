@@ -162,9 +162,13 @@ fn default_max_depth_is_64_and_default_matches_it() {
 
     let mb = Mailbox::default();
     for tag in 0..64u8 {
-        mb.enqueue("alice", env(tag), LIVE).expect("within default depth");
+        mb.enqueue("alice", env(tag), LIVE)
+            .expect("within default depth");
     }
-    assert_eq!(mb.enqueue("alice", env(99), LIVE), Err(MailboxError::QueueFull));
+    assert_eq!(
+        mb.enqueue("alice", env(99), LIVE),
+        Err(MailboxError::QueueFull)
+    );
 }
 
 #[test]
