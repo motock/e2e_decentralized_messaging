@@ -82,10 +82,17 @@ fn queue_accepts_up_to_max_depth_then_rejects_without_dropping() {
     // At max_depth: still accepted.
     mb.enqueue("alice", env(3), LIVE).expect("depth 3 of 3");
     // One past max_depth: rejected, and nothing was evicted to make room.
-    assert_eq!(mb.enqueue("alice", env(4), LIVE), Err(MailboxError::QueueFull));
+    assert_eq!(
+        mb.enqueue("alice", env(4), LIVE),
+        Err(MailboxError::QueueFull)
+    );
 
     for tag in 1..=3u8 {
-        assert_eq!(mb.dequeue("alice").unwrap(), env(tag), "queued envelope {tag} must survive");
+        assert_eq!(
+            mb.dequeue("alice").unwrap(),
+            env(tag),
+            "queued envelope {tag} must survive"
+        );
     }
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
