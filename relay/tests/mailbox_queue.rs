@@ -175,7 +175,11 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
         .rev()
         .skip_while(|l| l.trim_start().starts_with("#[") || l.trim().is_empty());
     assert!(
-        preceding.next().unwrap_or("").trim_start().starts_with("///"),
+        preceding
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("///"),
         "Mailbox must carry a doc comment explaining why it exists next to RelayStore"
     );
 
