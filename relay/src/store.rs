@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -80,8 +80,6 @@ impl RelayStore {
     }
 }
 
-use std::collections::VecDeque;
-
 /// Maximum number of live envelopes retained per recipient by [`Mailbox`].
 pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT: usize = 64;
 
@@ -96,6 +94,9 @@ pub enum MailboxError {
     QueueFull,
 }
 
+/// Opaque envelope with its expiry instant, queued FIFO per recipient.
+type Queue = VecDeque<(Vec<u8>, Instant)>;
+
 /// Per-recipient FIFO queue of opaque envelopes.
 ///
 /// [`RelayStore`] holds exactly one value per key, which is the required
@@ -105,10 +106,7 @@ pub enum MailboxError {
 /// provides that queue, bounded to `max_depth` live envelopes per recipient.
 pub struct Mailbox {
     max_depth: usize,
-    // The storage type is pinned verbatim by relay/tests/mailbox_queue.rs, so
-    // the complexity lint is silenced instead of aliasing the type away.
-    #[allow(clippy::type_complexity)]
-    queues: Mutex<HashMap<String, VecDeque<(Vec<u8>, Instant)>>>,
+    queues: Mutex<HashMap<String, Queue>>,
 }
 
 impl Mailbox {
