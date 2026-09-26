@@ -6,9 +6,11 @@
 //! chain key) and, for every member, *seals* that per-message key to the member's identity key
 //! via [`crypto::identity::PublicIdentityKey::seal`] — the same ephemeral-static-ECDH + HKDF +
 //! AEAD construction `core/transport/src/sealed_sender.rs` uses to hide sender identity from a
-//! relay. The chain key itself never leaves the [`GroupSession`] that holds it and never appears
-//! on the wire in any form, sealed or otherwise: only the one-time per-message key is sealed, and
-//! only for that message.
+//! relay. The chain key itself never appears on the wire in any form, sealed or otherwise: only
+//! the one-time per-message key is sealed, and only for that message. It leaves the
+//! [`GroupSession`] that holds it only through [`GroupSession::to_bytes`], which returns it
+//! verbatim in a caller-visible blob — that blob is secret ratchet state and the caller MUST
+//! encrypt it at rest before storing it (see that method's docs).
 //!
 //! An earlier version of this module embedded the raw chain key in every member's wrapper in
 //! plaintext. That defeated the entire feature: any passive observer of the ciphertext bytes —
@@ -183,6 +185,113 @@ impl GroupSession {
     pub fn remove_member(mut self, member: GroupMember) -> Self {
         self.members.retain(|m| m != &member.0);
         self.rotate_sender_key()
+    }
+
+    /// Serialize this group session's ratchet state (member roster + current chain key) as a v1
+    /// blob, so a restarted client can resume the same chain.
+    ///
+    /// SECURITY: the returned bytes contain secret ratchet state — the chain key every future
+    /// per-message key is derived from. The CALLER must encrypt them at rest before storing them
+    /// (the web client's `StorageGate` does). Never log or `Debug`-print the returned bytes.
+    ///
+    /// Format (big-endian): `version(1) | chain_key(32) | member_count(u16) | (len(u16) | key)*`.
+    /// The chain key is copied verbatim, so a restored session continues from the current
+    /// position instead of replaying keys already used. This is a pure read: it never advances
+    /// the ratchet.
+    ///
+    /// Precondition: the roster must hold at most [`MAX_MEMBERS`] (255) members. [`add_member`]
+    /// does not enforce that cap — only [`encrypt_as`](Self::encrypt_as) does — so a session that
+    /// grew past it serializes to a blob [`from_bytes`](Self::from_bytes) rejects (and past 65535
+    /// members the count would truncate). This fails closed on restore, but a caller that can
+    /// exceed the cap should check before persisting.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut chain_key = self.chain_key.get();
+        let mut out = Vec::with_capacity(1 + 32 + 2 + self.members.len() * 35);
+        out.push(1u8); // VERSION
+        out.extend_from_slice(&chain_key);
+        out.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
+        for member in &self.members {
+            let key = member.to_bytes();
+            out.extend_from_slice(&(key.len() as u16).to_be_bytes());
+            out.extend_from_slice(&key);
+        }
+        chain_key.zeroize();
+        out
+    }
+
+    /// Restore a group session previously produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// Fails closed: every malformed, truncated, or over-long input returns
+    /// [`ErrorKind::InvalidData`](std::io::ErrorKind::InvalidData) and no partially restored
+    /// session is ever returned. Every length prefix is checked against the bytes remaining
+    /// BEFORE anything is allocated or sliced, so a hostile blob declaring a multi-gigabyte
+    /// segment is rejected rather than allocated. Trailing bytes after the last member are
+    /// rejected too.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, std::io::Error> {
+        fn invalid(msg: &str) -> std::io::Error {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+        }
+
+        let version = *bytes.first().ok_or_else(|| invalid("empty group blob"))?;
+        if version != 1 {
+            return Err(invalid("unsupported group blob version"));
+        }
+        let mut chain_key = [0u8; 32];
+        chain_key.copy_from_slice(
+            bytes
+                .get(1..33)
+                .ok_or_else(|| invalid("truncated chain key"))?,
+        );
+        // The roster is parsed in an inner closure so the local chain-key copy is zeroized on the
+        // error paths too, not only on success.
+        let parsed = (|| -> Result<Vec<PublicIdentityKey>, std::io::Error> {
+            let count_bytes = bytes
+                .get(33..35)
+                .ok_or_else(|| invalid("truncated member count"))?;
+            let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]);
+            if count as usize > MAX_MEMBERS {
+                return Err(invalid("member count exceeds MAX_MEMBERS"));
+            }
+            let mut pos = 35usize;
+            // Every member segment is at least 2 + 33 bytes, so this necessary condition rejects
+            // a hostile count before any allocation happens.
+            if bytes.len() - pos < count as usize * 35 {
+                return Err(invalid("truncated member list"));
+            }
+            let mut members = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let len_bytes = bytes
+                    .get(pos..pos + 2)
+                    .ok_or_else(|| invalid("truncated member length"))?;
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                pos += 2;
+                if len != 33 {
+                    return Err(invalid("member key must be exactly 33 bytes"));
+                }
+                let key_bytes = bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| invalid("truncated member key"))?;
+                pos += len;
+                members.push(PublicIdentityKey::from_bytes(key_bytes));
+            }
+            if pos != bytes.len() {
+                return Err(invalid("trailing bytes after last member"));
+            }
+            Ok(members)
+        })();
+        let members = match parsed {
+            Ok(members) => members,
+            Err(err) => {
+                chain_key.zeroize();
+                return Err(err);
+            }
+        };
+        let session = Self {
+            members,
+            chain_key: Cell::new(chain_key),
+        };
+        chain_key.zeroize();
+        Ok(session)
     }
 
     /// Replace the chain key with a fresh CSPRNG value, unrelated to the current one.
