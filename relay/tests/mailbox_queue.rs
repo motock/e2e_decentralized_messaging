@@ -60,7 +60,10 @@ fn envelope_enqueued_after_a_dequeue_is_returned() {
 
 #[test]
 fn dequeue_with_nothing_ever_stored_is_not_found() {
-    assert_eq!(Mailbox::new(8).dequeue("nobody"), Err(MailboxError::NotFound));
+    assert_eq!(
+        Mailbox::new(8).dequeue("nobody"),
+        Err(MailboxError::NotFound)
+    );
 }
 
 #[test]

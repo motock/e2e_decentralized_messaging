@@ -71,3 +71,7 @@ PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only v
 [step 28] view_file: relay/tests/mailbox_queue.rs
 [step 29] create_file: relay/tests/mailbox_queue.rs
    [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
+[step 30] no scratchpad update in 15 steps; nudging
+[step 30] bash: wc -l relay/tests/mailbox_queue.rs; rustfmt --edition 2021 --check relay/tests/mailbox_queue.rs && echo "FMT CLEAN"; ech
+[step 31] str_replace: relay/tests/mailbox_queue.rs
+   [parking: off-task drift onto relay/tests/mailbox_queue.rs after nudge]
