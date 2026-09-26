@@ -209,7 +209,10 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
         "Mailbox must carry a doc comment explaining why it exists next to RelayStore"
     );
 
-    assert!(src.contains("pub enum MailboxError"), "MailboxError must be public in store.rs");
+    assert!(
+        src.contains("pub enum MailboxError"),
+        "MailboxError must be public in store.rs"
+    );
     assert!(
         src.contains("pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT"),
         "DEFAULT_MAX_ENVELOPES_PER_RECIPIENT must be a public const"
