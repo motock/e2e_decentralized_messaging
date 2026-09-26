@@ -33,12 +33,13 @@ use std::fmt;
 use libsignal_protocol::{
     DeviceId, IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore,
     KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SignalProtocolError, SignedPreKeyId,
-    SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SessionRecord, SessionStore,
+    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
 };
 use rand::rngs::OsRng;
 use rand::TryRngCore as _;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::double_ratchet::{self, DoubleRatchetError, MessageType, SerializedCiphertext};
 use crate::prekey::{generate_one_time_pre_keys, generate_signed_pre_key};
@@ -62,6 +63,15 @@ const TYPE_TAG_PREKEY: u8 = 1;
 const TYPE_TAG_CIPHERTEXT: u8 = 2;
 /// Total length of the envelope prefix the receiver must strip before the raw ciphertext.
 const ENVELOPE_PREFIX_LEN: usize = 32 + 1;
+
+/// Version tag of the [`DoubleRatchetSession::to_bytes`] / [`DoubleRatchetSession::from_bytes`]
+/// session-state blob. Bump only for an incompatible layout change.
+const SERIALIZATION_VERSION: u8 = 1;
+/// Role tag for a sender (Alice) session blob — the only role this build serializes.
+const ROLE_SENDER: u8 = 1;
+/// Role tag for a receiver (Bob) session blob. Reserved for the receiver story; restoring one
+/// is rejected as [`SessionError::UnsupportedRole`] here.
+const ROLE_RECEIVER: u8 = 2;
 
 /// A high-level 1:1 Signal (PQXDH + Double Ratchet) session.
 ///
@@ -96,6 +106,14 @@ pub struct DoubleRatchetSession {
 /// fail-closed: on any error no plaintext is produced and the session state is untouched.
 #[derive(Debug)]
 pub enum SessionError {
+    /// A serialized session blob was structurally invalid: wrong version, a truncated or
+    /// over-long length prefix, trailing bytes, a remote name that does not match its
+    /// identity hash, or a local identity that does not match the one the session was
+    /// created with. Fail-closed: no partially restored session is ever returned.
+    MalformedState,
+    /// A serialized session blob declared a role this build cannot restore (e.g. a receiver
+    /// blob passed to the sender-only restore path). Fail-closed.
+    UnsupportedRole,
     /// A prekey-generation or in-memory store failure during [`new_bob`](Self::new_bob) /
     /// [`new_alice`](Self::new_alice).
     PreKey(SignalProtocolError),
@@ -136,6 +154,8 @@ pub enum SessionError {
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MalformedState => write!(f, "malformed serialized session state"),
+            Self::UnsupportedRole => write!(f, "serialized session role not supported"),
             Self::PreKey(e) => write!(f, "session prekey error: {e}"),
             Self::Establishment(e) => write!(f, "session establishment failed: {e}"),
             Self::Encrypt(e) => write!(f, "session encrypt failed: {e}"),
@@ -215,6 +235,38 @@ fn address_for_hash(hash: &[u8; 32]) -> ProtocolAddress {
     ProtocolAddress::new(hex_name(hash), device())
 }
 
+/// Read one big-endian `u32`-length-prefixed segment from `bytes` at `*pos`, advancing `*pos`
+/// past it and returning the segment slice.
+///
+/// Checks the declared length against the bytes remaining BEFORE slicing or allocating, so a
+/// hostile blob declaring a 4 GiB segment returns [`SessionError::MalformedState`] instead of
+/// panicking or allocating. Any shortfall (missing length prefix, or a segment longer than the
+/// remaining bytes) is also [`SessionError::MalformedState`].
+fn read_segment<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<&'a [u8], SessionError> {
+    let remaining = bytes.len().saturating_sub(*pos);
+    if remaining < 4 {
+        return Err(SessionError::MalformedState);
+    }
+    let len = u32::from_be_bytes([
+        bytes[*pos],
+        bytes[*pos + 1],
+        bytes[*pos + 2],
+        bytes[*pos + 3],
+    ]) as usize;
+    *pos += 4;
+
+    // `*pos <= bytes.len()` holds here, so the subtraction cannot underflow. `len` is checked
+    // against the remaining bytes before `*pos + len` is formed, so that addition cannot
+    // overflow either (even on 32-bit wasm32 targets).
+    let remaining = bytes.len() - *pos;
+    if len > remaining {
+        return Err(SessionError::MalformedState);
+    }
+    let segment = &bytes[*pos..*pos + len];
+    *pos += len;
+    Ok(segment)
+}
+
 fn type_tag(mt: MessageType) -> u8 {
     match mt {
         MessageType::PreKey => TYPE_TAG_PREKEY,
@@ -231,6 +283,168 @@ fn message_type_from_tag(tag: u8) -> Option<MessageType> {
 }
 
 impl DoubleRatchetSession {
+    /// Serialize this sender (Alice) session to a self-contained byte blob that
+    /// [`from_bytes`](Self::from_bytes) can restore.
+    ///
+    /// # Security
+    ///
+    /// The returned bytes contain **secret ratchet state** (the libsignal `SessionRecord`,
+    /// including chain keys). The CALLER MUST encrypt them at rest before persisting them —
+    /// the web client's `StorageGate` does. Never log or `Debug`-print the blob or any key
+    /// material. The local identity keypair is deliberately NOT included (data
+    /// minimization); the caller supplies it to [`from_bytes`](Self::from_bytes).
+    ///
+    /// # Format (v1, all integers big-endian)
+    ///
+    /// ```text
+    ///   [ version : 1 byte  ]   // 1
+    ///   [ role    : 1 byte  ]   // 1 = sender/Alice
+    ///   [ remote entry: four u32-length-prefixed segments ]
+    /// ```
+    ///
+    /// A remote entry is, in order: the remote address name (UTF-8), the remote device id
+    /// (exactly 4 bytes), the remote `IdentityKey` (libsignal `serialize`), and that remote's
+    /// libsignal `SessionRecord` (`serialize`).
+    ///
+    /// Returns [`SessionError::UnsupportedRole`] on a receiver-only session
+    /// (`remote_address == None`), which holds no outbound session to serialize.
+    pub async fn to_bytes(&self) -> Result<Vec<u8>, SessionError> {
+        let remote = self
+            .remote_address
+            .as_ref()
+            .ok_or(SessionError::UnsupportedRole)?;
+
+        let record = self
+            .store
+            .session_store
+            .load_session(remote)
+            .await
+            .map_err(SessionError::Store)?
+            .ok_or(SessionError::MalformedState)?;
+
+        let remote_identity = self
+            .store
+            .identity_store
+            .get_identity(remote)
+            .await
+            .map_err(SessionError::Store)?
+            .ok_or(SessionError::MalformedState)?;
+
+        // The serialized record is secret ratchet state; keep the temporary copy in a
+        // `Zeroizing` buffer so it is wiped when this function returns.
+        let record_bytes = Zeroizing::new(record.serialize().map_err(SessionError::Store)?);
+
+        let mut out = Vec::new();
+        out.push(SERIALIZATION_VERSION);
+        out.push(ROLE_SENDER);
+        let push_segment = |buf: &mut Vec<u8>, segment: &[u8]| {
+            buf.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+            buf.extend_from_slice(segment);
+        };
+        push_segment(&mut out, remote.name().as_bytes());
+        push_segment(&mut out, &u32::from(remote.device_id()).to_be_bytes());
+        push_segment(&mut out, &remote_identity.serialize());
+        push_segment(&mut out, record_bytes.as_slice());
+        Ok(out)
+    }
+
+    /// Restore a sender (Alice) session from the blob produced by
+    /// [`to_bytes`](Self::to_bytes), using the local `identity` the session was created with.
+    ///
+    /// Parses strictly and fails closed: every structural error (bad version, unknown role,
+    /// truncated or over-long length prefix, trailing bytes, a remote name that does not match
+    /// its identity hash, or an `identity` that is not the one the session was created with)
+    /// returns `Err` and no partially restored session is ever returned.
+    pub async fn from_bytes(
+        identity: &IdentityKeyPair,
+        bytes: &[u8],
+    ) -> Result<Self, SessionError> {
+        let mut pos = 0usize;
+
+        let version = *bytes.first().ok_or(SessionError::MalformedState)?;
+        pos += 1;
+        if version != SERIALIZATION_VERSION {
+            return Err(SessionError::MalformedState);
+        }
+
+        let role = *bytes.get(pos).ok_or(SessionError::MalformedState)?;
+        pos += 1;
+        match role {
+            ROLE_SENDER => {}
+            ROLE_RECEIVER => return Err(SessionError::UnsupportedRole),
+            _ => return Err(SessionError::MalformedState),
+        }
+
+        let name_bytes = read_segment(bytes, &mut pos)?;
+        let name = std::str::from_utf8(name_bytes).map_err(|_| SessionError::MalformedState)?;
+
+        let device_bytes = read_segment(bytes, &mut pos)?;
+        let device_raw: [u8; 4] = device_bytes
+            .try_into()
+            .map_err(|_| SessionError::MalformedState)?;
+        let device_id = DeviceId::new(
+            u8::try_from(u32::from_be_bytes(device_raw))
+                .map_err(|_| SessionError::MalformedState)?,
+        )
+        .map_err(|_| SessionError::MalformedState)?;
+
+        let identity_bytes = read_segment(bytes, &mut pos)?;
+        let remote_identity =
+            IdentityKey::try_from(identity_bytes).map_err(|_| SessionError::MalformedState)?;
+
+        let record_bytes = read_segment(bytes, &mut pos)?;
+        let record =
+            SessionRecord::deserialize(record_bytes).map_err(|_| SessionError::MalformedState)?;
+
+        // Reject trailing bytes after the last segment.
+        if pos != bytes.len() {
+            return Err(SessionError::MalformedState);
+        }
+
+        // The remote address name must be the hash of the remote identity key, so a blob
+        // cannot bind an identity key to a name it does not hash to.
+        if name != hex_name(&hash_of_identity_key(&remote_identity)) {
+            return Err(SessionError::MalformedState);
+        }
+
+        // The supplied identity must be the one the session was created with, otherwise the
+        // restored session would silently operate under the wrong identity.
+        let record_local_identity = record
+            .local_identity_key_bytes()
+            .map_err(|_| SessionError::MalformedState)?;
+        if record_local_identity.as_slice() != identity.public_key().serialize().as_ref() {
+            return Err(SessionError::MalformedState);
+        }
+
+        let remote_address = ProtocolAddress::new(name.to_string(), device_id);
+
+        let mut store = InMemSignalProtocolStore::new(*identity, REGISTRATION_ID)
+            .map_err(SessionError::PreKey)?;
+        store
+            .session_store
+            .store_session(&remote_address, &record)
+            .await
+            .map_err(SessionError::Store)?;
+        store
+            .identity_store
+            .save_identity(&remote_address, &remote_identity)
+            .await
+            .map_err(SessionError::Store)?;
+
+        let local_hash = identity_hash(identity);
+        let local_address = address_for_hash(&local_hash);
+
+        Ok(Self {
+            identity: *identity,
+            local_address,
+            local_hash,
+            store,
+            remote_address: Some(remote_address),
+            signed_prekey: None,
+            kyber_prekey: None,
+            one_time_prekey: None,
+        })
+    }
     /// Construct a receiver (Bob): generate and save signed, Kyber, and one-time prekeys into a
     /// fresh in-memory libsignal store, ready for [`publish_bundle`](Self::publish_bundle) and
     /// inbound [`decrypt`](Self::decrypt).
