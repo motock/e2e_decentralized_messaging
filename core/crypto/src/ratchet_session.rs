@@ -31,10 +31,11 @@
 use std::fmt;
 
 use libsignal_protocol::{
-    DeviceId, IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore,
-    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore, ProtocolAddress, SessionRecord, SessionStore,
-    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    DeviceId, GenericSignedPreKey, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    InMemSignalProtocolStore, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle,
+    PreKeyId, PreKeyRecord, PreKeySignalMessage, PreKeyStore, ProtocolAddress, SessionRecord,
+    SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    Timestamp,
 };
 use rand::rngs::OsRng;
 use rand::TryRngCore as _;
@@ -42,7 +43,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::double_ratchet::{self, DoubleRatchetError, MessageType, SerializedCiphertext};
-use crate::prekey::{generate_one_time_pre_keys, generate_signed_pre_key};
+use crate::prekey::{generate_one_time_pre_keys, generate_signed_pre_key, verify_signed_pre_key};
 use crate::session::{build_prekey_bundle, establish_outbound_session, generate_kyber_prekey};
 
 /// Registration id both parties use in this facade. Addressing is derived from the identity
@@ -67,10 +68,10 @@ const ENVELOPE_PREFIX_LEN: usize = 32 + 1;
 /// Version tag of the [`DoubleRatchetSession::to_bytes`] / [`DoubleRatchetSession::from_bytes`]
 /// session-state blob. Bump only for an incompatible layout change.
 const SERIALIZATION_VERSION: u8 = 1;
-/// Role tag for a sender (Alice) session blob — the only role this build serializes.
+/// Role tag for a sender (Alice) session blob: one remote entry holding the outbound session.
 const ROLE_SENDER: u8 = 1;
-/// Role tag for a receiver (Bob) session blob. Reserved for the receiver story; restoring one
-/// is rejected as [`SessionError::UnsupportedRole`] here.
+/// Role tag for a receiver (Bob) session blob: prekey records plus one remote entry per peer
+/// the receiver has heard from.
 const ROLE_RECEIVER: u8 = 2;
 
 /// A high-level 1:1 Signal (PQXDH + Double Ratchet) session.
@@ -96,6 +97,10 @@ pub struct DoubleRatchetSession {
     signed_prekey: Option<SignedPreKeyRecord>,
     kyber_prekey: Option<KyberPreKeyRecord>,
     one_time_prekey: Option<PreKeyRecord>,
+    /// Addresses this receiver (Bob) has successfully decrypted a message from, in first-seen
+    /// order. Persisted by [`to_bytes`](Self::to_bytes) so a restored receiver can keep
+    /// ratcheting with every peer it has heard from. Empty on a sender.
+    known_remotes: Vec<ProtocolAddress>,
 }
 
 /// Errors from high-level session construction, encryption, or decryption.
@@ -111,8 +116,9 @@ pub enum SessionError {
     /// identity hash, or a local identity that does not match the one the session was
     /// created with. Fail-closed: no partially restored session is ever returned.
     MalformedState,
-    /// A serialized session blob declared a role this build cannot restore (e.g. a receiver
-    /// blob passed to the sender-only restore path). Fail-closed.
+    /// A serialized session blob declared a role this build cannot restore, or
+    /// [`to_bytes`](DoubleRatchetSession::to_bytes) was called on a session that is neither a
+    /// sender with an outbound session nor a receiver holding prekeys. Fail-closed.
     UnsupportedRole,
     /// A prekey-generation or in-memory store failure during [`new_bob`](Self::new_bob) /
     /// [`new_alice`](Self::new_alice).
@@ -283,32 +289,103 @@ fn message_type_from_tag(tag: u8) -> Option<MessageType> {
 }
 
 impl DoubleRatchetSession {
-    /// Serialize this sender (Alice) session to a self-contained byte blob that
+    /// Serialize this session to a self-contained byte blob that
     /// [`from_bytes`](Self::from_bytes) can restore.
     ///
     /// # Security
     ///
     /// The returned bytes contain **secret ratchet state** (the libsignal `SessionRecord`,
-    /// including chain keys). The CALLER MUST encrypt them at rest before persisting them —
-    /// the web client's `StorageGate` does. Never log or `Debug`-print the blob or any key
-    /// material. The local identity keypair is deliberately NOT included (data
-    /// minimization); the caller supplies it to [`from_bytes`](Self::from_bytes).
+    /// including chain keys, and the receiver's prekey private material). The CALLER MUST
+    /// encrypt them at rest before persisting them — the web client's `StorageGate` does.
+    /// Never log or `Debug`-print the blob or any key material. The local identity keypair is
+    /// deliberately NOT included (data minimization); the caller supplies it to
+    /// [`from_bytes`](Self::from_bytes).
     ///
     /// # Format (v1, all integers big-endian)
     ///
     /// ```text
     ///   [ version : 1 byte  ]   // 1
-    ///   [ role    : 1 byte  ]   // 1 = sender/Alice
-    ///   [ remote entry: four u32-length-prefixed segments ]
+    ///   [ role    : 1 byte  ]   // 1 = sender/Alice, 2 = receiver/Bob
     /// ```
+    ///
+    /// A **sender** (role 1) body is exactly one remote entry. A **receiver** (role 2) body is,
+    /// in order: the signed prekey record, the Kyber prekey record, the one-time prekey record
+    /// (an empty segment once it has been consumed), the remote count as 4 bytes, then that many
+    /// remote entries.
     ///
     /// A remote entry is, in order: the remote address name (UTF-8), the remote device id
     /// (exactly 4 bytes), the remote `IdentityKey` (libsignal `serialize`), and that remote's
     /// libsignal `SessionRecord` (`serialize`).
     ///
-    /// Returns [`SessionError::UnsupportedRole`] on a receiver-only session
-    /// (`remote_address == None`), which holds no outbound session to serialize.
+    /// Returns [`SessionError::UnsupportedRole`] on a session that is neither a sender with an
+    /// outbound session nor a receiver holding prekeys.
     pub async fn to_bytes(&self) -> Result<Vec<u8>, SessionError> {
+        let push_segment = |buf: &mut Vec<u8>, segment: &[u8]| {
+            buf.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+            buf.extend_from_slice(segment);
+        };
+
+        // A receiver (Bob) holds prekeys and no outbound session; a sender (Alice) holds an
+        // outbound session and no prekeys. The two roles have disjoint bodies.
+        if let (Some(signed_prekey), Some(kyber_prekey)) = (&self.signed_prekey, &self.kyber_prekey)
+        {
+            let mut out = Vec::new();
+            out.push(SERIALIZATION_VERSION);
+            out.push(ROLE_RECEIVER);
+
+            // Prekey records are secret key material; keep the temporary copies in `Zeroizing`
+            // buffers so they are wiped when this function returns.
+            let signed_bytes =
+                Zeroizing::new(signed_prekey.serialize().map_err(SessionError::Store)?);
+            push_segment(&mut out, signed_bytes.as_slice());
+
+            let kyber_bytes =
+                Zeroizing::new(kyber_prekey.serialize().map_err(SessionError::Store)?);
+            push_segment(&mut out, kyber_bytes.as_slice());
+
+            // libsignal removes a one-time prekey from the store when a first (PreKey) message
+            // consumes it. Emit an empty segment in that case so a restore does not resurrect a
+            // key the store no longer holds.
+            match self
+                .store
+                .pre_key_store
+                .get_pre_key(PreKeyId::from(ONE_TIME_PREKEY_ID))
+                .await
+            {
+                Ok(record) => {
+                    let record_bytes =
+                        Zeroizing::new(record.serialize().map_err(SessionError::Store)?);
+                    push_segment(&mut out, record_bytes.as_slice());
+                }
+                Err(_) => push_segment(&mut out, &[]),
+            }
+
+            out.extend_from_slice(&(self.known_remotes.len() as u32).to_be_bytes());
+            for remote in &self.known_remotes {
+                let record = self
+                    .store
+                    .session_store
+                    .load_session(remote)
+                    .await
+                    .map_err(SessionError::Store)?
+                    .ok_or(SessionError::MalformedState)?;
+                let remote_identity = self
+                    .store
+                    .identity_store
+                    .get_identity(remote)
+                    .await
+                    .map_err(SessionError::Store)?
+                    .ok_or(SessionError::MalformedState)?;
+                let record_bytes = Zeroizing::new(record.serialize().map_err(SessionError::Store)?);
+
+                push_segment(&mut out, remote.name().as_bytes());
+                push_segment(&mut out, &u32::from(remote.device_id()).to_be_bytes());
+                push_segment(&mut out, &remote_identity.serialize());
+                push_segment(&mut out, record_bytes.as_slice());
+            }
+            return Ok(out);
+        }
+
         let remote = self
             .remote_address
             .as_ref()
@@ -337,10 +414,6 @@ impl DoubleRatchetSession {
         let mut out = Vec::new();
         out.push(SERIALIZATION_VERSION);
         out.push(ROLE_SENDER);
-        let push_segment = |buf: &mut Vec<u8>, segment: &[u8]| {
-            buf.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-            buf.extend_from_slice(segment);
-        };
         push_segment(&mut out, remote.name().as_bytes());
         push_segment(&mut out, &u32::from(remote.device_id()).to_be_bytes());
         push_segment(&mut out, &remote_identity.serialize());
@@ -348,13 +421,22 @@ impl DoubleRatchetSession {
         Ok(out)
     }
 
-    /// Restore a sender (Alice) session from the blob produced by
-    /// [`to_bytes`](Self::to_bytes), using the local `identity` the session was created with.
+    /// Restore a session from the blob produced by [`to_bytes`](Self::to_bytes), using the
+    /// local `identity` the session was created with. Both roles restore through this one entry
+    /// point: a sender (role 1) blob rebuilds the outbound session, a receiver (role 2) blob
+    /// rebuilds the prekey store and every peer session the receiver had established.
     ///
     /// Parses strictly and fails closed: every structural error (bad version, unknown role,
     /// truncated or over-long length prefix, trailing bytes, a remote name that does not match
     /// its identity hash, or an `identity` that is not the one the session was created with)
     /// returns `Err` and no partially restored session is ever returned.
+    ///
+    /// # Replay caveat
+    ///
+    /// libsignal's `InMemKyberPreKeyStore.base_keys_seen` replay set cannot be exported and is
+    /// not persisted; after a restore a replayed message on an already-established session is
+    /// still rejected by that session's own message counters, and only a replayed first (PreKey)
+    /// message against a session that no longer exists is unguarded.
     pub async fn from_bytes(
         identity: &IdentityKeyPair,
         bytes: &[u8],
@@ -371,7 +453,7 @@ impl DoubleRatchetSession {
         pos += 1;
         match role {
             ROLE_SENDER => {}
-            ROLE_RECEIVER => return Err(SessionError::UnsupportedRole),
+            ROLE_RECEIVER => return Self::restore_receiver(identity, bytes, pos).await,
             _ => return Err(SessionError::MalformedState),
         }
 
@@ -443,8 +525,140 @@ impl DoubleRatchetSession {
             signed_prekey: None,
             kyber_prekey: None,
             one_time_prekey: None,
+            known_remotes: Vec::new(),
         })
     }
+
+    /// Restore a receiver (Bob) session (role 2) from `bytes`, starting at `pos` — the offset
+    /// just past the version and role bytes. See [`from_bytes`](Self::from_bytes) for the format
+    /// and the replay caveat.
+    async fn restore_receiver(
+        identity: &IdentityKeyPair,
+        bytes: &[u8],
+        mut pos: usize,
+    ) -> Result<Self, SessionError> {
+        let signed_bytes = read_segment(bytes, &mut pos)?;
+        let signed_prekey = SignedPreKeyRecord::deserialize(signed_bytes)
+            .map_err(|_| SessionError::MalformedState)?;
+
+        let kyber_bytes = read_segment(bytes, &mut pos)?;
+        let kyber_prekey = KyberPreKeyRecord::deserialize(kyber_bytes)
+            .map_err(|_| SessionError::MalformedState)?;
+
+        // An empty segment means the one-time prekey was already consumed by a first message;
+        // libsignal removed it from the store, so a restore must not resurrect it.
+        let one_time_bytes = read_segment(bytes, &mut pos)?;
+        let one_time_prekey = if one_time_bytes.is_empty() {
+            None
+        } else {
+            Some(
+                PreKeyRecord::deserialize(one_time_bytes)
+                    .map_err(|_| SessionError::MalformedState)?,
+            )
+        };
+
+        // The supplied identity must be the one the session was created with. The signed prekey
+        // is XEdDSA-signed by that identity's private key, so verifying its signature binds the
+        // blob to `identity`; a different identity fails closed here.
+        verify_signed_pre_key(identity.identity_key(), &signed_prekey)
+            .map_err(|_| SessionError::MalformedState)?;
+
+        // The remote count is exactly 4 bytes, not length-prefixed. Check it against the bytes
+        // remaining BEFORE reserving capacity: each remote entry needs at least 16 bytes of
+        // length prefixes, so a hostile count (e.g. 0xFFFFFFFF) is rejected without allocating.
+        // The division form avoids overflowing `count * 16` on 32-bit wasm32.
+        let remaining = bytes.len().saturating_sub(pos);
+        if remaining < 4 {
+            return Err(SessionError::MalformedState);
+        }
+        let count = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        pos += 4;
+        if count > (bytes.len() - pos) / 16 {
+            return Err(SessionError::MalformedState);
+        }
+
+        let mut store = InMemSignalProtocolStore::new(*identity, REGISTRATION_ID)
+            .map_err(SessionError::PreKey)?;
+        store
+            .save_signed_pre_key(SignedPreKeyId::from(SIGNED_PREKEY_ID), &signed_prekey)
+            .await
+            .map_err(SessionError::Store)?;
+        store
+            .save_kyber_pre_key(KyberPreKeyId::from(KYBER_PREKEY_ID), &kyber_prekey)
+            .await
+            .map_err(SessionError::Store)?;
+        if let Some(record) = &one_time_prekey {
+            store
+                .save_pre_key(PreKeyId::from(ONE_TIME_PREKEY_ID), record)
+                .await
+                .map_err(SessionError::Store)?;
+        }
+
+        let mut known_remotes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_bytes = read_segment(bytes, &mut pos)?;
+            let name = std::str::from_utf8(name_bytes).map_err(|_| SessionError::MalformedState)?;
+
+            let device_bytes = read_segment(bytes, &mut pos)?;
+            let device_raw: [u8; 4] = device_bytes
+                .try_into()
+                .map_err(|_| SessionError::MalformedState)?;
+            let device_id = DeviceId::new(
+                u8::try_from(u32::from_be_bytes(device_raw))
+                    .map_err(|_| SessionError::MalformedState)?,
+            )
+            .map_err(|_| SessionError::MalformedState)?;
+
+            let identity_bytes = read_segment(bytes, &mut pos)?;
+            let remote_identity =
+                IdentityKey::try_from(identity_bytes).map_err(|_| SessionError::MalformedState)?;
+
+            let record_bytes = read_segment(bytes, &mut pos)?;
+            let record = SessionRecord::deserialize(record_bytes)
+                .map_err(|_| SessionError::MalformedState)?;
+
+            // The remote address name must be the hash of the remote identity key, so a blob
+            // cannot bind an identity key to a name it does not hash to.
+            if name != hex_name(&hash_of_identity_key(&remote_identity)) {
+                return Err(SessionError::MalformedState);
+            }
+
+            let remote_address = ProtocolAddress::new(name.to_string(), device_id);
+            store
+                .session_store
+                .store_session(&remote_address, &record)
+                .await
+                .map_err(SessionError::Store)?;
+            store
+                .identity_store
+                .save_identity(&remote_address, &remote_identity)
+                .await
+                .map_err(SessionError::Store)?;
+            known_remotes.push(remote_address);
+        }
+
+        // Reject trailing bytes after the last remote entry.
+        if pos != bytes.len() {
+            return Err(SessionError::MalformedState);
+        }
+
+        let local_hash = identity_hash(identity);
+        let local_address = address_for_hash(&local_hash);
+
+        Ok(Self {
+            identity: *identity,
+            local_address,
+            local_hash,
+            store,
+            remote_address: None,
+            signed_prekey: Some(signed_prekey),
+            kyber_prekey: Some(kyber_prekey),
+            one_time_prekey,
+            known_remotes,
+        })
+    }
+
     /// Construct a receiver (Bob): generate and save signed, Kyber, and one-time prekeys into a
     /// fresh in-memory libsignal store, ready for [`publish_bundle`](Self::publish_bundle) and
     /// inbound [`decrypt`](Self::decrypt).
@@ -492,6 +706,7 @@ impl DoubleRatchetSession {
             signed_prekey: Some(signed_prekey),
             kyber_prekey: Some(kyber_prekey),
             one_time_prekey: Some(one_time_prekey),
+            known_remotes: Vec::new(),
         })
     }
 
@@ -561,6 +776,7 @@ impl DoubleRatchetSession {
             signed_prekey: None,
             kyber_prekey: None,
             one_time_prekey: None,
+            known_remotes: Vec::new(),
         })
     }
 
@@ -654,7 +870,7 @@ impl DoubleRatchetSession {
 
         let ciphertext = SerializedCiphertext::new(message_type, raw.to_vec());
 
-        double_ratchet::decrypt_message(
+        let plaintext = double_ratchet::decrypt_message(
             ciphertext,
             &sender_address,
             &self.local_address,
@@ -665,7 +881,16 @@ impl DoubleRatchetSession {
             &mut self.store.kyber_pre_key_store,
         )
         .await
-        .map_err(SessionError::Decrypt)
+        .map_err(SessionError::Decrypt)?;
+
+        // Only a *successful* decrypt records the sender: a failed decrypt must leave the
+        // session state (including `known_remotes`) untouched. Deduplicated so a peer that
+        // sends many messages is recorded once, in first-seen order.
+        if !self.known_remotes.contains(&sender_address) {
+            self.known_remotes.push(sender_address);
+        }
+
+        Ok(plaintext)
     }
 }
 
