@@ -234,6 +234,13 @@ fn member_count_0xffff_with_short_body_is_rejected() {
     assert_rejected(&blob(1, [0x22; 32], 0xFFFF, &[0u8; 10]));
 }
 
+/// The count is within `MAX_MEMBERS`, so this blob is rejected by the "check the declared count
+/// against the bytes remaining before allocating" guard rather than by the cap check.
+#[test]
+fn member_count_255_with_short_body_is_rejected() {
+    assert_rejected(&blob(1, [0x22; 32], 255, &repeated_member_segments(1)));
+}
+
 #[test]
 fn member_key_length_zero_is_rejected() {
     assert_rejected(&blob(1, [0x22; 32], 1, &member_segment(0, &[])));
@@ -249,6 +256,12 @@ fn member_key_length_34_is_rejected() {
     assert_rejected(&blob(1, [0x22; 32], 1, &member_segment(34, &[0x33; 34])));
 }
 
+/// The serialized blob never shows up in the session's `Debug` output.
+///
+/// Scope note: `GroupSession` derives `Debug`, which renders the chain key as a decimal byte list
+/// (`chain_key: Cell { value: [..] }`), so this test covers the blob's own representation only —
+/// it does NOT establish that `Debug` redacts key material. Redacting the derived `Debug` is out
+/// of scope for this story.
 #[test]
 fn debug_output_does_not_contain_the_serialized_blob() {
     let group = group_with_members(2);

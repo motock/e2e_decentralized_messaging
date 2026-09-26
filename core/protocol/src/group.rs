@@ -6,9 +6,11 @@
 //! chain key) and, for every member, *seals* that per-message key to the member's identity key
 //! via [`crypto::identity::PublicIdentityKey::seal`] — the same ephemeral-static-ECDH + HKDF +
 //! AEAD construction `core/transport/src/sealed_sender.rs` uses to hide sender identity from a
-//! relay. The chain key itself never leaves the [`GroupSession`] that holds it and never appears
-//! on the wire in any form, sealed or otherwise: only the one-time per-message key is sealed, and
-//! only for that message.
+//! relay. The chain key itself never appears on the wire in any form, sealed or otherwise: only
+//! the one-time per-message key is sealed, and only for that message. It leaves the
+//! [`GroupSession`] that holds it only through [`GroupSession::to_bytes`], which returns it
+//! verbatim in a caller-visible blob — that blob is secret ratchet state and the caller MUST
+//! encrypt it at rest before storing it (see that method's docs).
 //!
 //! An earlier version of this module embedded the raw chain key in every member's wrapper in
 //! plaintext. That defeated the entire feature: any passive observer of the ciphertext bytes —
@@ -196,6 +198,12 @@ impl GroupSession {
     /// The chain key is copied verbatim, so a restored session continues from the current
     /// position instead of replaying keys already used. This is a pure read: it never advances
     /// the ratchet.
+    ///
+    /// Precondition: the roster must hold at most [`MAX_MEMBERS`] (255) members. [`add_member`]
+    /// does not enforce that cap — only [`encrypt_as`](Self::encrypt_as) does — so a session that
+    /// grew past it serializes to a blob [`from_bytes`](Self::from_bytes) rejects (and past 65535
+    /// members the count would truncate). This fails closed on restore, but a caller that can
+    /// exceed the cap should check before persisting.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut chain_key = self.chain_key.get();
         let mut out = Vec::with_capacity(1 + 32 + 2 + self.members.len() * 35);
@@ -234,38 +242,50 @@ impl GroupSession {
                 .get(1..33)
                 .ok_or_else(|| invalid("truncated chain key"))?,
         );
-        let count_bytes = bytes
-            .get(33..35)
-            .ok_or_else(|| invalid("truncated member count"))?;
-        let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]);
-        if count as usize > MAX_MEMBERS {
-            return Err(invalid("member count exceeds MAX_MEMBERS"));
-        }
-        let mut pos = 35usize;
-        // Every member segment is at least 2 + 33 bytes, so this necessary condition rejects a
-        // hostile count before any allocation happens.
-        if bytes.len() - pos < count as usize * 35 {
-            return Err(invalid("truncated member list"));
-        }
-        let mut members = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let len_bytes = bytes
-                .get(pos..pos + 2)
-                .ok_or_else(|| invalid("truncated member length"))?;
-            let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
-            pos += 2;
-            if len != 33 {
-                return Err(invalid("member key must be exactly 33 bytes"));
+        // The roster is parsed in an inner closure so the local chain-key copy is zeroized on the
+        // error paths too, not only on success.
+        let parsed = (|| -> Result<Vec<PublicIdentityKey>, std::io::Error> {
+            let count_bytes = bytes
+                .get(33..35)
+                .ok_or_else(|| invalid("truncated member count"))?;
+            let count = u16::from_be_bytes([count_bytes[0], count_bytes[1]]);
+            if count as usize > MAX_MEMBERS {
+                return Err(invalid("member count exceeds MAX_MEMBERS"));
             }
-            let key_bytes = bytes
-                .get(pos..pos + len)
-                .ok_or_else(|| invalid("truncated member key"))?;
-            pos += len;
-            members.push(PublicIdentityKey::from_bytes(key_bytes));
-        }
-        if pos != bytes.len() {
-            return Err(invalid("trailing bytes after last member"));
-        }
+            let mut pos = 35usize;
+            // Every member segment is at least 2 + 33 bytes, so this necessary condition rejects
+            // a hostile count before any allocation happens.
+            if bytes.len() - pos < count as usize * 35 {
+                return Err(invalid("truncated member list"));
+            }
+            let mut members = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let len_bytes = bytes
+                    .get(pos..pos + 2)
+                    .ok_or_else(|| invalid("truncated member length"))?;
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                pos += 2;
+                if len != 33 {
+                    return Err(invalid("member key must be exactly 33 bytes"));
+                }
+                let key_bytes = bytes
+                    .get(pos..pos + len)
+                    .ok_or_else(|| invalid("truncated member key"))?;
+                pos += len;
+                members.push(PublicIdentityKey::from_bytes(key_bytes));
+            }
+            if pos != bytes.len() {
+                return Err(invalid("trailing bytes after last member"));
+            }
+            Ok(members)
+        })();
+        let members = match parsed {
+            Ok(members) => members,
+            Err(err) => {
+                chain_key.zeroize();
+                return Err(err);
+            }
+        };
         let session = Self {
             members,
             chain_key: Cell::new(chain_key),
