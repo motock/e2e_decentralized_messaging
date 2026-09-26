@@ -169,11 +169,14 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
         .expect("Mailbox must be added to store.rs");
     assert!(mailbox_at > store_at, "Mailbox must be defined below the existing RelayStore");
 
-    // Walk back over any attribute lines to find the doc comment block.
-    let preceding: Vec<&str> = src[..mailbox_at].lines().rev().take(30).collect();
+    // Walk back over attribute/blank lines to find the doc comment block.
+    let mut preceding = src[..mailbox_at].lines().rev().skip_while(|l| {
+        let t = l.trim_start();
+        t.starts_with("#[") || t.is_empty()
+    });
     assert!(
-        preceding.iter().any(|line| line.trim_start().starts_with("///")),
-        "Mailbox must carry a doc comment explaining why it exists next to RelayStore, found: {preceding:?}"
+        preceding.next().unwrap_or("").trim_start().starts_with("///"),
+        "Mailbox must carry a doc comment explaining why it exists next to RelayStore"
     );
 
     assert!(src.contains("pub enum MailboxError"), "MailboxError must be public in store.rs");
