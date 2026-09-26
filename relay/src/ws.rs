@@ -2,17 +2,19 @@
 //!
 //! Browsers cannot open raw TCP/QUIC sockets or run the Kademlia DHT / Circuit Relay v2
 //! libp2p stack the native clients use (`core/transport/src/{dht.rs, online.rs}`). This
-//! module adds a **parallel** WebSocket listener to the self-hostable relay that bridges
-//! to the relay's existing store-and-forward envelope handling (`store::RelayStore`)
-//! and its existing proof-of-work / rate-limit gates (`pow`, `ratelimit`).
+//! module adds a **parallel** WebSocket listener to the self-hostable relay that shares
+//! its existing proof-of-work / rate-limit gates (`pow`, `ratelimit`) and uses
+//! `store::Mailbox` for store-and-forward envelope handling (`store::RelayStore` for
+//! prekey bundles, which are last-write-wins by design).
 //!
 //! ## Design decision (solution-architect sign-off)
 //!
 //! The WS listener is a **parallel ingress path**, not a replacement for the libp2p
-//! transport. Both paths share the same `RelayStore`, `pow::verify`, and
-//! `ratelimit::RateLimiter` gates — the WS path does **not** create a second, weaker
-//! ingress. A browser client must solve the same PoW challenge and is subject to the
-//! same per-identity rate limit before any store/pickup operation is accepted.
+//! transport. Both paths share the same `pow::verify` and `ratelimit::RateLimiter`
+//! gates — the WS path does **not** create a second, weaker ingress. A browser client
+//! must solve the same PoW challenge and is subject to the same per-identity rate limit
+//! before any store/pickup operation is accepted. Envelopes are queued in
+//! `store::Mailbox` (FIFO per recipient); prekey bundles stay in `store::RelayStore`.
 //!
 //! ## Wire protocol
 //!
@@ -311,6 +313,7 @@ fn truncate_id(id: &str) -> String {
 fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
     match e {
         MailboxError::QueueFull => WsResponse::err("QueueFull"),
+        // NotFound/Expired are unreachable from enqueue; kept for exhaustiveness.
         other => WsResponse::err(format!("StoreError: {other:?}")),
     }
 }
