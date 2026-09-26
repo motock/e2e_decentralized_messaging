@@ -129,7 +129,8 @@ fn expired_entries_do_not_count_toward_the_depth_cap() {
     mb.enqueue("alice", env(2), DEAD).unwrap();
 
     // The queue is "full" only with expired entries, so a live one still fits.
-    mb.enqueue("alice", env(3), LIVE).expect("expired entries dropped first");
+    mb.enqueue("alice", env(3), LIVE)
+        .expect("expired entries dropped first");
     assert_eq!(mb.dequeue("alice").unwrap(), env(3));
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
