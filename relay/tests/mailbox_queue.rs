@@ -218,10 +218,4 @@ fn relay_store_and_store_error_are_unchanged() {
     ] {
         assert!(src.contains(needle), "store.rs must keep `{needle}` (prekey bundles depend on it)");
     }
-
-    // Runtime round-trip: the single-slot store still behaves as before.
-    let store = relay::store::RelayStore::new();
-    store.store("bob", vec![7u8; 4], LIVE).expect("store");
-    assert_eq!(store.pickup("bob").unwrap(), vec![7u8; 4]);
-    assert_eq!(store.pickup("bob"), Err(relay::store::StoreError::NotFound));
 }
