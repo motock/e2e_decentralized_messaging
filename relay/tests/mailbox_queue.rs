@@ -60,8 +60,7 @@ fn envelope_enqueued_after_a_dequeue_is_returned() {
 
 #[test]
 fn dequeue_with_nothing_ever_stored_is_not_found() {
-    let mb = Mailbox::new(8);
-    assert_eq!(mb.dequeue("nobody"), Err(MailboxError::NotFound));
+    assert_eq!(Mailbox::new(8).dequeue("nobody"), Err(MailboxError::NotFound));
 }
 
 #[test]
@@ -74,11 +73,7 @@ fn queue_accepts_up_to_max_depth_then_rejects_without_dropping() {
     assert_full(mb.enqueue("alice", env(4), LIVE));
 
     for tag in 1..=3u8 {
-        assert_eq!(
-            mb.dequeue("alice").unwrap(),
-            env(tag),
-            "envelope {tag} must survive"
-        );
+        assert_eq!(mb.dequeue("alice").unwrap(), env(tag), "envelope {tag} survives");
     }
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
@@ -127,8 +122,7 @@ fn expired_entries_do_not_count_toward_the_depth_cap() {
     mb.enqueue("alice", env(2), DEAD).unwrap();
 
     // The queue is "full" only with expired entries, so a live one still fits.
-    mb.enqueue("alice", env(3), LIVE)
-        .expect("expired entries dropped first");
+    mb.enqueue("alice", env(3), LIVE).expect("expired dropped first");
     assert_eq!(mb.dequeue("alice").unwrap(), env(3));
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
@@ -139,8 +133,7 @@ fn default_max_depth_is_64_and_default_matches_it() {
 
     let mb = Mailbox::default();
     for tag in 0..64u8 {
-        mb.enqueue("alice", env(tag), LIVE)
-            .expect("within default depth");
+        mb.enqueue("alice", env(tag), LIVE).expect("within default depth");
     }
     assert_full(mb.enqueue("alice", env(99), LIVE));
 }
@@ -158,16 +151,9 @@ fn mailbox_error_is_debug_and_partial_eq() {
 #[test]
 fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
     let src = include_str!("../src/store.rs");
-    let store_at = src
-        .find("pub struct RelayStore")
-        .expect("RelayStore stays in store.rs");
-    let mailbox_at = src
-        .find("pub struct Mailbox ")
-        .expect("Mailbox must be in store.rs");
-    assert!(
-        mailbox_at > store_at,
-        "Mailbox must be defined below RelayStore"
-    );
+    let store_at = src.find("pub struct RelayStore").expect("RelayStore stays");
+    let mailbox_at = src.find("pub struct Mailbox ").expect("Mailbox must be in store.rs");
+    assert!(mailbox_at > store_at, "Mailbox must be defined below RelayStore");
 
     // Walk back over attribute/blank lines to the doc comment block.
     let mut preceding = src[..mailbox_at]
@@ -175,18 +161,11 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
         .rev()
         .skip_while(|l| l.trim_start().starts_with("#[") || l.trim().is_empty());
     assert!(
-        preceding
-            .next()
-            .unwrap_or("")
-            .trim_start()
-            .starts_with("///"),
+        preceding.next().unwrap_or("").trim_start().starts_with("///"),
         "Mailbox must carry a doc comment explaining why it exists next to RelayStore"
     );
 
-    assert!(
-        src.contains("pub enum MailboxError"),
-        "MailboxError must be public"
-    );
+    assert!(src.contains("pub enum MailboxError"), "MailboxError must be public");
     assert!(
         src.contains("pub const DEFAULT_MAX_ENVELOPES_PER_RECIPIENT"),
         "DEFAULT_MAX_ENVELOPES_PER_RECIPIENT must be a public const"
@@ -200,12 +179,9 @@ fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
 #[test]
 fn mailbox_exposes_only_new_enqueue_and_dequeue() {
     let src = include_str!("../src/store.rs");
-    let start = src
-        .find("impl Mailbox {")
-        .expect("impl Mailbox block must exist");
+    let start = src.find("impl Mailbox {").expect("impl Mailbox block must exist");
     let rest = &src[start..];
-    let end = rest.find("\n}").expect("impl Mailbox must be closed");
-    let body = &rest[..end];
+    let body = &rest[..rest.find("\n}").expect("impl Mailbox must be closed")];
 
     let mut names: Vec<&str> = body
         .lines()
@@ -225,7 +201,7 @@ fn mailbox_exposes_only_new_enqueue_and_dequeue() {
 }
 
 #[test]
-fn relay_store_and_store_error_are_unchanged() {
+fn relay_store_store_error_and_ws_rs_are_unchanged() {
     let src = include_str!("../src/store.rs");
     for needle in [
         "pub enum StoreError",
@@ -238,17 +214,9 @@ fn relay_store_and_store_error_are_unchanged() {
     ] {
         assert!(src.contains(needle), "store.rs must keep `{needle}`");
     }
-}
 
-#[test]
-fn ws_rs_is_untouched_by_this_story() {
+    // This story must not switch ws.rs call sites over to Mailbox.
     let ws = include_str!("../src/ws.rs");
-    assert!(
-        !ws.contains("Mailbox"),
-        "this story must not switch ws.rs call sites to Mailbox"
-    );
-    assert!(
-        ws.contains("RelayStore"),
-        "ws.rs must keep using RelayStore for now"
-    );
+    assert!(!ws.contains("Mailbox"), "ws.rs must not reference Mailbox yet");
+    assert!(ws.contains("RelayStore"), "ws.rs must keep using RelayStore");
 }
