@@ -184,11 +184,16 @@ fn mailbox_error_is_debug_and_partial_eq() {
 #[test]
 fn mailbox_is_defined_below_relay_store_with_a_doc_comment() {
     let src = include_str!("../src/store.rs");
-    let store_at = src.find("pub struct RelayStore").expect("RelayStore must remain in store.rs");
+    let store_at = src
+        .find("pub struct RelayStore")
+        .expect("RelayStore must remain in store.rs");
     let mailbox_at = src
         .find("pub struct Mailbox ")
         .expect("Mailbox must be added to store.rs");
-    assert!(mailbox_at > store_at, "Mailbox must be defined below the existing RelayStore");
+    assert!(
+        mailbox_at > store_at,
+        "Mailbox must be defined below the existing RelayStore"
+    );
 
     // Walk back over attribute/blank lines to find the doc comment block.
     let mut preceding = src[..mailbox_at].lines().rev().skip_while(|l| {
