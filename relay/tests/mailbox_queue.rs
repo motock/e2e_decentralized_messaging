@@ -100,8 +100,14 @@ fn queue_accepts_up_to_max_depth_then_rejects_without_dropping() {
 #[test]
 fn zero_depth_rejects_every_enqueue() {
     let mb = Mailbox::new(0);
-    assert_eq!(mb.enqueue("alice", env(1), LIVE), Err(MailboxError::QueueFull));
-    assert_eq!(mb.enqueue("alice", env(2), LIVE), Err(MailboxError::QueueFull));
+    assert_eq!(
+        mb.enqueue("alice", env(1), LIVE),
+        Err(MailboxError::QueueFull)
+    );
+    assert_eq!(
+        mb.enqueue("alice", env(2), LIVE),
+        Err(MailboxError::QueueFull)
+    );
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
 
@@ -109,7 +115,10 @@ fn zero_depth_rejects_every_enqueue() {
 fn depth_one_accepts_one_then_rejects() {
     let mb = Mailbox::new(1);
     mb.enqueue("alice", env(1), LIVE).expect("first fits");
-    assert_eq!(mb.enqueue("alice", env(2), LIVE), Err(MailboxError::QueueFull));
+    assert_eq!(
+        mb.enqueue("alice", env(2), LIVE),
+        Err(MailboxError::QueueFull)
+    );
     assert_eq!(mb.dequeue("alice").unwrap(), env(1));
     assert_eq!(mb.dequeue("alice"), Err(MailboxError::NotFound));
 }
