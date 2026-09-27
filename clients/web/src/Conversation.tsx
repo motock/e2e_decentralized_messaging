@@ -9,7 +9,12 @@ import {
 import { ensureWasmInit } from './wasm_init';
 import { StorageGate, StoreName } from './storage';
 import { getStorageKey } from './storage_key';
-import { persistSessionRecord, RECEIVER_RECORD_ID } from './session_persistence';
+import {
+    persistSessionRecord,
+    restoreSessionRecord,
+    senderRecordId,
+    RECEIVER_RECORD_ID,
+} from './session_persistence';
 import { RelayTransport } from './relay_transport';
 import type { PersistedIdentity } from './identity';
 import './Conversation.css';
@@ -305,9 +310,47 @@ export const Conversation: React.FC<ConversationProps> = ({
         try {
             let peerSession = sessionsRef.current.get(trimmedPeerId);
 
+            // Lazy restore: a previous run may have saved this peer's sender
+            // session. Only a record that carries the peer's identity key is
+            // usable — without it the safety number cannot be reported, so the
+            // record is treated as unusable and a fresh session is established
+            // instead. A partially restored session is never used.
+            let restoreFailed = false;
             if (!peerSession) {
-                setStatus('Looking up peer…');
+                // Restoring a session deserializes it in WASM, so make sure the
+                // module is ready before the first attempt (the establishment path
+                // below needs it too).
                 await ensureWasmInit();
+                try {
+                    const restored = await restoreSessionRecord(
+                        await getSessionGate(),
+                        senderRecordId(trimmedPeerId),
+                        identity.handle,
+                    );
+                    if (restored && restored.remoteIdentityKey) {
+                        peerSession = {
+                            session: restored.session,
+                            remoteIdentityKey: restored.remoteIdentityKey,
+                        };
+                        sessionsRef.current.set(trimmedPeerId, peerSession);
+                        onRemoteIdentityKeyChange?.(trimmedPeerId, restored.remoteIdentityKey);
+                    } else if (restored) {
+                        restoreFailed = true;
+                    }
+                } catch {
+                    // Static message only: a record's contents (blob bytes, keys)
+                    // must never reach a log, an error message, or the UI.
+                    console.warn('failed to restore saved sender session');
+                    restoreFailed = true;
+                }
+            }
+
+            if (!peerSession) {
+                setStatus(
+                    restoreFailed
+                        ? 'Saved session for this peer could not be restored; establishing a new one'
+                        : 'Looking up peer…',
+                );
 
                 let bundleBytes: Uint8Array;
                 try {
@@ -354,6 +397,23 @@ export const Conversation: React.FC<ConversationProps> = ({
                 envelope = encrypt_message(peerSession.session, plaintextBytes);
             } catch (e) {
                 setStatus(`Encrypt failed: ${describeError(e)}`);
+                return;
+            }
+
+            // Persist the advanced ratchet state BEFORE the envelope leaves the
+            // device. A skipped ratchet step is safe; a reused message key is not,
+            // so a failed save must abort the send rather than deliver a message
+            // whose key material was never recorded.
+            try {
+                await persistSessionRecord(
+                    await getSessionGate(),
+                    senderRecordId(trimmedPeerId),
+                    peerSession.session,
+                    peerSession.remoteIdentityKey,
+                );
+            } catch {
+                console.warn('failed to persist sender session');
+                setStatus('Could not save session state; message not sent');
                 return;
             }
 
