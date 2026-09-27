@@ -1,6 +1,5 @@
 import React from 'react';
 import Banner from './Banner';
-import WarningBanner from './WarningBanner';
 import { Conversation } from './Conversation';
 import { SafetyNumberVerification } from './SafetyNumberVerification';
 import { BackupPanel } from './BackupPanel';
@@ -144,7 +143,6 @@ export default function App() {
         <div className="shell">
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
                 <Banner />
-                <WarningBanner />
                 <div className="shell-body">
                     <nav className="rail" aria-label="Sections">
                         <div className="rail-identity">

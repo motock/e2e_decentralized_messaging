@@ -104,10 +104,21 @@ See PLAN.md §5 for the documented reduced threat model on web (no secure enclav
 
 ## Session persistence
 
-The web client does not currently persist the cryptographic session across page
-reloads. If you have an active conversation and reload the page, the session
-will be lost and messages may fail to decrypt. A banner warns you of this while
-a session is active — please save any unsent messages before reloading.
+The web client persists its cryptographic state in the browser's encrypted
+IndexedDB store, so it survives a page reload:
+
+- The identity key is loaded from storage (or generated and persisted on first
+  run).
+- The receiver session is restored at startup and re-saved after every
+  successful decrypt.
+- Per-peer sender sessions are saved before each send and restored lazily when
+  a peer is next messaged.
+- Message history is stored alongside the session state.
+
+Limits that remain: clearing site data or opening the app in another browser or
+on another device starts fresh, and a message can still be lost if the tab dies
+between the relay handing it over and the save. A failed session save shows a
+warning rather than silently continuing.
 
 ## Encrypted storage API
 
