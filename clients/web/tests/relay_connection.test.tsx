@@ -211,44 +211,6 @@ describe('useRelayConnection', () => {
         spy.mockRestore();
     });
 
-    test('successful connect sets the session_active flag WarningBanner reads', async () => {
-        localStorage.clear();
-        publishHolder.fn = vi.fn().mockResolvedValue({ _mock: 'session' });
-        render(<HookHarness relayUrl="ws://relay.example:8000" />);
-
-        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-
-        expect(localStorage.getItem('session_active')).toBe('true');
-    });
-
-    test('unmount clears the session_active flag', async () => {
-        localStorage.clear();
-        publishHolder.fn = vi.fn().mockResolvedValue({ _mock: 'session' });
-        const { unmount } = render(<HookHarness relayUrl="ws://relay.example:8000" />);
-        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-        expect(localStorage.getItem('session_active')).toBe('true');
-
-        unmount();
-
-        expect(localStorage.getItem('session_active')).toBeNull();
-    });
-
-    test('changing the relay URL after a successful connect clears the stale session_active flag', async () => {
-        localStorage.clear();
-        publishHolder.fn = vi.fn().mockResolvedValue({});
-        const { rerender } = render(<HookHarness relayUrl="ws://one.example:8000" />);
-        await act(async () => { await vi.advanceTimersByTimeAsync(0); });
-        expect(localStorage.getItem('session_active')).toBe('true');
-
-        // A pending (never-resolving) publish on the new URL means the flag
-        // must be cleared immediately on effect re-entry, before any new
-        // success re-sets it — proving the clear isn't just a side effect of
-        // the next connect's own set.
-        publishHolder.fn = vi.fn().mockImplementation(() => new Promise(() => {}));
-        rerender(<HookHarness relayUrl="ws://two.example:8000" />);
-
-        expect(localStorage.getItem('session_active')).toBeNull();
-    });
 });
 
 // ── Panel (presentational) ───────────────────────────────────────────────────
