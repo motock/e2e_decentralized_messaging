@@ -53,6 +53,11 @@ const NAV_ITEMS: { id: ViewId; label: string; title: string; subtitle: string }[
 
 export default function App() {
     const [identity, setIdentity] = React.useState<PersistedIdentity | null>(null);
+    // The encrypted store opened for identity loading, held so the relay
+    // connection can persist/restore the receiver session through it. It is
+    // set in the same synchronous block as `identity` so a single render
+    // carries both (see the startup effect below).
+    const [sessionGate, setSessionGate] = React.useState<StorageGate | undefined>(undefined);
     // Relay endpoint, resolved at startup via getRelayWsUrl() (localStorage >
     // VITE_RELAY_WS_URL > dev default) and editable at runtime through the
     // relay panel. An empty field resets to that same resolution order.
@@ -91,6 +96,11 @@ export default function App() {
             await gate.open();
             const id = await loadOrGenerateIdentity(gate);
             if (cancelled) return;
+            // Set both in the same synchronous block (no await between them) so
+            // React batches them into ONE render where identity and sessionGate
+            // are both present — useRelayConnection then receives the gate on
+            // that render and persists the receiver session it creates.
+            setSessionGate(gate);
             setIdentity(id);
             // Prekey publishing (with retry/backoff + human status) is driven
             // by useRelayConnection below, which starts once `identity` is set.
@@ -103,7 +113,7 @@ export default function App() {
     // Retry-with-backoff prekey publish + Connecting/Connected/Unreachable
     // status. The receiver session it produces on success is handed to
     // Conversation's receive loop.
-    const conn = useRelayConnection(identity, relayUrl);
+    const conn = useRelayConnection(identity, relayUrl, sessionGate);
 
     const handleRelayUrlChange = React.useCallback((url: string) => {
         if (url === '') {
