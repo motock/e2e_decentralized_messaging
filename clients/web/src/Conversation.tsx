@@ -89,6 +89,18 @@ function describeError(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * Merge the message history just read from storage with whatever is already in
+ * memory. The stored ordering is authoritative; any in-memory message whose id
+ * is not in the stored history — i.e. one that arrived while the load was in
+ * flight — is appended after it. `stored` is null/undefined when the store has
+ * never been written, in which case the in-memory messages are the whole history.
+ */
+function mergeHistory(stored: Message[] | null | undefined, prev: Message[]): Message[] {
+    const base = stored ?? [];
+    return [...base, ...prev.filter(p => !base.some(m => m.id === p.id))];
+}
+
 export const Conversation: React.FC<ConversationProps> = ({
     identity,
     transport,
@@ -152,15 +164,21 @@ export const Conversation: React.FC<ConversationProps> = ({
         return sessionGateRef.current;
     };
 
-    // Load history from storage on mount
+    // Load history from storage on mount. The load MERGES into whatever arrived
+    // while it was in flight: the stored ordering is authoritative and any
+    // in-memory message whose id is not in storage is appended, so an envelope
+    // picked up during the read is neither dropped from the UI nor lost from
+    // state. `loadedRef` is set BEFORE the state update so the persist effect can
+    // never observe the merged render while its guard is still closed — that
+    // render is what flushes the in-flight message to storage.
     useEffect(() => {
         const gate = new StorageGate({ indexedDB: (globalThis as any).indexedDB, keyBytes: getStorageKey() });
         gate.open().then(async () => {
             try {
                 // StorageGate.get already returns the parsed value (or null).
                 const stored = await gate.get(MESSAGES_STORE, HISTORY_ID);
-                if (stored) setMessages(stored as Message[]);
                 loadedRef.current = true;
+                setMessages(prev => mergeHistory(stored as Message[] | null, prev));
             } catch (e) {
                 console.error('storage load error', e);
             }
