@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { RelayTransport } from './relay_transport';
 import { publishPrekeyForIdentity, type PersistedIdentity } from './identity';
+import type { StorageGate } from './storage';
 import type { SessionHandle } from '../../../core/bindings/wasm/pkg/index.js';
 
 // Relay connection UX for the web client.
@@ -62,10 +63,17 @@ export interface UseRelayConnectionResult {
  * changes, so there are never overlapping retry loops and no state updates
  * after unmount. Errors from `publishPrekeyForIdentity` are caught here (the
  * loop must not surface an unhandled rejection).
+ *
+ * An optional `sessionGate` is forwarded to `publishPrekeyForIdentity` so the
+ * receiver session is restored from (and re-persisted to) the encrypted store
+ * instead of being recreated on every load. The gate is supplied by the caller
+ * (App) — this hook never constructs one, so it stays renderable without
+ * IndexedDB.
  */
 export function useRelayConnection(
     identity: PersistedIdentity | null,
     relayUrl: string,
+    sessionGate?: StorageGate,
 ): UseRelayConnectionResult {
     const [status, setStatus] = useState<RelayStatus>('connecting');
     const [error, setError] = useState<string | null>(null);
@@ -106,7 +114,7 @@ export function useRelayConnection(
             if (attemptIdx < INITIAL_ATTEMPTS) setStatus('connecting');
 
             try {
-                const session = await publishPrekeyForIdentity(identity, transport);
+                const session = await publishPrekeyForIdentity(identity, transport, sessionGate);
                 if (cancelled) return;
                 setReceiverSession(session);
                 // Persist a flag so WarningBanner can warn that reloading loses
@@ -148,7 +156,9 @@ export function useRelayConnection(
         };
         // identity is included because the effect closes over it; it is set
         // once (null → loaded) and then stable, so this does not cause loops.
-    }, [recipientId, relayUrl, retryCount, identity]);
+        // sessionGate is included so a gate that arrives after the first render
+        // (App opens storage asynchronously) is picked up rather than left stale.
+    }, [recipientId, relayUrl, retryCount, identity, sessionGate]);
 
     const retry = useCallback(() => setRetryCount((n) => n + 1), []);
 

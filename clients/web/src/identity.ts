@@ -32,6 +32,11 @@ import {
     type IdentityHandle,
 } from '../../../core/bindings/wasm/pkg/index.js';
 import type { StorageGate } from './storage';
+import {
+    persistSessionRecord,
+    restoreSessionRecord,
+    RECEIVER_RECORD_ID,
+} from './session_persistence';
 
 /** The IndexedDB store and record id used for the identity keypair. */
 const IDENTITY_STORE = 'identity' as const;
@@ -222,21 +227,66 @@ export interface PrekeyTransport {
  * `create_receiver_session` + `publish_bundle_bytes` instead, which produce
  * the bundle from a retained session handle we can hand to the receive loop.
  *
+ * ## Session persistence (optional `gate`)
+ *
+ * When a `StorageGate` is supplied, the receiver session is restored from the
+ * encrypted store (store `'session'`, record `RECEIVER_RECORD_ID`) instead of
+ * being recreated on every load, so a peer that already fetched this client's
+ * prekey bundle keeps decrypting after a reload. The session is re-persisted
+ * *before* the bundle is published, so the stored state always matches the
+ * bundle a peer can fetch.
+ *
+ * Both persistence steps fail soft, because a client that cannot reach its
+ * store must still become reachable on the relay:
+ * - a restore that returns nothing or throws falls back to a fresh session
+ *   (a throw logs a static warning; a `null` return is simply "nothing saved");
+ * - a save that fails is non-fatal and logs a static warning.
+ *
+ * Warnings are static strings only — session bytes, keys, and peer ids are
+ * never logged.
+ *
  * If the relay is unreachable, `publishPrekey` rejects and the error
  * propagates — the caller must surface a visible error state, not swallow it.
  *
  * @param identity The loaded/generated identity.
  * @param transport The relay transport (or a mock).
+ * @param gate Optional encrypted store used to persist/restore the receiver
+ *             session. When omitted, no storage is touched and the function
+ *             behaves exactly as before.
  * @returns The receiver session handle — pass this to `<Conversation receiverSession={...} />`
  *          so the receive loop decrypts with the same session whose bundle was published.
  */
 export async function publishPrekeyForIdentity(
     identity: PersistedIdentity,
     transport: PrekeyTransport,
+    gate?: StorageGate,
 ): Promise<InstanceType<typeof SessionHandle>> {
-    const session = create_receiver_session(
-        identity.handle as unknown as InstanceType<typeof IdentityHandle>,
-    );
+    let session: ReturnType<typeof create_receiver_session> | null = null;
+
+    if (gate) {
+        try {
+            const restored = await restoreSessionRecord(gate, RECEIVER_RECORD_ID, identity.handle);
+            session = restored ? restored.session : null;
+        } catch {
+            console.warn('receiver session restore failed; creating a new session');
+            session = null;
+        }
+    }
+
+    if (!session) {
+        session = create_receiver_session(
+            identity.handle as unknown as InstanceType<typeof IdentityHandle>,
+        );
+    }
+
+    if (gate) {
+        try {
+            await persistSessionRecord(gate, RECEIVER_RECORD_ID, session);
+        } catch {
+            console.warn('receiver session could not be saved; continuing in memory');
+        }
+    }
+
     const bundle = publish_bundle_bytes(session);
     await transport.publishPrekey(identity.recipientId, bundle);
     return session;
