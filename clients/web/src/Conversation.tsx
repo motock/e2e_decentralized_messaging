@@ -9,6 +9,7 @@ import {
 import { ensureWasmInit } from './wasm_init';
 import { StorageGate, StoreName } from './storage';
 import { getStorageKey } from './storage_key';
+import { persistSessionRecord, RECEIVER_RECORD_ID } from './session_persistence';
 import { RelayTransport } from './relay_transport';
 import type { PersistedIdentity } from './identity';
 import './Conversation.css';
@@ -95,11 +96,12 @@ export const Conversation: React.FC<ConversationProps> = ({
     const [status, setStatus] = useState<string>('');
     const [sending, setSending] = useState(false);
     const [decryptionWarning, setDecryptionWarning] = useState<string>('');
+    const [persistenceWarning, setPersistenceWarning] = useState<string | null>(null);
     const loadedRef = React.useRef(false);
-    // SessionHandle is a WASM-side opaque handle with no serialization support (see
-    // core/bindings/wasm/src/lib.rs's SessionHandle doc comment) - it is kept in this
-    // module-instance ref for the component's lifetime only. A page reload loses all
-    // in-flight session state and the next send re-establishes from scratch.
+    // Live sender-side sessions for the peers this component talks to, keyed by
+    // peer id. A SessionHandle is serializable (session_to_bytes/session_from_bytes)
+    // and its ratchet state is persisted through StorageGate, so this ref is an
+    // in-memory cache over persisted state rather than the only copy of it.
     const sessionsRef = useRef<Map<string, PeerSession>>(new Map());
     const transportRef = useRef<ConversationTransport>(transport ?? new RelayTransport());
     // Receiver-side session for decrypting inbound envelopes. Injected by the
@@ -107,8 +109,9 @@ export const Conversation: React.FC<ConversationProps> = ({
     // whose prekey bundle was published to the relay, so envelopes encrypted to
     // that bundle can be decrypted here. The component does NOT create its own
     // session, because that would be cryptographically distinct from the published
-    // bundle. Like SessionHandle, it is not serializable and lives only for the
-    // component's lifetime.
+    // bundle. Its ratchet state is serializable and is persisted through
+    // StorageGate after every successful decrypt, so a reload can restore it and
+    // keep decrypting.
     const receiverSessionRef = useRef<InstanceType<typeof SessionHandle> | null>(null);
     // Mirror the `receiverSession` prop into a ref so the receive-loop effect (which
     // depends on `[identity]`, not `receiverSession`) always reads the latest value.
@@ -125,6 +128,24 @@ export const Conversation: React.FC<ConversationProps> = ({
     // concurrent pickups (which could double-process an envelope before dedup
     // sees it, or create unnecessary relay load).
     const pollInFlightRef = useRef<boolean>(false);
+    // Lazily-created, single StorageGate used to persist the receiver session.
+    // Created once per component instance (and opened) so every successful
+    // decrypt reuses the same open gate instead of opening a new one per message.
+    const sessionGateRef = useRef<StorageGate | null>(null);
+
+    /**
+     * Return this component instance's open StorageGate for session persistence,
+     * creating and opening it on first use. Uses the same construction as the
+     * message-history effects (global IndexedDB + the derived storage key).
+     */
+    const getSessionGate = async (): Promise<StorageGate> => {
+        if (!sessionGateRef.current) {
+            const gate = new StorageGate({ indexedDB: (globalThis as any).indexedDB, keyBytes: getStorageKey() });
+            await gate.open();
+            sessionGateRef.current = gate;
+        }
+        return sessionGateRef.current;
+    };
 
     // Load history from storage on mount
     useEffect(() => {
@@ -209,6 +230,24 @@ export const Conversation: React.FC<ConversationProps> = ({
 
                 // Success: clear any prior warning and append the decrypted message.
                 setDecryptionWarning('');
+                // Persist the advanced ratchet state BEFORE rendering the message:
+                // the relay has already consumed the envelope, so if the save fails
+                // the message must still be shown (dropping it would lose it) but
+                // the user is warned that a reload may not be able to decrypt
+                // subsequent messages.
+                try {
+                    await persistSessionRecord(
+                        await getSessionGate(),
+                        RECEIVER_RECORD_ID,
+                        receiverSessionRef.current,
+                    );
+                    setPersistenceWarning(null);
+                } catch {
+                    console.warn('failed to persist receiver session');
+                    setPersistenceWarning(
+                        'Session state could not be saved. Messages received after a reload may fail to decrypt.',
+                    );
+                }
                 const body = new TextDecoder().decode(plaintext);
                 const msg: Message = {
                     id: Math.random().toString(36).substr(2, 9),
@@ -378,6 +417,9 @@ export const Conversation: React.FC<ConversationProps> = ({
             </div>
             {decryptionWarning && (
                 <p className="thread-warning" role="alert">{decryptionWarning}</p>
+            )}
+            {persistenceWarning && (
+                <p className="thread-warning" role="alert">{persistenceWarning}</p>
             )}
             {status && <p className="thread-status">{status}</p>}
         </div>
