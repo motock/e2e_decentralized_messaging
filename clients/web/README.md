@@ -117,12 +117,16 @@ IndexedDB store, so it survives a page reload:
 
 Limits that remain: clearing site data or opening the app in another browser or
 on another device starts fresh, and a message can still be lost if the tab dies
-between the relay handing it over and the save. A failed save is surfaced where
-it is actionable: a failed pre-send save stops the send with "Could not save
-session state; message not sent", and a failed save after a decrypt shows a
-warning in the conversation. The startup receiver-session save and the
-message-history write are logged to the console only — if the startup save
-fails, the session continues in memory for that page load.
+after the relay hands it over but before it has been stored: the relay deletes
+each envelope as it delivers it, and the decrypted text only reaches storage
+once it has been rendered. A death in that window loses the message permanently
+— the ratchet has already advanced past it and the relay keeps no copy. A
+failed save is surfaced where it is actionable: a failed pre-send save stops
+the send with "Could not save session state; message not sent", and a failed
+save after a decrypt shows a warning in the conversation. The startup
+receiver-session save and the message-history write are logged to the console
+only — if the startup save fails, the session continues in memory for that
+page load.
 
 ## Encrypted storage API
 
