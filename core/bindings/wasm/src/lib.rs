@@ -666,3 +666,81 @@ pub fn encode_device_qr(identity_public_key_bytes: &[u8]) -> Result<String, Wasm
 pub fn decode_device_qr(qr_payload: &str) -> Result<Vec<u8>, WasmError> {
     device_qr::decode_device_qr(qr_payload).map_err(|e| WasmError::new("QrDecode", &e.to_string()))
 }
+
+// ---------------------------------------------------------------------------
+// Session / group state persistence (NS-5D)
+// ---------------------------------------------------------------------------
+
+/// Serialize an established session to a self-contained byte blob that
+/// [`session_from_bytes`] can restore, given the same local identity the session was created
+/// with. The blob is the inverse of [`session_from_bytes`] and lets a client resume a
+/// conversation across a reload without re-running PQXDH.
+///
+/// **Security:** the returned bytes contain **secret ratchet state** (the libsignal
+/// `SessionRecord`, including chain keys, and for a receiver the prekey private material). The
+/// CALLER MUST encrypt them at rest before persisting them — the web client's `StorageGate`
+/// does. Never log or `Debug`-print the blob or any key material.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Session"` if the session is neither a sender with an
+/// outbound session nor a receiver holding prekeys, or if serialization fails. Never panics.
+#[wasm_bindgen]
+pub fn session_to_bytes(session: &SessionHandle) -> Result<Vec<u8>, WasmError> {
+    block_on(async { session.inner.to_bytes().await.map_err(WasmError::from) })
+}
+
+/// Restore a session from the blob produced by [`session_to_bytes`], using the local identity
+/// keypair the session was created with. The identity is required because the blob deliberately
+/// excludes it (data minimization), so the caller must supply it from its own encrypted store.
+///
+/// Fails closed: any malformed, truncated, over-long, unknown-version, or wrong-identity input
+/// returns `Err` and no partially restored session is ever returned.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Session"` if the bytes are empty, truncated, carry an
+/// unknown version, contain trailing bytes, or were produced under a different identity. Never
+/// panics.
+#[wasm_bindgen]
+pub fn session_from_bytes(
+    identity_handle: &IdentityHandle,
+    bytes: &[u8],
+) -> Result<SessionHandle, WasmError> {
+    let session = block_on(async {
+        DoubleRatchetSession::from_bytes(identity_handle.inner.as_libsignal(), bytes)
+            .await
+            .map_err(WasmError::from)
+    })?;
+
+    Ok(SessionHandle { inner: session })
+}
+
+/// Serialize a Sender Keys group session to a self-contained byte blob that
+/// [`group_from_bytes`] can restore. A restored group continues from the current chain-key
+/// position instead of replaying keys already used.
+///
+/// **Security:** the returned bytes contain **secret ratchet state** (the group chain key,
+/// copied verbatim). The CALLER MUST encrypt them at rest before persisting them — the web
+/// client's `StorageGate` does. Never log or `Debug`-print the blob or any key material.
+#[wasm_bindgen]
+pub fn group_to_bytes(group: &GroupHandle) -> Vec<u8> {
+    group.inner.to_bytes()
+}
+
+/// Restore a group session from the blob produced by [`group_to_bytes`].
+///
+/// Fails closed: every malformed, truncated, or over-long input returns `Err` and no partially
+/// restored group is ever returned.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Group"` if the bytes are empty, truncated, carry an
+/// unknown version, declare a segment longer than the bytes remaining, or contain trailing
+/// bytes. Never panics.
+#[wasm_bindgen]
+pub fn group_from_bytes(bytes: &[u8]) -> Result<GroupHandle, WasmError> {
+    let session = GroupSession::from_bytes(bytes).map_err(WasmError::from)?;
+
+    Ok(GroupHandle { inner: session })
+}
