@@ -106,3 +106,8 @@ echo
 [step 36] bash: echo "=== crypto/src/lib.rs ==="; grep -n "pub use\|pub mod\|pub fn" core/crypto/src/lib.rs | head -40
 echo "=== crypto/
 [step 36] bash: ls ~/.cargo/registry/src/ 2>/dev/null; ls -d ~/.cargo/registry/src/*/libsignal* 2>/dev/null | head
+[step 37] bash: sed -n '1,60p' core/crypto/src/lib.rs; echo "..... 100-215 ....."; sed -n '100,215p' core/crypto/src/lib.rs
+[step 38] bash: sed -n '60,100p' core/crypto/src/lib.rs; echo "===== 140-215 ====="; sed -n '140,215p' core/crypto/src/lib.rs
+[step 39] bash: echo "=== IdentityKeyPairExt ==="; grep -n "trait IdentityKeyPairExt" -A 25 core/crypto/src/ratchet_session.rs | head -4
+[step 40] create_file: core/protocol/tests/device_revocation.rs
+[step 41] bash: cargo test -p protocol --test device_revocation 2>&1 | tail -40
