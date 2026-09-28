@@ -100,7 +100,13 @@ These headers complement the CSP meta tag and provide additional protection when
 - For more context on the reduced threat model and how it affects multi-device usage, see [PLAN.md §5](../PLAN.md) (the same link-rather-than-restate convention used in `docs/two-machine-testing.md`).
 
 React app consuming the shared Rust core via WASM bindings (`core/bindings/wasm`).
-See PLAN.md §5 for the documented reduced threat model on web (no secure enclave).
+Current state: identity, sessions, message history, safety-number verification, and relay
+transport are implemented and covered by the Vitest suite. Target state (not yet built):
+multi-device sync and any native (non-browser) platform — see [PLAN.md §6.5](../PLAN.md) for
+the current-state vs target-state breakdown.
+See PLAN.md §5 for the documented reduced threat model on web (no secure enclave): the app
+shows a warning about it before first use, and browser key storage is weaker than on
+mobile/desktop by design of the platform, not by omission in this client.
 
 ## Session persistence
 

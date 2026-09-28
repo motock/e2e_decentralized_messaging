@@ -136,6 +136,24 @@ Portability is treated on four axes:
 /docs            Architecture, threat model, operator guide
 ```
 
+### 6.5 Current state vs target state
+
+The tree above is the **target layout**. Not every box is built today, and this document
+deliberately describes the finished design; read it as the destination, not a status report.
+What exists and is tested right now (see the per-crate tests and `docs/threat-model.md`):
+
+- **Built:** the Rust core (`core/crypto`, `core/protocol`, `core/storage`, `core/transport`,
+  including Sealed Sender and padding), the standalone relay (`relay/`), the UniFFI and WASM
+  bindings, the web client (`clients/web`), and the desktop client (`clients/desktop-tauri`).
+- **Scaffolded only:** `clients/desktop`, `clients/ios`, and `clients/android` are placeholder
+  directories with a README each — no implementation yet (Phase 8).
+- **Not started:** multi-device history sync (a later epic, per §4) and the Phase 9 hardening
+  items (external audit, fuzzing, Tor/mixnet transport).
+
+Everything else in this plan — DHT discovery, relay store-and-forward, group Sender Keys,
+backup export/import — is implemented and covered by the suites; where a capability is still
+future work, this plan says so explicitly (§4, §7, §10) rather than in the present tense.
+
 ---
 
 ## 7. Phased Roadmap
