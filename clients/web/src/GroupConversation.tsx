@@ -275,8 +275,9 @@ function isByte(entry: unknown): entry is number {
  *
  * Returns the bytes, or `null` when the record simply has no blob (a legacy
  * record from before ratchet persistence). Throws on a blob that is present
- * but structurally invalid — the caller must fail closed rather than rebuild
- * a fresh chain, which would rewind the ratchet and reuse (key, nonce) pairs.
+ * but structurally invalid — the caller must fail closed rather than build a
+ * fresh session: a fresh session starts a different chain, and silently
+ * dropping the persisted state is the very failure this persistence prevents.
  */
 function validatedGroupBlob(blob: unknown): Uint8Array | null {
     if (blob === undefined || blob === null) return null;
