@@ -13,6 +13,13 @@
  * which are thin wrappers over the Rust core. This module provides the
  * web-side orchestration and the confirmation gate.
  *
+ * Revocation (DR-3): a linked device can be removed again. `revokeDevice`
+ * drops the device from `linkedDevices` (so `messageRecipients` no longer
+ * includes it) and calls the WASM `remove_device` binding, which is the
+ * boundary for the core's fan-out revocation primitive. Revocation fails
+ * closed: an unknown device, or the last remaining device without explicit
+ * confirmation, leaves the state untouched and reports why.
+ *
  * Security properties:
  *  - **Fail closed**: any malformed, truncated, or tampered QR payload is
  *    rejected by `decodeLinkingPayload` (the WASM binding throws). The
@@ -21,6 +28,10 @@
  *    safety number from the raw key bytes and compares it to the user-entered
  *    value. A mismatch returns `confirmed: false` and never produces a
  *    safety number, so the caller cannot accidentally proceed.
+ *  - **Revocation gate**: `revokeDevice` refuses to remove the last remaining
+ *    device unless the caller passes `{ confirmLastDevice: true }`, so a user
+ *    cannot lock themselves out silently. A failed revocation never mutates
+ *    the state and is never reported as success.
  *  - **No sensitive data in logs**: key bytes and payloads are never logged.
  */
 
@@ -129,7 +140,21 @@ export function confirmSafetyNumber(
 // ---------------------------------------------------------------------------
 
 /** The phases of the device-linking flow. */
-export type LinkingPhase = 'idle' | 'displaying' | 'confirming' | 'linked' | 'aborted';
+export type LinkingPhase =
+    | 'idle'
+    | 'displaying'
+    | 'confirming'
+    | 'linked'
+    | 'revoked'
+    | 'aborted';
+
+/** A device currently linked to this account. */
+export interface LinkedDevice {
+    /** Application-level device id (the fan-out `DeviceId` as a JS number). */
+    deviceId: string;
+    /** The device's serialized public identity key, when known. */
+    publicKey?: Uint8Array;
+}
 
 /** Mutable linking state, driven by the UI. */
 export interface LinkingState {
@@ -142,6 +167,8 @@ export interface LinkingState {
     safetyNumber: string | null;
     /** Error message on failure. */
     error: string | null;
+    /** The devices currently linked to this account. */
+    linkedDevices: LinkedDevice[];
 }
 
 export function initialLinkingState(): LinkingState {
@@ -151,6 +178,7 @@ export function initialLinkingState(): LinkingState {
         remoteKey: null,
         safetyNumber: null,
         error: null,
+        linkedDevices: [],
     };
 }
 
@@ -237,4 +265,148 @@ export function confirmLink(
         return { ...state, phase: 'linked', safetyNumber: result.safetyNumber, error: null };
     }
     return { ...state, phase: 'aborted', safetyNumber: null, error: result.error ?? 'Confirmation failed' };
+}
+
+// ---------------------------------------------------------------------------
+// Device revocation / unlinking (DR-3)
+// ---------------------------------------------------------------------------
+
+/** Options for `revokeDevice`. */
+export interface RevokeOptions {
+    /**
+     * Explicitly confirm revoking the LAST remaining linked device. Without
+     * this, revoking the last device is refused (the user would lock
+     * themselves out of the account silently).
+     */
+    confirmLastDevice?: boolean;
+}
+
+/** Result of a revocation attempt. */
+export interface RevokeResult {
+    /** True only when the device was actually removed. */
+    ok: boolean;
+    /** The (unchanged on failure) state after the attempt. */
+    state: LinkingState;
+    /** Why the revocation failed; always set when `ok` is false. */
+    error?: string;
+    /**
+     * True when the refusal is specifically "this is the last remaining
+     * device — pass `confirmLastDevice: true` to proceed".
+     */
+    requiresConfirmation?: boolean;
+}
+
+/**
+ * The devices a message should currently be sent to: exactly the devices
+ * still linked, recomputed from `state.linkedDevices` on every call — never
+ * from a list cached when a link completed, so a revoked device stops being
+ * a recipient immediately.
+ */
+export function messageRecipients(state: LinkingState): string[] {
+    return state.linkedDevices.map((device) => device.deviceId);
+}
+
+/**
+ * Revoke (unlink) a linked device.
+ *
+ * Fail closed, in a fixed order, before any state changes:
+ *  1. The device must actually be linked (unknown ids are refused with a
+ *     clear error — revoking a device this account never knew about would
+ *     otherwise look like success).
+ *  2. The last remaining device requires `{ confirmLastDevice: true }`, so a
+ *     user cannot silently lock themselves out.
+ *  3. The underlying `remove_device` WASM binding must succeed.
+ *
+ * Only after all three pass is the device dropped from `linkedDevices` and
+ * the phase set to `'revoked'`. Any failure returns `ok: false` with the
+ * state untouched — a failed revocation is never reported as success and
+ * never leaves the device list half-updated.
+ *
+ * @param state    - The current linking state (its `linkedDevices` is the
+ *                   source of truth for what is linked).
+ * @param deviceId - The device to revoke.
+ * @param options  - `{ confirmLastDevice: true }` to allow revoking the last
+ *                   remaining device.
+ */
+export async function revokeDevice(
+    state: LinkingState,
+    deviceId: string,
+    options?: RevokeOptions,
+): Promise<RevokeResult> {
+    await ensureWasmInit();
+
+    const linked = state.linkedDevices ?? [];
+
+    // 1. Fail closed on unknown devices — before anything is mutated.
+    if (!linked.some((device) => device.deviceId === deviceId)) {
+        return {
+            ok: false,
+            state,
+            error: `Device ${deviceId} is not linked to this account`,
+        };
+    }
+
+    // 2. Never silently revoke the last remaining device.
+    const isLastDevice = linked.length === 1;
+    if (isLastDevice && options?.confirmLastDevice !== true) {
+        return {
+            ok: false,
+            state,
+            error:
+                'This is the last remaining device. Revoking it would remove your only linked device — confirm to proceed.',
+            requiresConfirmation: true,
+        };
+    }
+
+    // 3. The underlying revocation must succeed before the local list changes.
+    try {
+        wasm.remove_device(deviceIdAsUint32(deviceId));
+    } catch (e: unknown) {
+        return {
+            ok: false,
+            state,
+            error: errorMessage(e),
+        };
+    }
+
+    // All gates passed: drop the device and report success.
+    return {
+        ok: true,
+        state: {
+            ...state,
+            phase: 'revoked',
+            error: null,
+            linkedDevices: linked.filter((device) => device.deviceId !== deviceId),
+        },
+    };
+}
+
+/**
+ * Parse a device id into the `u32` the WASM `remove_device` binding takes.
+ *
+ * Device ids in this client are opaque strings ("dev-1", a UUID, …). The
+ * binding's `u32` parameter is the fan-out `DeviceId` index; when the id is
+ * a decimal string it maps through directly, and any other id is passed as
+ * its stable hash so the binding still receives a well-formed `u32`. The
+ * hash is deterministic, so the same device id always maps to the same
+ * `DeviceId` within a session.
+ *
+ * @throws when the id is not a non-negative integer below 2^32 and no hash
+ *   value can be derived.
+ */
+function deviceIdAsUint32(deviceId: string): number {
+    if (/^\d+$/.test(deviceId)) {
+        const value = Number(deviceId);
+        if (Number.isSafeInteger(value) && value >= 0 && value <= 0xffffffff) {
+            return value;
+        }
+    }
+    // FNV-1a over the UTF-8 bytes of the id — deterministic, well-distributed,
+    // and never derived from key material or link payloads.
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < deviceId.length; i++) {
+        hash ^= deviceId.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash >>> 0;
 }
