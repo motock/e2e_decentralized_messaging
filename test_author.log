@@ -135,3 +135,21 @@ echo "=== crypto/
 [step 58] done rejected — worktree dirty, asking agent to commit
 [step 59] bash: git status --short; echo "--- diff of test_author.log ---"; git diff -- test_author.log | head -30
 [step 60] bash: git add -A && git commit -q -m "chore(DR-2): record test-authoring session log" && git status --short && echo "--- clean
+[step 61] DONE: Test-authoring dispatch for DR-2 ("make device revocation verifiable rather than a local sender-side shortcut") is complete and committed on branch agent/dr-2 (HEAD 73ea8fc; test file introduced in 5acd45a, refined in 069a300, checkpointed in e880c4e). Worktree is clean.
+
+Deliverable: NEW additive test file core/protocol/tests/device_revocation.rs (296 lines, 9 tests). No implementation file was created or edited.
+
+Preflight conflicts honored — both flagged pinned tests pin a property that must REMAIN TRUE, so the verifiable path was ADDED alongside the existing local drop rather than reshaping remove_device:
+- core/protocol/tests/per_device_fanout.rs:43-62 untouched, still passes (2/2).
+- inline #[cfg(test)] removal case in core/protocol/src/fanout.rs untouched, still passes (lib 16/16).
+- remove_device and every existing FanoutError variant keep their signatures/meanings. No pinned test needed to change, so no STOP/report was required.
+
+Graded behavior (public API only, no source-text or private-field assertions):
+- Happy path: primary-signed revocation verifies against the account primary, excludes the device from fan-out (spec §8.2.5), and rejects its post-revocation traffic (§8.2.3); still-linked devices keep decrypting.
+- Negative: non-primary signer -> NotEntitled; tampered/empty/truncated bytes -> Malformed; never-linked device -> UnknownDevice; re-revoking -> AlreadyRevoked.
+- Boundary: byte round-trip preserves device+version; equal and older versions -> StaleVersion{held,offered} with both fields asserted, strictly newer accepted (§8.3 monotonicity); a rejected update leaves the session unchanged (no revocation, version not advanced); revocation_version() starts at 0.
+- Coexistence: local remove_device still returns Ok and drops delivery alongside the verifiable path.
+
+RED confirmed for the right reason: 25 compile errors, all E0432/E0599 for the not-yet-existing SignedRevocation / RevocationError / apply_revocation / revocation_version / is_revoked — zero errors in the test logic itself.
+
+Not graded (stated explicitly): the exact wire byte-layout of SignedRevocation (only round-trip + tamper-rejection are asserted) and the choice of signing primitive (the file header directs reuse of crypto's existing primary-signed device-identity primitive).
