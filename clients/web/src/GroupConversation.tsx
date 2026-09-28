@@ -85,16 +85,17 @@ export interface GroupConversationProps {
      */
     storageGate?: StorageGate;
     /**
-     * The local persisted identity. When provided, the component uses this
-     * identity (instead of generating a demo one) for group_create,
-     * group_encrypt, and group_decrypt — enabling real send/receive over the
-     * relay. The `selfRecipientId` must also be provided.
+     * The local persisted identity, used for group_create, group_encrypt and
+     * group_decrypt. REQUIRED: there is no demo-identity fallback. Omitting
+     * this prop (or `selfRecipientId`) makes the component fail closed — it
+     * renders a visible "unavailable" alert, starts no receive loop, and never
+     * generates a demo identity.
      */
     identity?: InstanceType<typeof IdentityHandle>;
     /**
-     * The local user's own recipient ID (base64 of their public key). Required
-     * when `identity` is provided — the receive loop polls the relay for
-     * envelopes addressed to this ID.
+     * The local user's own recipient ID (base64 of their public key). REQUIRED
+     * alongside `identity` — the receive loop polls the relay for envelopes
+     * addressed to this ID. Omitting either prop fails closed.
      */
     selfRecipientId?: string;
 }
@@ -157,6 +158,24 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     const [decryptionWarning, setDecryptionWarning] = useState<string>('');
 
     const transportRef = useRef<GroupTransport>(transport ?? new RelayTransport());
+
+    // RelayTransport allows only ONE request in flight (see its one-in-flight
+    // constraint): a second concurrent op overwrites the single pending slot and
+    // the first caller's promise never settles. The receive loop polls
+    // pickupEnvelope on an interval while the send path fires sendEnvelope
+    // without awaiting, so a send landing mid-poll would hang that poll forever
+    // — pollInFlightRef would stay true and the receive loop would be dead for
+    // the rest of the session. Funnel every transport op through this chain so
+    // ops are serialized instead of overlapping.
+    const transportQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+    const runTransportOp = <T,>(op: () => Promise<T>): Promise<T> => {
+        const next = transportQueueRef.current.then(op, op);
+        transportQueueRef.current = next.then(
+            () => undefined,
+            () => undefined,
+        );
+        return next;
+    };
     const gateRef = useRef<StorageGate | undefined>(storageGate);
     // Track whether we've attempted to load persisted state so we don't
     // overwrite it with an empty group on the first render.
@@ -180,14 +199,37 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     useEffect(() => { groupRef.current = group; }, [group]);
     useEffect(() => { selfIdentityRef.current = selfIdentity; }, [selfIdentity]);
 
+    // Keep the prop-derived refs fresh WITHOUT re-running the one-time init.
+    // The init effect below rebuilds the GroupHandle and re-reads persisted
+    // state, so it must only re-run when the identity itself changes — not on a
+    // relay-URL change, which would silently rebuild the group and drop
+    // in-memory ratchet state. Declared before the init effect so it runs first
+    // on the render that supplies real props.
+    useEffect(() => {
+        if (transport) transportRef.current = transport;
+        if (storageGate) gateRef.current = storageGate;
+    }, [transport, storageGate]);
+
     useEffect(() => {
         let cancelled = false;
+        // Criterion 3 — fail closed. With no identity/selfRecipientId the group
+        // view must not silently pretend to be connected: no throwaway demo
+        // identity, no receive loop, and crucially no persisted-config ref
+        // (gateRef) written from a permissive default. Leaving gateRef untouched
+        // is what keeps a LATER render that does supply real props correct.
+        if (!identityProp || !selfRecipientId) {
+            // The render path already prefixes this with "Group conversation
+            // unavailable: ", so keep the message itself free of a second
+            // "unavailable" clause.
+            setError('no identity supplied.');
+            setReady(false);
+            return;
+        }
+        setError(null);
         ensureWasmInit()
             .then(async () => {
                 if (cancelled) return;
-                // Use the externally-provided identity (real send/receive path)
-                // or generate a demo identity (legacy demo-member path).
-                const self = identityProp ?? generate_identity();
+                const self = identityProp;
                 const demoMembers: DemoMember[] = DEMO_MEMBER_NAMES.map((name) => {
                     const identity = generate_identity();
                     return { name, identity, publicBytes: identity.public_bytes() };
@@ -254,7 +296,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [identityProp, selfRecipientId]);
 
     // Persist the current real-member list to StorageGate so it survives
     // a page reload. Called after every membership change.
@@ -318,8 +360,8 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 const currentSelf = selfIdentityRef.current;
                 if (!currentGroup || !currentSelf) return;
 
-                const envelope: Uint8Array = await transportRef.current.pickupEnvelope(
-                    selfRecipientId!,
+                const envelope: Uint8Array = await runTransportOp(() =>
+                    transportRef.current.pickupEnvelope(selfRecipientId!),
                 );
 
                 // Dedup: the relay may return the same envelope on consecutive polls.
@@ -428,7 +470,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         try {
             let bundleBytes: Uint8Array;
             try {
-                bundleBytes = await transportRef.current.lookupPrekey(trimmedId);
+                bundleBytes = await runTransportOp(() =>
+                    transportRef.current.lookupPrekey(trimmedId),
+                );
             } catch {
                 setPeerError('Peer not found');
                 return;
@@ -508,9 +552,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         // Conversation.tsx's send path. Demo members are local-only (no relay
         // address) so they are not sent over the wire.
         for (const member of realMembers) {
-            void transportRef.current
-                .sendEnvelope(member.recipientId, new Uint8Array(ciphertext))
-                .catch((e) => {
+            void runTransportOp(() =>
+                transportRef.current.sendEnvelope(member.recipientId, new Uint8Array(ciphertext)),
+            ).catch((e) => {
                     console.warn('sendEnvelope failed for group member', {
                         recipientId: member.recipientId,
                         error: e instanceof Error ? e.message : String(e),

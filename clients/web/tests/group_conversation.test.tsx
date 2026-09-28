@@ -86,10 +86,24 @@ vi.mock('../../../core/bindings/wasm/pkg/index.js', () => {
 vi.mock('../src/wasm_init', () => ({ ensureWasmInit: async () => {} }));
 
 import { GroupConversation } from '../src/GroupConversation';
+import { generate_identity } from '../../../core/bindings/wasm/pkg/index.js';
+
+// Criterion 3: the group view fails closed without an identity + recipient ID,
+// so these render sites supply the app's real identity and a no-op transport.
+// The demo-member flow under test never touches the relay, so the transport
+// only has to satisfy the interface (an empty mailbox rejects with "NotFound",
+// which the receive loop treats as a normal empty poll).
+const selfIdentity = generate_identity();
+const selfRecipientId = 'self-recipient-id';
+const noopTransport = {
+    lookupPrekey: async () => { throw new Error('NotFound'); },
+    sendEnvelope: async () => {},
+    pickupEnvelope: async () => { throw new Error('NotFound'); },
+};
 
 describe('GroupConversation', () => {
     test('creates a group, adds members, and sends a message all current members decrypt', async () => {
-        render(<GroupConversation />);
+        render(<GroupConversation identity={selfIdentity} selfRecipientId={selfRecipientId} transport={noopTransport} />);
 
         const createBtn = await screen.findByTestId('create-group-button');
         fireEvent.click(createBtn);
@@ -115,7 +129,7 @@ describe('GroupConversation', () => {
     });
 
     test('a removed member cannot decrypt a message sent after their removal', async () => {
-        render(<GroupConversation />);
+        render(<GroupConversation identity={selfIdentity} selfRecipientId={selfRecipientId} transport={noopTransport} />);
 
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());

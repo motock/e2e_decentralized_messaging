@@ -10,7 +10,7 @@ import { SealGlyph } from './design/SealGlyph';
 import { StorageGate } from './storage';
 import { getStorageKey, getStoragePassword } from './storage_key';
 import { loadOrGenerateIdentity, type PersistedIdentity } from './identity';
-import { getRelayWsUrl } from './relay_transport';
+import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import { useRelayConnection, RelayConnectionPanel } from './useRelayConnection';
 import './design/AppShell.css';
 
@@ -42,6 +42,10 @@ class SafetyNumberErrorBoundary extends React.Component<
 }
 
 type ViewId = 'direct' | 'group' | 'link' | 'backup';
+
+// The WASM identity handle GroupConversation expects, derived from its own
+// props so App.tsx does not have to import the wasm pkg directly.
+type GroupIdentity = NonNullable<React.ComponentProps<typeof GroupConversation>['identity']>;
 
 const NAV_ITEMS: { id: ViewId; label: string; title: string; subtitle: string }[] = [
     { id: 'direct', label: 'Direct', title: 'Direct message', subtitle: 'One-to-one, Double Ratchet' },
@@ -113,6 +117,24 @@ export default function App() {
     // status. The receiver session it produces on success is handed to
     // Conversation's receive loop.
     const conn = useRelayConnection(identity, relayUrl, sessionGate);
+
+    // The group view reaches the relay through the same transport surface as the
+    // direct path. Memoized on relayUrl so a runtime URL change is picked up;
+    // without this GroupConversation would build its own RelayTransport.
+    const groupTransport = React.useMemo(() => new RelayTransport(relayUrl), [relayUrl]);
+
+    // Close the superseded transport when relayUrl changes so its socket does
+    // not leak. Deliberately ref-based rather than a plain unmount cleanup:
+    // React StrictMode double-invokes effects (mount → cleanup → mount) with
+    // the SAME memoized instance, so an unmount cleanup would close the live
+    // transport and never reopen it. This only closes an instance that was
+    // genuinely replaced.
+    const prevGroupTransportRef = React.useRef<RelayTransport | null>(null);
+    React.useEffect(() => {
+        const prev = prevGroupTransportRef.current;
+        prevGroupTransportRef.current = groupTransport;
+        if (prev && prev !== groupTransport) prev.close();
+    }, [groupTransport]);
 
     const handleRelayUrlChange = React.useCallback((url: string) => {
         if (url === '') {
@@ -206,7 +228,14 @@ export default function App() {
                                         onRemoteIdentityKeyChange={handleRemoteIdentityKeyChange}
                                     />
                                 )}
-                                {view === 'group' && <GroupConversation />}
+                                {view === 'group' && (
+                                    <GroupConversation
+                                        identity={identity?.handle as unknown as GroupIdentity}
+                                        selfRecipientId={recipientId ?? undefined}
+                                        storageGate={sessionGate}
+                                        transport={groupTransport}
+                                    />
+                                )}
                                 {view === 'link' && (
                                     <SafetyNumberErrorBoundary>
                                         {identity && (

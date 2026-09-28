@@ -90,8 +90,26 @@ vi.mock('../src/relay_transport', () => ({
             // error banner, no console spam) rather than crashing with
             // "pickupEnvelope is not a function".
             pickupEnvelope: () => Promise.reject(new Error('NotFound')),
+            close: () => {},
         };
     }),
+}));
+
+// ── GroupConversation mock ─────────────────────────────────────────────────
+//
+// The group view is a bare `<GroupConversation />` in the shipped app unless
+// App.tsx wires the real identity, recipient ID, storage gate and transport
+// into it — and GroupConversation now FAILS CLOSED without them. So the
+// wiring is load-bearing and must be pinned here: we replace the component
+// with a stub that records the props it actually receives, then assert on
+// those props (not on App's internals or on DOM text).
+const groupPropsHolder: { props: any[] } = { props: [] };
+
+vi.mock('../src/GroupConversation', () => ({
+    GroupConversation: (props: any) => {
+        groupPropsHolder.props.push(props);
+        return null;
+    },
 }));
 
 // ── Storage key mock ───────────────────────────────────────────────────────
@@ -111,6 +129,7 @@ function newGate(): StorageGate {
 
 beforeEach(async () => {
     keypairs.length = 0;
+    groupPropsHolder.props.length = 0;
     mockHolder.publishPrekey = vi.fn().mockResolvedValue(undefined);
     mockHolder.connect = vi.fn().mockResolvedValue(undefined);
 
@@ -184,6 +203,52 @@ describe('App identity UI', () => {
             fireEvent.click(screen.getByRole('button', { name: /details/i }));
         });
         expect(screen.getByText(/relay unreachable/i)).toBeInTheDocument();
+    });
+
+    // ── Criterion 1/2: App wires the group view to the app's real identity ──
+    //
+    // Regression guard for the story's central change. GroupConversation fails
+    // closed without identity + selfRecipientId, so if App.tsx ever goes back
+    // to a bare `<GroupConversation />` (or drops any one of the four props)
+    // the shipped group view breaks with a visible "unavailable" alert. This
+    // test asserts on the props the component ACTUALLY receives.
+    test('the group view receives the app identity, recipient ID, storage gate and transport', async () => {
+        render(<App />);
+
+        // Wait for the persisted identity to load — the recipient ID only
+        // renders once `identity` is set, and the group view must be wired to
+        // that same identity.
+        await waitFor(() => {
+            expect(screen.getByTitle('Copy your recipient ID')).toBeInTheDocument();
+        });
+        const appRecipientId = screen.getByTitle('Copy your recipient ID').querySelector('code')!.textContent!;
+
+        // Switch to the group view.
+        await act(async () => {
+            fireEvent.click(screen.getByRole('button', { name: 'Group' }));
+        });
+
+        await waitFor(() => {
+            expect(groupPropsHolder.props.length).toBeGreaterThan(0);
+        });
+        const props = groupPropsHolder.props[groupPropsHolder.props.length - 1];
+
+        // All four props must be supplied — dropping any one breaks the view.
+        expect(props.identity).toBeTruthy();
+        expect(props.selfRecipientId).toBeTruthy();
+        expect(props.storageGate).toBeTruthy();
+        expect(props.transport).toBeTruthy();
+
+        // Criterion 2: the identity used is the APP's persisted identity, not a
+        // freshly generated demo one. Its public bytes must base64-encode to
+        // the recipient ID the app itself displays.
+        expect(props.selfRecipientId).toBe(appRecipientId);
+        const pub = props.identity.public_bytes();
+        expect(btoa(String.fromCharCode(...pub))).toBe(appRecipientId);
+
+        // The gate handed to the group view is App's canonical sessionGate, not
+        // a second StorageGate opened over the same IndexedDB.
+        expect(props.storageGate).toBeInstanceOf(StorageGate);
     });
 
     test('reloading (re-instantiating StorageGate) yields the same recipient ID', async () => {
