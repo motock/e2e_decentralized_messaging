@@ -39,7 +39,7 @@ What we are protecting, in priority order:
 | **Malicious or compromised contact** | A legitimate, verified conversation partner whose account or device has been compromised, or who is acting in bad faith. | Read messages sent to them (unavoidable — they are an intended recipient); attempt to pivot compromise to others (e.g., poison group Sender Key state). |
 | **Global passive adversary** | Network observer at internet-backbone scale, correlating timing/volume across many vantage points simultaneously. | De-anonymize via traffic analysis even without reading any single hop's metadata in isolation. |
 | **Handle-squatter / discovery-layer impersonator** | Publishes a prekey bundle to the DHT under a handle before the legitimate owner does, or races a republish. Does not have the legitimate owner's identity key. | Get a victim's contacts to establish a session with the attacker's identity instead of the real owner (a TOFU gap at the *discovery* layer, distinct from message-content TOFU). |
-| **Compromised primary device (device-linking abuse)** | Has compromised a user's *primary* device specifically (not just any device, see lost/stolen below), and so holds its device-linking signing authority. | Sign and link a rogue device into the account; that rogue device then has standing as a "legitimate" linked device until detected and revoked. |
+| **Compromised primary device (device-linking abuse)** | Has compromised a user's *primary* device specifically (not just any device, see lost/stolen below), and so holds its device-linking signing authority. | Sign and link a rogue device into the account; that rogue device then has standing as a "legitimate" linked device until detected and revoked. Revocation semantics are in `spec/v0.md` §8, but a compromised primary can sign a device list that keeps the rogue device in — see §5.3 and `spec/v0.md` §8.5. |
 
 Out of scope for v1 (acknowledged, not designed against): an adversary who can compel or
 backdoor the `libsignal` library itself, and a fully active global adversary capable of
@@ -73,7 +73,8 @@ and §10, not v1).
 - **Multi-device boundary**: a user's own additional devices are a *separate* trust domain
   from each other until explicitly linked (QR pairing + safety-number confirmation per
   `PLAN.md` §4). An unlinked device has no implicit trust just because it shares an account
-  in the future history-sync sense.
+  in the future history-sync sense. Unlinking a device revokes it (`spec/v0.md` §8); the
+  revoked device's messages are rejected once the signed device-list update is observed.
 
 ---
 
@@ -244,11 +245,18 @@ locked (e.g., screen lock bypassed but disk not separately encrypted), or fully 
   blast radius is limited to that one device's sessions and local history. Forward secrecy
   (Double Ratchet) limits exposure of *past* messages even if a current chain key is
   recovered, but does not protect messages already decrypted and stored in local history.
-- **Residual risk / open item**: device revocation/unlinking flow (so other devices and
-  contacts stop trusting a stolen device's key) is not yet specified — this should be an
-  explicit story under the Multi-Device epic (`PLAN.md` Phase 6), not assumed to fall out of
-  linking alone. Remote wipe is out of scope for a server-less design and should be
-  documented as a known limitation, not silently gapped.
+- **Revocation semantics now specified**: the unlink/revoke flow this bullet used to flag as
+  unspecified is defined in `spec/v0.md` §8 — unlinking a device revokes its `DeviceAddress`,
+  removes its `PreKeyBundle` from the account's `DiscoveryRecord`, tears down existing sessions,
+  and rejects its Sealed Sender certificates, propagated as a signed, monotonically versioned
+  device list. The wire shapes remain Phase 6 (`PLAN.md` Phase 6) work.
+- **Residual risk / open item**: revocation is *eventually consistent*, not instantaneous — a
+  peer that has not yet observed the device-list update still accepts the stolen device's
+  messages, and the revoked device itself cannot be reached (`spec/v0.md` §8.3, §8.5). Revoking
+  the *primary* device is not covered by `spec/v0.md` §8 and is an open item (`spec/v0.md` §7);
+  it is the "compromised primary device" adversary in §2 above. Remote wipe is out of scope for a
+  server-less design and is documented as a known limitation (`spec/v0.md` §8.5), not silently
+  gapped.
 
 ### 5.4 Network observer
 
