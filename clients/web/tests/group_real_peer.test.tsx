@@ -38,6 +38,13 @@ let prekeyBundles: Record<string, Uint8Array>;
 let prekeyRejections: Record<string, string>;
 /** Persisted group state that the mock StorageGate returns on reload. */
 let persistedGroupState: unknown;
+/**
+ * The local identity + recipient ID the real-peer path needs. Criterion 3
+ * makes the group view fail closed without them, so every real-peer render
+ * site supplies them (see the no-props test at the bottom of this file).
+ */
+let selfIdentity: InstanceType<typeof IdentityHandle>;
+let selfRecipientId: string;
 
 // ── WASM mock ───────────────────────────────────────────────────────────────
 
@@ -147,6 +154,7 @@ vi.mock('../src/storage', () => {
 
 import { StorageGate as MockStorageGate } from '../src/storage';
 import { GroupConversation } from '../src/GroupConversation';
+import { generate_identity, IdentityHandle } from '../../../core/bindings/wasm/pkg/index.js';
 
 // ── Transport mock ──────────────────────────────────────────────────────────
 
@@ -184,6 +192,8 @@ beforeEach(() => {
     prekeyBundles = {};
     prekeyRejections = {};
     persistedGroupState = null;
+    selfIdentity = generate_identity();
+    selfRecipientId = 'self-recipient-id';
     // Clear the mock storage store so persisted group state from a previous
     // test doesn't leak into the next (the store is module-level in the mock).
     (MockStorageGate as unknown as { __store: Map<string, unknown> }).__store.clear();
@@ -198,7 +208,7 @@ describe('GroupConversation real-peer member distribution', () => {
         prekeyBundles[peerId] = peerKey;
 
         const transport = makeTransport();
-        render(<GroupConversation transport={transport} />);
+        render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
 
         // Create the group first.
         fireEvent.click(await screen.findByTestId('create-group-button'));
@@ -227,7 +237,7 @@ describe('GroupConversation real-peer member distribution', () => {
         prekeyRejections[ghostId] = 'relay: recipient not found';
 
         const transport = makeTransport();
-        render(<GroupConversation transport={transport} />);
+        render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
 
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
@@ -252,7 +262,7 @@ describe('GroupConversation real-peer member distribution', () => {
         // "relay: recipient not found" by default.
 
         const transport = makeTransport();
-        render(<GroupConversation transport={transport} />);
+        render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
 
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
@@ -276,7 +286,7 @@ describe('GroupConversation real-peer member distribution', () => {
         const transport = makeTransport();
 
         // First "session": create group, add a real peer.
-        const { unmount } = render(<GroupConversation transport={transport} />);
+        const { unmount } = render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
 
@@ -286,7 +296,7 @@ describe('GroupConversation real-peer member distribution', () => {
 
         // Simulate a page reload: unmount and re-render a fresh component.
         unmount();
-        render(<GroupConversation transport={transport} />);
+        render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
 
         // The group and its members should be restored from persisted state.
         await waitFor(() => {
@@ -305,7 +315,7 @@ describe('GroupConversation real-peer member distribution', () => {
         prekeyBundles[peerId] = peerKey;
 
         const transport = makeTransport();
-        render(<GroupConversation transport={transport} />);
+        render(<GroupConversation transport={transport} identity={selfIdentity} selfRecipientId={selfRecipientId} />);
 
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
@@ -327,6 +337,52 @@ describe('GroupConversation real-peer member distribution', () => {
         // path — since the member is already removed, there's no remove
         // button. The component should handle this gracefully.
         // Verify no error alert appeared at any point.
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    // ── Criterion 3: the no-props path fails closed ─────────────────────────
+    //
+    // The shipped group view was a demo sandbox because it was rendered with no
+    // props at all, so it ran on a throwaway identity and never polled the
+    // relay. Rendering it with no props must now fail closed with a visible
+    // message instead of silently pretending to be connected.
+
+    test('rendering the group view with no props fails closed instead of pretending to be connected', async () => {
+        render(<GroupConversation />);
+
+        // A visible, fail-closed message — not a live-looking group UI.
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeInTheDocument();
+        });
+        expect(screen.getByRole('alert').textContent).toMatch(/unavailable|no identity/i);
+
+        // No group UI that would imply a working, connected group.
+        expect(screen.queryByTestId('create-group-button')).not.toBeInTheDocument();
+        expect(screen.queryByTestId('member-list')).not.toBeInTheDocument();
+    });
+
+    test('a no-props render does not poison a later render that supplies real props', async () => {
+        const transport = makeTransport();
+        const { rerender } = render(<GroupConversation />);
+
+        // Render 1: no props -> DENY.
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeInTheDocument();
+        });
+
+        // Render 2: real props -> must ALLOW. This is the state-persistence
+        // trap: render 1 must not have written a permissive default into any
+        // persisted config that render 2 then reads.
+        rerender(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+
+        fireEvent.click(await screen.findByTestId('create-group-button'));
+        await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
         expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
 });
