@@ -185,9 +185,12 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         ensureWasmInit()
             .then(async () => {
                 if (cancelled) return;
-                // Use the externally-provided identity (real send/receive path)
-                // or generate a demo identity (legacy demo-member path).
-                const self = identityProp ?? generate_identity();
+                // EXPERIMENT ONLY - fail closed when no identity prop.
+                if (!identityProp || !selfRecipientId) {
+                    setError('Group messaging unavailable: no identity supplied.');
+                    return;
+                }
+                const self = identityProp;
                 const demoMembers: DemoMember[] = DEMO_MEMBER_NAMES.map((name) => {
                     const identity = generate_identity();
                     return { name, identity, publicBytes: identity.public_bytes() };
