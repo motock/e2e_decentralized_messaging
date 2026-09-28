@@ -248,12 +248,17 @@ impl SignedRevocation {
         let payload = revocation_payload(device, version);
         let signature = primary
             .private_key()
-            .calculate_signature_for_multipart_message(&[&payload], &mut rand::rngs::OsRng.unwrap_err())
+            .calculate_signature_for_multipart_message(
+                &[&payload],
+                &mut rand::rngs::OsRng.unwrap_err(),
+            )
             .map_err(|_| RevocationError::SigningFailed)?;
         Ok(Self {
             device,
             version,
-            signature: signature.into(),
+            // `calculate_signature_for_multipart_message` already returns the boxed
+            // slice we store; no conversion needed.
+            signature,
         })
     }
 
@@ -295,9 +300,7 @@ impl SignedRevocation {
         if bytes[0] != 0x01 {
             return Err(RevocationError::Malformed);
         }
-        let device = DeviceId(u32::from_be_bytes([
-            bytes[1], bytes[2], bytes[3], bytes[4],
-        ]));
+        let device = DeviceId(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]));
         let version = u64::from_be_bytes([
             bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
         ]);

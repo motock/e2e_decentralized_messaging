@@ -69,7 +69,9 @@ fn primary_signed_revocation_verifies_and_stops_delivery() {
     let primary = generate_identity_key_pair();
     let primary_pub = primary.public_identity();
 
-    let before = fanout.encrypt_to_all(b"before revocation").expect("encrypt");
+    let before = fanout
+        .encrypt_to_all(b"before revocation")
+        .expect("encrypt");
     assert_eq!(before.len(), 3);
     let for_device_2 = before
         .iter()
@@ -89,7 +91,10 @@ fn primary_signed_revocation_verifies_and_stops_delivery() {
         .expect("apply verified revocation");
 
     assert!(fanout.is_revoked(DeviceId(2)), "device 2 must be revoked");
-    assert!(!fanout.is_revoked(DeviceId(1)), "device 1 must not be revoked");
+    assert!(
+        !fanout.is_revoked(DeviceId(1)),
+        "device 1 must not be revoked"
+    );
     assert_eq!(fanout.revocation_version(), 1);
 
     // §8.2.5: the revoked device is excluded from fan-out.
@@ -108,14 +113,24 @@ fn primary_signed_revocation_verifies_and_stops_delivery() {
     );
 
     // The still-linked devices keep working.
-    let ct1 = after.iter().find(|c| c.device == DeviceId(1)).expect("ct 1");
-    let ct3 = after.iter().find(|c| c.device == DeviceId(3)).expect("ct 3");
+    let ct1 = after
+        .iter()
+        .find(|c| c.device == DeviceId(1))
+        .expect("ct 1");
+    let ct3 = after
+        .iter()
+        .find(|c| c.device == DeviceId(3))
+        .expect("ct 3");
     assert_eq!(
-        fanout.decrypt_as(&devices[0], ct1).expect("device 1 decrypts"),
+        fanout
+            .decrypt_as(&devices[0], ct1)
+            .expect("device 1 decrypts"),
         b"after revocation"
     );
     assert_eq!(
-        fanout.decrypt_as(&devices[2], ct3).expect("device 3 decrypts"),
+        fanout
+            .decrypt_as(&devices[2], ct3)
+            .expect("device 3 decrypts"),
         b"after revocation"
     );
 }
@@ -130,7 +145,10 @@ fn revocation_signed_by_a_non_primary_is_rejected() {
     let forged = SignedRevocation::sign(&rogue, DeviceId(1), 1).expect("sign");
 
     assert!(
-        matches!(forged.verify(&primary_pub), Err(RevocationError::NotEntitled)),
+        matches!(
+            forged.verify(&primary_pub),
+            Err(RevocationError::NotEntitled)
+        ),
         "a revocation not signed by the account primary must not verify"
     );
     assert!(matches!(
@@ -138,10 +156,23 @@ fn revocation_signed_by_a_non_primary_is_rejected() {
         Err(RevocationError::NotEntitled)
     ));
 
-    assert!(!fanout.is_revoked(DeviceId(1)), "a rejected revocation must not take effect");
-    assert!(!fanout.is_revoked(DeviceId(99)), "an unlinked device is not 'revoked'");
-    assert_eq!(fanout.revocation_version(), 0, "a rejected revocation must not advance the version");
-    assert_eq!(fanout.encrypt_to_all(b"still all").expect("encrypt").len(), 2);
+    assert!(
+        !fanout.is_revoked(DeviceId(1)),
+        "a rejected revocation must not take effect"
+    );
+    assert!(
+        !fanout.is_revoked(DeviceId(99)),
+        "an unlinked device is not 'revoked'"
+    );
+    assert_eq!(
+        fanout.revocation_version(),
+        0,
+        "a rejected revocation must not advance the version"
+    );
+    assert_eq!(
+        fanout.encrypt_to_all(b"still all").expect("encrypt").len(),
+        2
+    );
 }
 
 #[test]
@@ -151,7 +182,10 @@ fn tampered_revocation_bytes_never_verify() {
     let revocation = SignedRevocation::sign(&primary, DeviceId(2), 7).expect("sign");
 
     let mut bytes = revocation.to_bytes();
-    assert!(!bytes.is_empty(), "a signed revocation must serialize to bytes");
+    assert!(
+        !bytes.is_empty(),
+        "a signed revocation must serialize to bytes"
+    );
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
 
@@ -170,11 +204,17 @@ fn tampered_revocation_bytes_never_verify() {
 #[test]
 fn malformed_revocation_bytes_are_rejected() {
     assert!(
-        matches!(SignedRevocation::from_bytes(&[]), Err(RevocationError::Malformed)),
+        matches!(
+            SignedRevocation::from_bytes(&[]),
+            Err(RevocationError::Malformed)
+        ),
         "empty input is not a revocation"
     );
     assert!(
-        matches!(SignedRevocation::from_bytes(&[0u8; 3]), Err(RevocationError::Malformed)),
+        matches!(
+            SignedRevocation::from_bytes(&[0u8; 3]),
+            Err(RevocationError::Malformed)
+        ),
         "a 3-byte blob is not a revocation"
     );
 
@@ -184,7 +224,10 @@ fn malformed_revocation_bytes_are_rejected() {
         .to_bytes();
     let truncated = &valid[..valid.len() / 2];
     assert!(
-        matches!(SignedRevocation::from_bytes(truncated), Err(RevocationError::Malformed)),
+        matches!(
+            SignedRevocation::from_bytes(truncated),
+            Err(RevocationError::Malformed)
+        ),
         "a truncated revocation must be rejected"
     );
 }
@@ -198,7 +241,9 @@ fn signed_revocation_round_trips_through_bytes() {
     let restored = SignedRevocation::from_bytes(&original.to_bytes()).expect("round trip");
     assert_eq!(restored.device(), DeviceId(4));
     assert_eq!(restored.version(), 9);
-    restored.verify(&primary_pub).expect("restored revocation still verifies");
+    restored
+        .verify(&primary_pub)
+        .expect("restored revocation still verifies");
 }
 
 #[test]
@@ -208,7 +253,9 @@ fn stale_revocation_versions_are_rejected() {
     let primary_pub = primary.public_identity();
 
     let first = SignedRevocation::sign(&primary, DeviceId(1), 5).expect("sign");
-    fanout.apply_revocation(&first, &primary_pub).expect("first revocation at version 5");
+    fanout
+        .apply_revocation(&first, &primary_pub)
+        .expect("first revocation at version 5");
     assert_eq!(fanout.revocation_version(), 5);
 
     // §8.3: the device list is *monotonically* versioned — an equal version is stale.
@@ -224,13 +271,21 @@ fn stale_revocation_versions_are_rejected() {
     let older = SignedRevocation::sign(&primary, DeviceId(2), 4).expect("sign");
     assert!(matches!(
         fanout.apply_revocation(&older, &primary_pub),
-        Err(RevocationError::StaleVersion { held: 5, offered: 4 })
+        Err(RevocationError::StaleVersion {
+            held: 5,
+            offered: 4
+        })
     ));
-    assert!(!fanout.is_revoked(DeviceId(2)), "a stale update must not revoke anything");
+    assert!(
+        !fanout.is_revoked(DeviceId(2)),
+        "a stale update must not revoke anything"
+    );
 
     // A strictly newer version is accepted.
     let newer = SignedRevocation::sign(&primary, DeviceId(2), 6).expect("sign");
-    fanout.apply_revocation(&newer, &primary_pub).expect("newer version accepted");
+    fanout
+        .apply_revocation(&newer, &primary_pub)
+        .expect("newer version accepted");
     assert!(fanout.is_revoked(DeviceId(2)));
     assert_eq!(fanout.revocation_version(), 6);
 }
@@ -247,7 +302,11 @@ fn revoking_a_device_that_was_never_linked_is_rejected() {
         Err(RevocationError::UnknownDevice(DeviceId(99)))
     ));
     assert!(!fanout.is_revoked(DeviceId(99)));
-    assert_eq!(fanout.revocation_version(), 0, "a rejected update must not advance the version");
+    assert_eq!(
+        fanout.revocation_version(),
+        0,
+        "a rejected update must not advance the version"
+    );
 }
 
 #[test]
@@ -257,7 +316,9 @@ fn revoking_an_already_revoked_device_is_rejected() {
     let primary_pub = primary.public_identity();
 
     let first = SignedRevocation::sign(&primary, DeviceId(1), 1).expect("sign");
-    fanout.apply_revocation(&first, &primary_pub).expect("first revocation");
+    fanout
+        .apply_revocation(&first, &primary_pub)
+        .expect("first revocation");
     assert!(fanout.is_revoked(DeviceId(1)));
 
     let again = SignedRevocation::sign(&primary, DeviceId(1), 2).expect("sign");
@@ -289,7 +350,9 @@ fn local_remove_device_still_works_alongside_verifiable_revocation() {
 
     // The verifiable path is additive: it revokes a *different* device and coexists.
     let revocation = SignedRevocation::sign(&primary, DeviceId(2), 1).expect("sign");
-    fanout.apply_revocation(&revocation, &primary_pub).expect("apply");
+    fanout
+        .apply_revocation(&revocation, &primary_pub)
+        .expect("apply");
     let after_both = fanout.encrypt_to_all(b"both").expect("encrypt");
     assert_eq!(after_both.len(), 1);
     assert_eq!(after_both[0].device, DeviceId(3));
