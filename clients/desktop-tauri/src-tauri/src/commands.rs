@@ -61,6 +61,8 @@ pub fn generate_identity() -> Result<Vec<u8>, ShellError> {
 ///
 /// # Failure model (fail closed)
 ///
+/// * App-data directory missing (a fresh install) -> created, then the file is minted. Tauri does
+///   not create `app_data_dir()` on desktop, so without this the first-run path could never run.
 /// * No identity file yet -> mint one, persist it, return it.
 /// * Identity file present and a well-formed public identity key -> return it verbatim. The file
 ///   is opened **read-only** and never rewritten: rewriting it would silently rotate the user's
@@ -89,7 +91,32 @@ pub fn load_or_create_identity(app: tauri::AppHandle) -> Result<Vec<u8>, ShellEr
         ShellError::Session(identity_error_message(correlation_id))
     })?;
 
-    load_or_create_identity_in(&dir)
+    load_or_create_identity_at(&dir)
+}
+
+/// Body of [`load_or_create_identity`] once the app-data directory has been resolved in Rust.
+///
+/// Split out of the `#[tauri::command]` so the *production* path is testable without a Tauri
+/// `AppHandle`: the command does nothing with `dir` except hand it here.
+///
+/// `app_data_dir()` on desktop is only `dirs::data_dir().join(identifier)` — Tauri does not create
+/// it (verified in the vendored tauri 2.11.5 source: `src/path/desktop.rs` has no `create_dir_all`,
+/// and the only one in `src/manager/webview.rs` is for the webview `user_data_dir`, which is set
+/// only on Linux/Windows). On a fresh macOS/Windows install the directory therefore does not
+/// exist, and [`validate_identity_dir`]'s `canonicalize` would fail with `NotFound`, so the
+/// documented first-run mint path could never execute. Creating it here (idempotent) is what makes
+/// that path reachable.
+fn load_or_create_identity_at(dir: &Path) -> Result<Vec<u8>, ShellError> {
+    let correlation_id = next_correlation_id();
+    std::fs::create_dir_all(dir).map_err(|err| {
+        eprintln!(
+            "identity: correlation {correlation_id}: cannot create app data dir {}: {err}",
+            dir.display()
+        );
+        ShellError::Session(identity_error_message(correlation_id))
+    })?;
+
+    load_or_create_identity_in(dir)
 }
 
 /// Path-taking implementation of [`load_or_create_identity`], crate-private on purpose.
@@ -656,6 +683,51 @@ mod identity_persistence_tests {
         assert!(
             !message.is_empty(),
             "the error must still carry a message the UI can render"
+        );
+    }
+
+    /// Regression test for the fresh-install path: `app_data_dir()` is *not* created by Tauri on
+    /// desktop, so on a first run the directory is missing. `load_or_create_identity_at` is the
+    /// exact body the `#[tauri::command]` runs after resolving the app-data dir in Rust, so this
+    /// covers the production path without needing a Tauri `AppHandle`.
+    ///
+    /// Before the fix this failed with `NotFound` from `validate_identity_dir`'s `canonicalize`,
+    /// i.e. the documented "no identity file yet -> mint one" path was unreachable on a fresh
+    /// macOS/Windows install. The path is deliberately multi-level so `create_dir_all` (rather
+    /// than a single-level `create_dir`) is what is required.
+    #[test]
+    fn load_or_create_identity_at_creates_a_missing_app_data_directory_and_mints_into_it() {
+        let root = fresh_temp_dir();
+        let missing = root.join("nested").join("app-data");
+        assert!(
+            !missing.exists(),
+            "precondition: the app-data directory must not exist yet"
+        );
+
+        let first = load_or_create_identity_at(&missing)
+            .expect("a missing app-data directory must be created, not rejected");
+        assert!(
+            !first.is_empty(),
+            "the minted public key returned to the UI must not be empty"
+        );
+
+        let path = identity_path(&missing);
+        assert!(
+            path.is_file(),
+            "the identity must be persisted inside the created directory"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the persisted identity must be readable"),
+            first,
+            "the bytes on disk must be exactly the key returned to the UI"
+        );
+
+        // Second call against the now-existing directory must load, not re-mint.
+        let second = load_or_create_identity_at(&missing)
+            .expect("a second call against the created directory must succeed");
+        assert_eq!(
+            second, first,
+            "the identity must be stable across calls once the directory exists"
         );
     }
 }
