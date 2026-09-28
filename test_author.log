@@ -85,3 +85,24 @@ d=json.load(open('/Users/jessecarroll/.claude/plans/e2e-ns7-device-revocation.ma
 [step 28] bash: sed -n '90,330p' core/protocol/src/fanout.rs
 [step 29] bash: sed -n '330,572p' core/protocol/src/fanout.rs
 [step 30] no successful edit in 30 steps (last progress at step 0); parking
+[step 30] no scratchpad update in 15 steps; nudging
+[step 30] create_file: .agent_scratchpad.md
+[step 30] bash: echo "=== tests/per_device_fanout.rs ==="; cat -n core/protocol/tests/per_device_fanout.rs; echo; echo "=== fanout.rs es
+[step 31] bash: python3 -c "
+import json
+d=json.load(open('/Users/jessecarroll/.claude/plans/e2e-ns7-device-revocation.manifest.json'))
+
+[step 31] bash: ls /Users/jessecarroll/.claude/plans/ | head -50; echo "---"; sed -n '150,200p' core/protocol/src/fanout.rs
+[step 32] bash: python3 -c "
+import json
+d=json.load(open('/Users/jessecarroll/.claude/plans/e2e-ns7-device-revocation.manifest.json'))
+
+[step 33] bash: grep -n -i "revoc\|unlink" spec/v0.md | head -60
+[step 33] bash: grep -n -i "revoc\|unlink" docs/threat-model.md PLAN.md | head -60
+   [read-heavy nudge: 6 reads in a row]
+[step 34] bash: sed -n '188,262p' spec/v0.md
+[step 35] bash: echo "=== crypto/src/lib.rs pub surface ==="; grep -n "pub use\|pub mod\|pub fn" core/crypto/src/lib.rs | head -40
+echo 
+[step 36] bash: echo "=== crypto/src/lib.rs ==="; grep -n "pub use\|pub mod\|pub fn" core/crypto/src/lib.rs | head -40
+echo "=== crypto/
+[step 36] bash: ls ~/.cargo/registry/src/ 2>/dev/null; ls -d ~/.cargo/registry/src/*/libsignal* 2>/dev/null | head
