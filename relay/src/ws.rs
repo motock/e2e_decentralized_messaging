@@ -24,15 +24,29 @@
 //!   → `{"ok":true}` or `{"ok":false,"error":"..."}`
 //! - `{"op":"lookup_prekey","recipient_id":"..."}`
 //!   → `{"ok":true,"bundle":"<base64>"}` or `{"ok":false,"error":"NotFound"}`
-//! - `{"op":"send_envelope","recipient_id":"...","envelope":"<base64>","challenge_id":"<hex>","pow_solution":"<base64>"}`
+//! - `{"op":"send_envelope","recipient_id":"...","envelope":"<base64>","kind":"direct|group","challenge_id":"<hex>","pow_solution":"<base64>"}`
 //!   → `{"ok":true}` or `{"ok":false,"error":"..."}`. Envelopes are queued FIFO per
 //!   recipient, up to a per-recipient cap; when the cap is reached the send is rejected
 //!   with `{"ok":false,"error":"QueueFull"}` and queued envelopes are never dropped to
-//!   make room.
-//! - `{"op":"pickup_envelope","recipient_id":"..."}`
-//!   → `{"ok":true,"envelope":"<base64>"}` or `{"ok":false,"error":"NotFound|Expired"}`.
-//!   Returns and removes the OLDEST queued envelope, one per call; `NotFound` when the
-//!   queue is empty, and `Expired` once when only expired envelopes remained (they are
+//!   make room. `kind` is an OPTIONAL out-of-band envelope-kind routing tag
+//!   (`"direct"` for 1:1 session envelopes, `"group"` for group sender-key
+//!   envelopes). It is NON-CONTENT routing metadata: it travels as a sibling JSON
+//!   field of the op — **never inside the ciphertext** — and the relay neither reads
+//!   nor needs to read it; it is stored and echoed verbatim. A missing or unknown
+//!   kind is passed through as absent, and the receiving client falls through to its
+//!   own decrypt (fail closed = not silently misrouted, not skipped).
+//! - `{"op":"pickup_envelope","recipient_id":"...","kind":"direct|group"}`
+//!   → `{"ok":true,"envelope":"<base64>","kind":"direct|group"}` or
+//!   `{"ok":false,"error":"NotFound|Expired"}`. The `kind` field is present only
+//!   when the sender supplied one (it is omitted otherwise). When the request
+//!   carries a `kind` filter, only envelopes tagged with that kind — or UNTAGGED
+//!   envelopes, which fall through to any polling loop — are delivered; an
+//!   envelope tagged with a foreign kind is left queued untouched, so the wrong
+//!   loop can never destroy the other loop's mail (the response is
+//!   `{"ok":false,"error":"NotFound"}` and the owning loop still receives the
+//!   envelope afterwards). Returns and removes the OLDEST acceptable queued
+//!   envelope, one per call; `NotFound` when nothing acceptable is queued, and
+//!   `Expired` once when only expired envelopes remained (they are
 //!   discarded, so the next call reports `NotFound`).
 //!
 //! The PoW challenge is issued out-of-band: the relay exposes a `challenge` op that
@@ -46,7 +60,10 @@
 //!   error response and does NOT perform the requested operation.
 //! - **Same gates**: PoW and rate-limit checks are identical to the libp2p path.
 //! - **Blind relay**: the relay never decrypts or inspects envelope/prekey contents —
-//!   they are opaque base64 blobs at this layer.
+//!   they are opaque base64 blobs at this layer. The optional `kind` field on
+//!   `send_envelope`/`pickup_envelope` is non-content routing metadata (a label the
+//!   relay stores and echoes verbatim), not a view into the payload: the ciphertext
+//!   bytes are passed through untouched, byte for byte.
 //! - **Data minimization**: no envelope or bundle contents are logged.
 //! - **Audit logging**: PoW failures and rate-limit violations are logged at WARN level
 //!   with the operation and a truncated recipient_id (first 8 chars), never the payload.
@@ -77,6 +94,10 @@ const DEFAULT_ENVELOPE_TTL: Duration = Duration::from_secs(7 * 86400);
 const POW_DIFFICULTY: u32 = 20;
 /// PoW context string (binds solutions to this relay's WS path).
 const POW_CONTEXT: &[u8] = b"ws-relay-v1";
+/// Upper bound on how many envelopes one `pickup_envelope` call may scan past
+/// (re-queueing foreign-kind envelopes) before reporting `NotFound`. Generous:
+/// the per-recipient queue is capped at `DEFAULT_MAX_ENVELOPES_PER_RECIPIENT`.
+const MAX_PICKUP_SCAN: usize = 1024;
 
 /// Shared state for the WS listener: the store, rate limiter, and active PoW challenges.
 struct WsState {
@@ -87,6 +108,24 @@ struct WsState {
     rate_limiter: Mutex<RateLimiter>,
     /// Currently active PoW challenges, keyed by a challenge ID (the nonce hex).
     challenges: Mutex<std::collections::HashMap<String, Challenge>>,
+    /// Out-of-band envelope-kind routing tags (GRP-6), keyed by the SHA-256 hex of
+    /// the queued envelope bytes.
+    ///
+    /// The kind is NON-CONTENT routing metadata: it arrives as a sibling JSON field
+    /// of `send_envelope` — never inside the ciphertext — and is held here, beside
+    /// the mailbox queue, so the blind store-and-forward in `store::Mailbox` stays
+    /// byte-for-byte unchanged. An entry is removed when its envelope is delivered.
+    envelope_kinds: Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// SHA-256 hex digest of `bytes` — the key under which an envelope's out-of-band
+/// kind tag is remembered (see `WsState::envelope_kinds`).
+fn envelope_kind_key(envelope: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(envelope);
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl WsState {
@@ -99,6 +138,7 @@ impl WsState {
             prekeys: RelayStore::new(),
             rate_limiter: Mutex::new(RateLimiter::per_identity(rate_limit_per_minute)),
             challenges: Mutex::new(std::collections::HashMap::new()),
+            envelope_kinds: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -121,12 +161,28 @@ enum WsRequest {
     #[serde(rename = "send_envelope")]
     SendEnvelope {
         recipient_id: String,
-        envelope: String,     // base64
+        envelope: String, // base64
+        /// Out-of-band envelope-kind routing tag (e.g. "direct" | "group").
+        ///
+        /// This is NON-CONTENT routing metadata: it travels as a sibling JSON field
+        /// of `send_envelope`, never inside the ciphertext, and the relay never
+        /// inspects (or needs to inspect) the envelope bytes themselves. A missing
+        /// or unknown kind is stored as `None` and passed through verbatim — the
+        /// receiving loop decides what to do with it (fall through to its decrypt).
+        kind: Option<String>,
         challenge_id: String, // hex of challenge nonce
         pow_solution: String, // base64 of solution bytes
     },
     #[serde(rename = "pickup_envelope")]
-    PickupEnvelope { recipient_id: String },
+    PickupEnvelope {
+        recipient_id: String,
+        /// Optional out-of-band kind filter (see `SendEnvelope::kind`). When
+        /// present, only envelopes tagged with this kind — or untagged
+        /// envelopes, which fall through to any loop — are delivered; a
+        /// foreign-kind envelope stays queued so the wrong loop cannot destroy
+        /// it. Absent = deliver the oldest live envelope regardless of tag.
+        kind: Option<String>,
+    },
 }
 
 /// Response frame: success or error.
@@ -139,6 +195,10 @@ enum WsResponse {
         bundle: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         envelope: Option<String>,
+        /// Out-of-band kind tag echoed back with `pickup_envelope` (see
+        /// `WsRequest::SendEnvelope::kind`). `None` when the sender sent no kind.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         challenge: Option<String>, // base64 of Challenge::to_wire()
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +216,7 @@ impl WsResponse {
             ok: true,
             bundle: None,
             envelope: None,
+            kind: None,
             challenge: None,
             challenge_id: None,
         }
@@ -166,16 +227,18 @@ impl WsResponse {
             ok: true,
             bundle: Some(bundle),
             envelope: None,
+            kind: None,
             challenge: None,
             challenge_id: None,
         }
     }
 
-    fn ok_envelope(envelope: String) -> Self {
+    fn ok_envelope(envelope: String, kind: Option<String>) -> Self {
         WsResponse::Ok {
             ok: true,
             bundle: None,
             envelope: Some(envelope),
+            kind,
             challenge: None,
             challenge_id: None,
         }
@@ -186,6 +249,7 @@ impl WsResponse {
             ok: true,
             bundle: None,
             envelope: None,
+            kind: None,
             challenge: Some(challenge),
             challenge_id: Some(challenge_id),
         }
@@ -454,6 +518,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
         WsRequest::SendEnvelope {
             recipient_id,
             envelope,
+            kind,
             challenge_id,
             pow_solution,
         } => {
@@ -477,14 +542,18 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 );
                 return WsResponse::err(format!("PowFailed: {e}"));
             }
-            // 3. Queue the envelope (blind — relay never inspects contents)
+            // 3. Queue the envelope (blind — relay never inspects contents). The
+            // kind tag is non-content routing metadata: it is remembered beside
+            // the queue (keyed by the envelope's SHA-256), never inside the
+            // envelope bytes.
             let envelope_bytes = match b64_decode(&envelope) {
                 Ok(b) => b,
                 Err(e) => return WsResponse::err(format!("InvalidBase64: {e}")),
             };
-            if let Err(e) = state
-                .store
-                .enqueue(&recipient_id, envelope_bytes, DEFAULT_ENVELOPE_TTL)
+            if let Err(e) =
+                state
+                    .store
+                    .enqueue(&recipient_id, envelope_bytes.clone(), DEFAULT_ENVELOPE_TTL)
             {
                 if matches!(&e, MailboxError::QueueFull) {
                     warn!(
@@ -494,11 +563,18 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 }
                 return mailbox_send_error_response(e);
             }
+            if let Some(kind) = &kind {
+                state
+                    .envelope_kinds
+                    .lock()
+                    .await
+                    .insert(envelope_kind_key(&envelope_bytes), kind.clone());
+            }
             info!(recipient = %truncate_id(&recipient_id), "ws: envelope stored");
             WsResponse::ok_simple()
         }
 
-        WsRequest::PickupEnvelope { recipient_id } => {
+        WsRequest::PickupEnvelope { recipient_id, kind } => {
             // Pickup is a read — rate-limited but no PoW required.
             {
                 let mut rl = state.rate_limiter.lock().await;
@@ -511,18 +587,75 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     return WsResponse::err("RateLimitExceeded");
                 }
             }
-            match state.store.dequeue(&recipient_id) {
-                Ok(envelope_bytes) => WsResponse::ok_envelope(b64_encode(&envelope_bytes)),
-                Err(MailboxError::NotFound) => WsResponse::err("NotFound"),
-                Err(MailboxError::Expired) => WsResponse::err("Expired"),
-                Err(MailboxError::Io(msg)) => {
-                    warn!(
-                        recipient = %truncate_id(&recipient_id),
-                        "ws: store io error on pickup_envelope: {msg}"
-                    );
-                    WsResponse::err("StoreError")
+            // Deliver the oldest queued envelope whose out-of-band kind the
+            // caller accepts (GRP-6). With no filter the oldest live envelope is
+            // delivered regardless of tag. With a filter, only envelopes tagged
+            // with that kind — or UNTAGGED envelopes, which fall through to any
+            // polling loop — are delivered; an envelope tagged with a foreign
+            // kind is re-queued (FIFO tail) so the wrong loop can never destroy
+            // the other loop's mail. The scan stops after one full lap so a
+            // queue holding only foreign-kind envelopes reports NotFound.
+            let mut delivered: Option<(Vec<u8>, Option<String>)> = None;
+            let mut scanned = 0usize;
+            while delivered.is_none() {
+                let envelope_bytes = match state.store.dequeue(&recipient_id) {
+                    Ok(bytes) => bytes,
+                    Err(MailboxError::NotFound) => break,
+                    Err(MailboxError::Expired) => break,
+                    // RES-1: the Io class is built from rusqlite's error text,
+                    // which embeds the store's absolute path and schema detail.
+                    // That belongs in the operator's log, never on the wire to a
+                    // peer that has only solved the PoW gate.
+                    Err(MailboxError::Io(msg)) => {
+                        warn!(
+                            recipient = %truncate_id(&recipient_id),
+                            "ws: store io error on pickup_envelope: {msg}"
+                        );
+                        return WsResponse::err("StoreError");
+                    }
+                    Err(e) => return WsResponse::err(format!("StoreError: {e:?}")),
+                };
+                let tag = state
+                    .envelope_kinds
+                    .lock()
+                    .await
+                    .get(&envelope_kind_key(&envelope_bytes))
+                    .cloned();
+                let accepted = match &kind {
+                    None => true,
+                    // Untagged envelopes fall through to any polling loop.
+                    Some(want) => tag.as_deref() == Some(want.as_str()) || tag.is_none(),
+                };
+                if accepted {
+                    if tag.is_some() {
+                        state
+                            .envelope_kinds
+                            .lock()
+                            .await
+                            .remove(&envelope_kind_key(&envelope_bytes));
+                    }
+                    delivered = Some((envelope_bytes, tag));
+                    break;
                 }
-                Err(e) => WsResponse::err(format!("StoreError: {e:?}")),
+                // Foreign kind: put it back at the FIFO tail, untouched, and
+                // keep its tag so the owning loop still finds it.
+                if let Err(e) =
+                    state
+                        .store
+                        .enqueue(&recipient_id, envelope_bytes.clone(), DEFAULT_ENVELOPE_TTL)
+                {
+                    return WsResponse::err(format!("StoreError: {e:?}"));
+                }
+                scanned += 1;
+                if scanned > MAX_PICKUP_SCAN {
+                    break; // every live envelope is foreign to this caller
+                }
+            }
+            match delivered {
+                Some((envelope_bytes, tag)) => {
+                    WsResponse::ok_envelope(b64_encode(&envelope_bytes), tag)
+                }
+                None => WsResponse::err("NotFound"),
             }
         }
     }
@@ -1280,6 +1413,9 @@ mod tests {
         let resp = handle_request(
             WsRequest::PickupEnvelope {
                 recipient_id: recipient_id.to_string(),
+                // No kind filter: this test exercises the store-error arm, not
+                // kind routing.
+                kind: None,
             },
             &state,
         )

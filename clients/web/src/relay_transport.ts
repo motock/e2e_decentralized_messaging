@@ -6,6 +6,17 @@
 //! `send_envelope`, and `pickup_envelope` ops with base64-encoded payloads and
 //! the solved `challenge_id` / `pow_solution` fields.
 //!
+//! ## Envelope kind (GRP-6, out-of-band)
+//!
+//! A `RelayTransport` may be constructed with an envelope `kind`
+//! (`"direct"` | `"group"`). The kind is NON-CONTENT routing metadata: it is
+//! sent as a SIBLING JSON field of the `send_envelope` op — never inside the
+//! ciphertext bytes, which stay byte-for-byte pure — and is surfaced by
+//! `pickupEnvelope` as a non-enumerable `kind` property on the returned
+//! `Uint8Array` so the two receive loops can route before decrypting. A
+//! missing or unknown kind falls through to the owning loop's decrypt; it is
+//! never silently skipped.
+//!
 //! The relay URL is configurable: read from a Vite env var (`VITE_RELAY_WS_URL`)
 //! at build time, with a `localStorage` override (`relayWsUrl`) checked at
 //! runtime. The old hardcoded `ws://localhost:8000` is gone.
@@ -248,9 +259,17 @@ export class RelayTransport {
     private pending: PendingRequest | null = null;
     private connectPromise: Promise<void> | null = null;
     private url: string;
+    /**
+     * The out-of-band envelope kind (GRP-6) this transport tags outgoing
+     * envelopes with ("direct" | "group"). Non-content routing metadata: it
+     * travels as a sibling JSON field on the `send_envelope` op, never inside
+     * the ciphertext. `undefined` = tag nothing (legacy behaviour).
+     */
+    private kind: string | undefined;
 
-    constructor(url?: string) {
+    constructor(url?: string, kind?: string) {
         this.url = url ?? getRelayWsUrl();
+        this.kind = kind;
     }
 
     /** Open (or reuse) the WebSocket connection. Resolves when open. */
@@ -387,16 +406,75 @@ export class RelayTransport {
             op: 'send_envelope',
             recipient_id: recipientId,
             envelope: bytesToBase64(envelope),
+            // Out-of-band envelope-kind routing tag (GRP-6). NON-CONTENT
+            // metadata: a sibling JSON field of the op, never inside the
+            // ciphertext bytes. Omitted entirely when this transport has no
+            // kind, so the wire shape is unchanged for kind-less transports.
+            ...(this.kind !== undefined ? { kind: this.kind } : {}),
             challenge_id: challengeId,
             pow_solution: powSolution,
         });
     }
 
-    /** Pick up a stored envelope for the given recipient. Returns the raw envelope bytes. */
+    /**
+     * Pick up a stored envelope for the given recipient.
+     *
+     * Sends the transport's kind as the sibling `kind` field of the
+     * `pickup_envelope` op (see below), so the relay only dequeues envelopes
+     * this loop owns; a foreign-kind envelope stays queued for its owner.
+     *
+     * Returns the raw envelope bytes — a `Uint8Array` — carrying the
+     * envelope's out-of-band kind tag (GRP-6) as NON-ENUMERABLE own
+     * properties so both consumption shapes work:
+     *
+     *   - `picked.kind` → the kind that travelled as a sibling field of the
+     *     relay's `pickup_envelope` response (`undefined` when the relay sent
+     *     none — the "missing kind" fall-through signal), and
+     *   - `picked.envelope` → the same `Uint8Array` (self-alias), so callers
+     *     may destructure `{ envelope, kind }`.
+     *
+     * Non-enumerable so structural comparisons against a plain `Uint8Array`
+     * still hold. The receive loops read `kind` to route the envelope BEFORE
+     * attempting a decrypt; a missing or unknown kind falls through to the
+     * owning loop's decrypt — never silently skipped.
+     */
     async pickupEnvelope(recipientId: string): Promise<Uint8Array> {
-        const resp = await this.roundTrip({ op: 'pickup_envelope', recipient_id: recipientId });
+        const resp = await this.roundTrip({
+            op: 'pickup_envelope',
+            recipient_id: recipientId,
+            // Out-of-band kind filter (GRP-6), the sibling field of the
+            // `pickup_envelope` op — the same NON-CONTENT metadata channel the
+            // `send_envelope` op uses. The relay only dequeues an envelope
+            // whose kind matches this filter (or one with no tag at all, the
+            // fall-through case); a FOREIGN-kind envelope stays queued so the
+            // loop that owns it still receives it. Without this filter the
+            // relay's destructive dequeue would hand this loop the other
+            // loop's mail and destroy it. Omitted entirely when this transport
+            // has no kind, so the wire shape is unchanged for kind-less
+            // transports.
+            ...(this.kind !== undefined ? { kind: this.kind } : {}),
+        });
         if (!resp.envelope) throw new RelayError('pickup_envelope response missing envelope');
-        return base64ToBytes(resp.envelope);
+        const bytes = base64ToBytes(resp.envelope);
+        // Self-alias so `{ envelope, kind }` destructuring works on the same
+        // object (the bytes ARE the envelope) — attached always, with or
+        // without a kind.
+        Object.defineProperty(bytes, 'envelope', {
+            value: bytes,
+            enumerable: false,
+            writable: true,
+            configurable: true,
+        });
+        const kind = typeof resp.kind === 'string' ? resp.kind : undefined;
+        if (kind !== undefined) {
+            Object.defineProperty(bytes, 'kind', {
+                value: kind,
+                enumerable: false,
+                writable: true,
+                configurable: true,
+            });
+        }
+        return bytes;
     }
 
     /** Close the WebSocket connection. */

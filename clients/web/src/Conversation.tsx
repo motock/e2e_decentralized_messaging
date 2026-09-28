@@ -15,7 +15,7 @@ import {
     senderRecordId,
     RECEIVER_RECORD_ID,
 } from './session_persistence';
-import { RelayTransport } from './relay_transport';
+import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import type { PersistedIdentity } from './identity';
 import './Conversation.css';
 
@@ -37,7 +37,10 @@ export interface ConversationTransport {
     sendEnvelope(recipientId: string, envelope: Uint8Array): Promise<void>;
     /**
      * Pick up a stored envelope addressed to `recipientId` (the local user's own
-     * recipient ID). Returns the raw envelope bytes. Rejects with an error whose
+     * recipient ID). Returns the raw envelope bytes — a `Uint8Array` carrying
+     * the envelope's out-of-band kind tag (GRP-6) as a non-enumerable `kind`
+     * property (`"direct"` | `"group"`, or `undefined` when the relay sent no
+     * tag: the "missing kind" fall-through signal). Rejects with an error whose
      * message is "NotFound" or "Expired" when the mailbox is empty — the receive
      * loop treats these as a normal empty poll, not an exceptional condition.
      */
@@ -120,7 +123,15 @@ export const Conversation: React.FC<ConversationProps> = ({
     // and its ratchet state is persisted through StorageGate, so this ref is an
     // in-memory cache over persisted state rather than the only copy of it.
     const sessionsRef = useRef<Map<string, PeerSession>>(new Map());
-    const transportRef = useRef<ConversationTransport>(transport ?? new RelayTransport());
+    // GRP-6: when no transport is injected (the App-level wiring was scoped out
+    // of this story), build the default transport tagged with THIS loop's
+    // envelope kind so outgoing envelopes carry the out-of-band "direct" tag and
+    // the two receive loops stop consuming each other's mail. An injected
+    // transport is used as-is (tests inject kindless mocks; a missing kind then
+    // falls through to this loop's decrypt, which is the fail-closed policy).
+    const transportRef = useRef<ConversationTransport>(
+        transport ?? new RelayTransport(getRelayWsUrl(), 'direct'),
+    );
     // Receiver-side session for decrypting inbound envelopes. Injected by the
     // caller (App.tsx) via the `receiverSession` prop — this is the SAME session
     // whose prekey bundle was published to the relay, so envelopes encrypted to
@@ -227,9 +238,31 @@ export const Conversation: React.FC<ConversationProps> = ({
                     receiverSessionRef.current = propSession;
                 }
 
-                const envelope: Uint8Array = await transportRef.current.pickupEnvelope(
+                const picked = await transportRef.current.pickupEnvelope(
                     identity!.recipientId,
                 );
+
+                // ── Envelope-kind routing (GRP-6, out-of-band) ──────────────
+                // The kind travels as a sibling field of the relay's
+                // pickup_envelope op — never inside the ciphertext. Normalize
+                // both pickup shapes: a bare Uint8Array (legacy mocks / no tag)
+                // or a `{ envelope, kind }` result.
+                const envelope: Uint8Array =
+                    picked instanceof Uint8Array ? picked : picked.envelope;
+                const envelopeKind: string | undefined = (picked as any).kind;
+                // This is the DIRECT loop. The transport already sent
+                // `kind: 'direct'` on the pickup op, so the relay keeps
+                // group-kind envelopes queued for the group loop and this
+                // branch should not fire against a filtering relay. It is kept
+                // as a DEFENSIVE FALLBACK for a non-filtering peer (legacy
+                // relay / mock): a known foreign kind ("group") must not be
+                // decrypted here, so we skip it without surfacing the tampered
+                // warning. A missing or UNKNOWN kind FALLS THROUGH to this
+                // loop's decrypt (fail closed = not silently misrouted, not
+                // skipped).
+                if (envelopeKind === 'group') {
+                    return; // foreign kind: leave for the owning loop
+                }
 
                 // Dedup: the relay may return the same envelope on consecutive polls.
                 const envelopeKey = Buffer.from(envelope).toString('base64');
