@@ -14,15 +14,15 @@ export default defineConfig({
   // server to hit under Vitest's Node-based test runner).
   plugins: [react(), wasm(), topLevelAwait()],
   build: {
-    // ES2022 is the floor at which esbuild can keep the wasm-bindgen glue's
-    // destructuring patterns as-is. Vite's default build target ('modules'
-    // = ES2020/Chrome87/Safari14) makes vite-plugin-top-level-await try to
-    // downlevel those patterns to ES2020, which esbuild cannot do, so
-    // `vite build` fails with "Transforming destructuring ... is not
-    // supported yet". ES2022 (Chrome 94+/Firefox 93+/Safari 15.4+) needs no
-    // downleveling and is the sensible floor for a web client that already
-    // depends on WASM + top-level await. This only affects the production
-    // build, not the dev server or Vitest.
+    // ES2022 is the floor at which the wasm-bindgen glue's destructuring
+    // patterns survive bundling as-is. Vite's default build target
+    // ('baseline-widely-available') still downlevels newer syntax for older
+    // browsers, and that downleveling chokes on the glue code's
+    // destructuring, so `vite build` fails with "Transforming destructuring
+    // ... is not supported yet". ES2022 (Chrome 94+/Firefox 93+/Safari
+    // 15.4+) needs no downleveling and is the sensible floor for a web
+    // client that already depends on WASM + top-level await. This only
+    // affects the production build, not the dev server or Vitest.
     target: 'es2022',
   },
   // Relative base so the published artifact is relocatable: index.html
