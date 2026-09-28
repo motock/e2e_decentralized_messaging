@@ -325,6 +325,22 @@ fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
     }
 }
 
+/// Map a [`StoreError`] from `prekeys.store` (publish_prekey) to a WS error response.
+///
+/// Mirrors [`mailbox_send_error_response`]: the `Io` class carries raw SQLite text
+/// (absolute database path, schema detail) that must never reach the peer, so it is
+/// logged server-side and the peer gets the fixed generic `StoreError` reason. The
+/// other variants keep the pre-existing `StoreError: {e:?}` wire form.
+fn prekey_store_error_response(e: StoreError) -> WsResponse {
+    match e {
+        StoreError::Io(msg) => {
+            warn!("ws: store io error on publish_prekey: {msg}");
+            WsResponse::err("StoreError")
+        }
+        other => WsResponse::err(format!("StoreError: {other:?}")),
+    }
+}
+
 /// Handle a single WS request against the shared state.
 ///
 /// This is the security-critical path: PoW and rate-limit gates are enforced here
@@ -403,7 +419,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 .prekeys
                 .store(&prekey_key, bundle_bytes, DEFAULT_PREKEY_TTL)
             {
-                return WsResponse::err(format!("StoreError: {e:?}"));
+                return prekey_store_error_response(e);
             }
             info!(recipient = %truncate_id(&recipient_id), "ws: prekey published");
             WsResponse::ok_simple()
@@ -1112,6 +1128,58 @@ mod tests {
             (MailboxError::Expired, "StoreError: Expired"),
         ] {
             match mailbox_send_error_response(variant) {
+                WsResponse::Err { ok, error } => {
+                    assert!(!ok, "a store failure must be an error response");
+                    assert_eq!(
+                        error, expected,
+                        "non-Io variants must keep their existing wire form"
+                    );
+                }
+                other => panic!("expected an error response, got: {other:?}"),
+            }
+        }
+    }
+
+    /// The publish_prekey store path must sanitize the same way: `StoreError::Io`
+    /// carries raw SQLite text (absolute database path, schema detail) that must
+    /// never reach a peer that has only solved the PoW gate.
+    #[test]
+    fn prekey_store_error_response_does_not_leak_store_detail() {
+        let secret = "unable to open database file: /tmp/relay-secret/relay.db";
+        match prekey_store_error_response(StoreError::Io(secret.to_string())) {
+            WsResponse::Err { ok, error } => {
+                assert!(!ok, "an Io store error must be an error response");
+                assert_eq!(
+                    error, "StoreError",
+                    "the Io class must map to the fixed generic StoreError string"
+                );
+                for sentinel in [
+                    "/",
+                    ".db",
+                    "unable to open database file",
+                    "Io(",
+                    "/tmp/relay-secret",
+                    "relay.db",
+                ] {
+                    assert!(
+                        !error.contains(sentinel),
+                        "the response body must not contain {sentinel:?}, got: {error}"
+                    );
+                }
+            }
+            other => panic!("expected an error response, got: {other:?}"),
+        }
+    }
+
+    /// Only the Io class changes on the publish path too: NotFound/Expired keep the
+    /// pre-existing `StoreError: {e:?}` wire form.
+    #[test]
+    fn prekey_store_error_response_keeps_other_variants_distinct() {
+        for (variant, expected) in [
+            (StoreError::NotFound, "StoreError: NotFound"),
+            (StoreError::Expired, "StoreError: Expired"),
+        ] {
+            match prekey_store_error_response(variant) {
                 WsResponse::Err { ok, error } => {
                     assert!(!ok, "a store failure must be an error response");
                     assert_eq!(
