@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 /// Errors returned by the blind store-and-forward.
@@ -164,11 +164,15 @@ fn temp_sibling(path: &Path) -> PathBuf {
 ///
 /// Created with [`RelayStore::new`] (in memory, the historical behaviour) or
 /// [`RelayStore::open`] (backed by a file, so entries survive a restart).
+///
+/// Handles can be shared: [`RelayStore::clone_handle`] returns a new handle onto
+/// the SAME underlying map (and the same backing file), so multiple listeners in
+/// one process observe one durable store.
 pub struct RelayStore {
-    inner: Mutex<HashMap<String, (Vec<u8>, SystemTime)>>,
+    inner: Arc<Mutex<HashMap<String, (Vec<u8>, SystemTime)>>>,
     /// When set, every mutation is flushed to this path so a later
     /// `RelayStore::open` on the same path sees the same state.
-    path: Option<PathBuf>,
+    path: Option<Arc<PathBuf>>,
 }
 
 impl Default for RelayStore {
@@ -181,7 +185,7 @@ impl RelayStore {
     /// Create a new empty store.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Arc::new(Mutex::new(HashMap::new())),
             path: None,
         }
     }
@@ -194,9 +198,20 @@ impl RelayStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let map = load_map(path);
         Ok(Self {
-            inner: Mutex::new(map),
-            path: Some(path.to_path_buf()),
+            inner: Arc::new(Mutex::new(map)),
+            path: Some(Arc::new(path.to_path_buf())),
         })
+    }
+
+    /// Return a second handle onto the same underlying map and backing file.
+    ///
+    /// Mutations through either handle are visible through the other, and both
+    /// persist to the same path.
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            path: self.path.clone(),
+        }
     }
 
     /// Store an envelope for the given recipient with a TTL.
@@ -291,10 +306,10 @@ type Queue = VecDeque<(Vec<u8>, SystemTime)>;
 /// restart).
 pub struct Mailbox {
     max_depth: usize,
-    queues: Mutex<HashMap<String, Queue>>,
+    queues: Arc<Mutex<HashMap<String, Queue>>>,
     /// When set, every mutation is flushed to this path so a later
     /// `Mailbox::open` on the same path sees the same queues.
-    path: Option<PathBuf>,
+    path: Option<Arc<PathBuf>>,
 }
 
 impl Mailbox {
@@ -302,7 +317,7 @@ impl Mailbox {
     pub fn new(max_depth: usize) -> Self {
         Self {
             max_depth,
-            queues: Mutex::new(HashMap::new()),
+            queues: Arc::new(Mutex::new(HashMap::new())),
             path: None,
         }
     }
@@ -320,9 +335,21 @@ impl Mailbox {
         let queues = decode_queues(&bytes).unwrap_or_default();
         Ok(Self {
             max_depth,
-            queues: Mutex::new(queues),
-            path: Some(path.to_path_buf()),
+            queues: Arc::new(Mutex::new(queues)),
+            path: Some(Arc::new(path.to_path_buf())),
         })
+    }
+
+    /// Return a second handle onto the same underlying queues and backing file.
+    ///
+    /// Mutations through either handle are visible through the other, and both
+    /// persist to the same path.
+    pub fn clone_handle(&self) -> Self {
+        Self {
+            max_depth: self.max_depth,
+            queues: Arc::clone(&self.queues),
+            path: self.path.clone(),
+        }
     }
 
     /// Appends `envelope` to `recipient_id`'s queue, expiring after `ttl`.
