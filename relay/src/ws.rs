@@ -32,9 +32,14 @@
 //!   (`"direct"` for 1:1 session envelopes, `"group"` for group sender-key
 //!   envelopes). It is NON-CONTENT routing metadata: it travels as a sibling JSON
 //!   field of the op — **never inside the ciphertext** — and the relay neither reads
-//!   nor needs to read it; it is stored and echoed verbatim. A missing or unknown
-//!   kind is passed through as absent, and the receiving client falls through to its
-//!   own decrypt (fail closed = not silently misrouted, not skipped).
+//!   nor needs to read it; it is stored and echoed verbatim. The tag is
+//!   ALLOW-LISTED: only `"direct"`, `"group"`, or an absent field is accepted —
+//!   any other value is rejected with `{"ok":false,"error":"InvalidKind"}` and the
+//!   envelope is NOT queued (the check is the FIRST gate of the send arm, before
+//!   the rate limiter and PoW verifier, so an invalid kind consumes no challenge
+//!   and burns no PoW-verification CPU). An absent kind is stored as absent, and
+//!   the receiving client falls through to its own decrypt (fail closed = not
+//!   silently misrouted, not skipped).
 //! - `{"op":"pickup_envelope","recipient_id":"...","kind":"direct|group"}`
 //!   → `{"ok":true,"envelope":"<base64>","kind":"direct|group"}` or
 //!   `{"ok":false,"error":"NotFound|Expired"}`. The `kind` field is present only
@@ -114,8 +119,14 @@ struct WsState {
     /// The kind is NON-CONTENT routing metadata: it arrives as a sibling JSON field
     /// of `send_envelope` — never inside the ciphertext — and is held here, beside
     /// the mailbox queue, so the blind store-and-forward in `store::Mailbox` stays
-    /// byte-for-byte unchanged. An entry is removed when its envelope is delivered.
-    envelope_kinds: Mutex<std::collections::HashMap<String, String>>,
+    /// byte-for-byte unchanged. Each entry also records the envelope's absolute
+    /// expiry (see [`EnvelopeKind`]). An entry is removed when its envelope is
+    /// delivered, or pruned once its recorded expiry has passed.
+    envelope_kinds: Mutex<std::collections::HashMap<String, EnvelopeKind>>,
+    /// TTL granted to a stored envelope at BOTH enqueue sites (the send path and
+    /// the foreign-kind re-queue). Defaults to [`DEFAULT_ENVELOPE_TTL`]; a test
+    /// may shorten it to make expiry behaviour observable over the wire.
+    envelope_ttl: Duration,
 }
 
 /// SHA-256 hex digest of `bytes` — the key under which an envelope's out-of-band
@@ -126,6 +137,36 @@ fn envelope_kind_key(envelope: &[u8]) -> String {
     hasher.update(envelope);
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An out-of-band envelope-kind tag together with the absolute instant its
+/// envelope expires.
+///
+/// Recording the expiry at send time (`now + envelope_ttl`) lets the
+/// foreign-kind re-queue path preserve the envelope's original lease instead
+/// of granting it a fresh TTL on every poll (FIX 2). A refreshed TTL would
+/// let an unrequested-kind envelope live forever while the victim's loop
+/// keeps polling, and the per-recipient cap would then reject every later
+/// send with `QueueFull` — a mailbox wedge.
+#[derive(Clone)]
+struct EnvelopeKind {
+    kind: String,
+    expiry: Duration,
+}
+
+/// Drop `envelope_kinds` entries whose recorded expiry has passed, so the map
+/// does not grow without bound (FIX 3): entries were previously removed only
+/// on accepted delivery, so an envelope the store discarded as expired left
+/// its entry resident forever.
+///
+/// Pruned opportunistically — before a send inserts an entry, and once per
+/// pickup — rather than on a background sweep, so a relay that goes idle can
+/// hold a few stale entries until the next send or pickup touches the map.
+/// That is acceptable because every entry is only created after its sender
+/// solved the proof-of-work challenge, which bounds how fast the map — and
+/// the cost of each prune — can grow.
+fn prune_expired_kinds(kinds: &mut std::collections::HashMap<String, EnvelopeKind>, now: Duration) {
+    kinds.retain(|_, entry| entry.expiry > now);
 }
 
 impl WsState {
@@ -139,6 +180,7 @@ impl WsState {
             rate_limiter: Mutex::new(RateLimiter::per_identity(rate_limit_per_minute)),
             challenges: Mutex::new(std::collections::HashMap::new()),
             envelope_kinds: Mutex::new(std::collections::HashMap::new()),
+            envelope_ttl: DEFAULT_ENVELOPE_TTL,
         }
     }
 }
@@ -188,7 +230,9 @@ enum WsRequest {
 /// Response frame: success or error.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum WsResponse {
+/// A wire response frame. Public so tests can assert on the exact error body
+/// of the re-queue error helper (`mailbox_requeue_error_response`).
+pub enum WsResponse {
     Ok {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,6 +433,28 @@ fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
     }
 }
 
+/// Map a [`MailboxError`] from the foreign-kind RE-QUEUE (GRP-6's re-enqueue
+/// of an envelope a filtered pickup did not take) to a WS error response.
+///
+/// Mirrors [`mailbox_send_error_response`] and RES-1's redaction rule: the
+/// `Io` class carries raw SQLite text (absolute database path, schema
+/// detail) that must never reach the peer, so it is logged server-side —
+/// with the recipient truncated — and the peer gets the fixed generic
+/// `StoreError` body. Exposed for tests: the fault is not reachable through
+/// the test listener, whose store opens in memory.
+pub fn mailbox_requeue_error_response(e: MailboxError) -> WsResponse {
+    match e {
+        MailboxError::Io(msg) => {
+            warn!("ws: store io error on envelope re-queue: {msg}");
+            WsResponse::err("StoreError")
+        }
+        // The re-queue only runs after a successful dequeue of a live
+        // envelope; QueueFull/NotFound/Expired are unreachable here, kept
+        // for exhaustiveness with the same generic form.
+        other => WsResponse::err(format!("StoreError: {other:?}")),
+    }
+}
+
 /// Map a [`StoreError`] from `prekeys.store` (publish_prekey) to a WS error response.
 ///
 /// Mirrors [`mailbox_send_error_response`]: the `Io` class carries raw SQLite text
@@ -522,7 +588,22 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
             challenge_id,
             pow_solution,
         } => {
-            // 1. Rate limit
+            // 1. Validate the out-of-band kind against the allow-list BEFORE
+            // any state change. The tag is non-content routing metadata, but
+            // an unbounded, unvalidated string would let a client grow the
+            // relay's kind map with arbitrary values; only the two known
+            // kinds (or an absent field) are accepted, and anything else is
+            // rejected WITHOUT enqueuing. Deliberately the FIRST gate in the
+            // arm — before the rate limiter and the PoW verifier — so an
+            // invalid kind fails fast: it consumes no challenge, burns no
+            // PoW-verification CPU, and changes no state. Do not move this
+            // later in the arm.
+            if let Some(kind) = &kind {
+                if kind != "direct" && kind != "group" {
+                    return WsResponse::err("InvalidKind");
+                }
+            }
+            // 2. Rate limit
             {
                 let mut rl = state.rate_limiter.lock().await;
                 if let Err(RateLimitError::Exceeded { .. }) = rl.check(recipient_id.as_bytes(), now)
@@ -534,7 +615,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     return WsResponse::err("RateLimitExceeded");
                 }
             }
-            // 2. PoW verification
+            // 3. PoW verification
             if let Err(e) = verify_pow(&challenge_id, &pow_solution, state).await {
                 warn!(
                     recipient = %truncate_id(&recipient_id),
@@ -542,7 +623,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 );
                 return WsResponse::err(format!("PowFailed: {e}"));
             }
-            // 3. Queue the envelope (blind — relay never inspects contents). The
+            // 4. Queue the envelope (blind — relay never inspects contents). The
             // kind tag is non-content routing metadata: it is remembered beside
             // the queue (keyed by the envelope's SHA-256), never inside the
             // envelope bytes.
@@ -553,7 +634,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
             if let Err(e) =
                 state
                     .store
-                    .enqueue(&recipient_id, envelope_bytes.clone(), DEFAULT_ENVELOPE_TTL)
+                    .enqueue(&recipient_id, envelope_bytes.clone(), state.envelope_ttl)
             {
                 if matches!(&e, MailboxError::QueueFull) {
                     warn!(
@@ -564,11 +645,23 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 return mailbox_send_error_response(e);
             }
             if let Some(kind) = &kind {
-                state
-                    .envelope_kinds
-                    .lock()
-                    .await
-                    .insert(envelope_kind_key(&envelope_bytes), kind.clone());
+                let mut kinds = state.envelope_kinds.lock().await;
+                // Reclaim stale entries on the same write that grows the map
+                // (FIX 3): bounded work, and acceptable here because every
+                // entry only exists after its sender solved the PoW
+                // challenge, which bounds how fast the map — and this prune —
+                // can grow.
+                prune_expired_kinds(&mut kinds, now);
+                kinds.insert(
+                    envelope_kind_key(&envelope_bytes),
+                    EnvelopeKind {
+                        kind: kind.clone(),
+                        // The absolute expiry is captured NOW, at send time,
+                        // so the foreign-kind re-queue can preserve the
+                        // envelope's original lease (FIX 2).
+                        expiry: now + state.envelope_ttl,
+                    },
+                );
             }
             info!(recipient = %truncate_id(&recipient_id), "ws: envelope stored");
             WsResponse::ok_simple()
@@ -586,6 +679,13 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     );
                     return WsResponse::err("RateLimitExceeded");
                 }
+            }
+            // Drop kind entries whose envelope has already expired so the map
+            // does not grow without bound across polls (FIX 3, see
+            // prune_expired_kinds).
+            {
+                let mut kinds = state.envelope_kinds.lock().await;
+                prune_expired_kinds(&mut kinds, now);
             }
             // Deliver the oldest queued envelope whose out-of-band kind the
             // caller accepts (GRP-6). With no filter the oldest live envelope is
@@ -615,38 +715,54 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     }
                     Err(e) => return WsResponse::err(format!("StoreError: {e:?}")),
                 };
-                let tag = state
-                    .envelope_kinds
-                    .lock()
-                    .await
-                    .get(&envelope_kind_key(&envelope_bytes))
-                    .cloned();
+                let key = envelope_kind_key(&envelope_bytes);
+                let entry = state.envelope_kinds.lock().await.get(&key).cloned();
+                let tag = entry.as_ref().map(|e| e.kind.clone());
                 let accepted = match &kind {
                     None => true,
                     // Untagged envelopes fall through to any polling loop.
                     Some(want) => tag.as_deref() == Some(want.as_str()) || tag.is_none(),
                 };
                 if accepted {
-                    if tag.is_some() {
-                        state
-                            .envelope_kinds
-                            .lock()
-                            .await
-                            .remove(&envelope_kind_key(&envelope_bytes));
+                    if entry.is_some() {
+                        state.envelope_kinds.lock().await.remove(&key);
                     }
                     delivered = Some((envelope_bytes, tag));
                     break;
                 }
                 // Foreign kind: put it back at the FIFO tail, untouched, and
-                // keep its tag so the owning loop still finds it.
-                if let Err(e) =
-                    state
-                        .store
-                        .enqueue(&recipient_id, envelope_bytes.clone(), DEFAULT_ENVELOPE_TTL)
-                {
-                    return WsResponse::err(format!("StoreError: {e:?}"));
-                }
+                // keep its tag so the owning loop still finds it. Re-enqueue
+                // with the envelope's REMAINING lease, never a fresh TTL
+                // (FIX 2): a refreshed TTL would let an unrequested-kind
+                // envelope live forever while the victim's loop keeps
+                // polling, and the per-recipient cap would then reject every
+                // later send with QueueFull. An envelope already past its
+                // recorded expiry is dropped (tag removed) rather than
+                // re-queued. Only a TAGGED envelope can be foreign (untagged
+                // ones are accepted above), so `entry` is present here.
+                let remaining = entry
+                    .as_ref()
+                    .map(|e| e.expiry.saturating_sub(now))
+                    .unwrap_or(Duration::ZERO);
                 scanned += 1;
+                if remaining.is_zero() {
+                    state.envelope_kinds.lock().await.remove(&key);
+                    if scanned > MAX_PICKUP_SCAN {
+                        break;
+                    }
+                    continue;
+                }
+                if state
+                    .store
+                    .enqueue(&recipient_id, envelope_bytes.clone(), remaining)
+                    .is_err()
+                {
+                    // The generic body: never fold the store's Io detail (a
+                    // SQLite string that can carry a filesystem path) into
+                    // the wire error. The helper logs the detail server-side
+                    // with the recipient truncated.
+                    return WsResponse::err("StoreError");
+                }
                 if scanned > MAX_PICKUP_SCAN {
                     break; // every live envelope is foreign to this caller
                 }
@@ -797,6 +913,49 @@ pub async fn start_ws_listener_for_test(rate_limit_per_minute: u32) -> WsListene
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = Arc::new(WsState::new(rate_limit_per_minute));
+
+    let join = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((tcp_stream, peer_addr)) => {
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        let ws_stream = match tokio_tungstenite::accept_async(tcp_stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(peer = %peer_addr, "ws: handshake failed: {e}");
+                                return;
+                            }
+                        };
+                        handle_connection(ws_stream, state).await;
+                    });
+                }
+                Err(e) => {
+                    warn!("ws: accept error: {e}");
+                    break;
+                }
+            }
+        }
+    });
+
+    WsListenerHandle {
+        addr,
+        join: Some(join),
+    }
+}
+
+/// Start a WS listener on a random localhost port with a SHORTENED envelope
+/// TTL, so expiry behaviour (FIX 2 / FIX 3) is observable over the wire in a
+/// test. For testing only — production uses `DEFAULT_ENVELOPE_TTL`.
+pub async fn start_ws_listener_for_test_with_ttl(
+    rate_limit_per_minute: u32,
+    envelope_ttl: Duration,
+) -> WsListenerHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut state = WsState::new(rate_limit_per_minute);
+    state.envelope_ttl = envelope_ttl;
+    let state = Arc::new(state);
 
     let join = tokio::spawn(async move {
         loop {
