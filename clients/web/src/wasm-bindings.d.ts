@@ -66,17 +66,4 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
    localIdentityKey: Uint8Array,
    remoteIdentityKey: Uint8Array,
  ): string;
-    group: GroupHandle,
-    senderIdentity: IdentityHandle,
-    plaintextBytes: Uint8Array,
-  ): Uint8Array;
-  export function group_decrypt(
-    group: GroupHandle,
-    memberIdentity: IdentityHandle,
-    ciphertext: Uint8Array,
-  ): Uint8Array;
-  export function derive_safety_number(
-    localIdentityKey: Uint8Array,
-    remoteIdentityKey: Uint8Array,
-  ): string;
 }
