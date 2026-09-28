@@ -268,7 +268,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [identityProp, selfRecipientId, transport, storageGate]);
 
     // Persist the current real-member list to StorageGate so it survives
     // a page reload. Called after every membership change.
