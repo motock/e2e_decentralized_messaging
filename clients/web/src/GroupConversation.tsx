@@ -204,11 +204,6 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
             setReady(false);
             return;
         }
-        // Sync prop-derived refs on every run so a re-render that supplies real
-        // props (after a no-props render) uses them instead of the defaults
-        // captured by useRef on the first render.
-        if (transport) transportRef.current = transport;
-        if (storageGate) gateRef.current = storageGate;
         setError(null);
         ensureWasmInit()
             .then(async () => {
