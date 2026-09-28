@@ -201,8 +201,16 @@ export interface GroupTransport {
      * tag: the "missing kind" fall-through signal). Rejects with an error whose
      * message is "NotFound" or "Expired" when the mailbox is empty — the receive
      * loop treats these as a normal empty poll, not an exceptional condition.
+     *
+     * The declared return type is the union the real transport can produce:
+     * the bytes themselves, or a `{ envelope, kind? }` result. Callers
+     * normalize with `picked instanceof Uint8Array ? picked : picked.envelope`
+     * (the real transport self-aliases `envelope` on the bytes, so both arms
+     * yield the same bytes).
      */
-    pickupEnvelope(recipientId: string): Promise<Uint8Array>;
+    pickupEnvelope(
+        recipientId: string,
+    ): Promise<Uint8Array | { envelope: Uint8Array; kind?: string }>;
 }
 
 export interface GroupConversationProps {
