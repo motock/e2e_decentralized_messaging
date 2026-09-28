@@ -115,3 +115,9 @@ echo "=== crypto/
 [step 42] bash: cargo test -p protocol --test per_device_fanout 2>&1 | tail -15
 [step 43] str_replace: core/protocol/tests/device_revocation.rs
 [step 44] bash: cargo test -p protocol --test device_revocation 2>&1 | grep -cE "^error"; echo "--- pinned suite ---"; cargo test -p pro
+[step 45] no scratchpad update in 15 steps; nudging
+[step 45] str_replace: .agent_scratchpad.md
+[step 45] bash: for t in per_device_fanout group_round_trip; do echo "--- $t ---"; cargo test -p protocol --test $t 2>&1 | grep -E "^tes
+[step 46] view_file: .agent_scratchpad.md
+[step 46] bash: ls core/protocol/tests/
+[step 47] replace_lines: .agent_scratchpad.md
