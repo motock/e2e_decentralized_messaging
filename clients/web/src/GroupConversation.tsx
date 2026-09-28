@@ -85,16 +85,17 @@ export interface GroupConversationProps {
      */
     storageGate?: StorageGate;
     /**
-     * The local persisted identity. When provided, the component uses this
-     * identity (instead of generating a demo one) for group_create,
-     * group_encrypt, and group_decrypt — enabling real send/receive over the
-     * relay. The `selfRecipientId` must also be provided.
+     * The local persisted identity, used for group_create, group_encrypt and
+     * group_decrypt. REQUIRED: there is no demo-identity fallback. Omitting
+     * this prop (or `selfRecipientId`) makes the component fail closed — it
+     * renders a visible "unavailable" alert, starts no receive loop, and never
+     * generates a demo identity.
      */
     identity?: InstanceType<typeof IdentityHandle>;
     /**
-     * The local user's own recipient ID (base64 of their public key). Required
-     * when `identity` is provided — the receive loop polls the relay for
-     * envelopes addressed to this ID.
+     * The local user's own recipient ID (base64 of their public key). REQUIRED
+     * alongside `identity` — the receive loop polls the relay for envelopes
+     * addressed to this ID. Omitting either prop fails closed.
      */
     selfRecipientId?: string;
 }
