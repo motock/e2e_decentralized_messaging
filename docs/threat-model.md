@@ -308,3 +308,15 @@ this story and `CLAUDE.md`'s mandatory security review for changes touching cryp
 identity, transport, or key storage design.
 
 - [ ] Security-engineer review completed
+
+**Sign-off status: NOT signed off.** No independent security-engineer review of this
+threat model has been performed. What blocks it: the review this section requires must
+be granted by the security-engineer persona; the implementing agent authored this
+document and cannot grant it on its own behalf, and self-sign-off would not be an
+independent review. This record states the blocker plainly rather than claiming a
+completed sign-off.
+
+| Reviewer | Date | Comments |
+|---|---|---|
+| Security-engineer persona (required) | — | Sign-off NOT obtained: no independent security-engineer review of this threat model has been performed. Blocked pending that review. |
+
