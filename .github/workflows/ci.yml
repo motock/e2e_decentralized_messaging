@@ -34,6 +34,36 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets --locked
+      # TEMPORARY DIAGNOSTIC -- REMOVE BEFORE MERGE.
+      # The desktop lib unit-test binary (clients_desktop_tauri-*.exe) fails to
+      # load on Windows with 0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND once
+      # core_storage's vendored SQLCipher/OpenSSL is linked into it. The process
+      # dies before running any test, so dump the binary's DLL import table to
+      # identify which import cannot be resolved.
+      - name: Diagnose desktop lib test binary imports (windows)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo test -p clients-desktop-tauri --lib --locked --no-run 2>&1 | Select-Object -Last 5
+          $exes = Get-ChildItem target/debug/deps/clients_desktop_tauri-*.exe -ErrorAction SilentlyContinue
+          if (-not $exes) { Write-Host "DIAG: no clients_desktop_tauri test exe found"; exit 0 }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $vs "VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { Write-Host "DIAG: dumpbin not found"; exit 0 }
+
+          foreach ($e in $exes) {
+            Write-Host "===== DIAG imports: $($e.Name) ====="
+            & $dumpbin.FullName /DEPENDENTS $e.FullName
+          }
+
+          Write-Host "===== DIAG ssl/crypto/sqlite DLLs reachable on PATH ====="
+          foreach ($p in ($env:PATH -split ';' | Where-Object { $_ })) {
+            Get-ChildItem -Path (Join-Path $p '*') -Include 'libssl*.dll','libcrypto*.dll','sqlite*.dll' -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "$($_.FullName)  v$($_.VersionInfo.FileVersion)" }
+          }
       - run: cargo test --workspace --locked
 
   lint:
