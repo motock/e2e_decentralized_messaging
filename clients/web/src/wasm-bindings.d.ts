@@ -66,4 +66,9 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
    localIdentityKey: Uint8Array,
    remoteIdentityKey: Uint8Array,
  ): string;
+
+ // Revokes a linked device by id. Mirrors the `remove_device` export in
+ // core/bindings/wasm/src/lib.rs (kind "Revocation"); throws WasmError on
+ // failure per the Result<T, WasmError> -> throw convention above.
+ export function remove_device(device_id: number): void;
 }

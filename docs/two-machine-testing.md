@@ -274,7 +274,39 @@ state.
 
 ---
 
-## 6. Reduced threat model caveat
+## 6. Link another device — and revoke it
+
+The **Devices** panel lets you link a second device (or browser profile) to
+your identity by scanning a QR code or exchanging a linking code, confirming
+the safety number out of band as in step 5. Once the link completes, every
+linked device is listed under **Linked devices**.
+
+### Revoking a linked device
+
+If a device is lost, stolen, or retired, revoke it so it can no longer
+receive your messages:
+
+1. In the **Linked devices** section, find the device you want to remove.
+2. Click **Revoke device &lt;id&gt;** next to it. Nothing is removed yet —
+   the client asks for confirmation first.
+3. Click **Confirm revoke** to proceed, or **Keep device** to back out.
+4. On success the status line reports the device as revoked, it disappears
+   from **Linked devices**, and it is excluded from message fan-out from
+   that point on.
+
+Guardrails:
+
+- **Last remaining device:** revoking your only linked device is refused
+  unless you explicitly confirm the action — the client never locks you out
+  silently.
+- **Unknown device:** revoking a device id that is not linked fails closed
+  with a clear error and changes nothing.
+- **Honest status:** a failed revocation is never reported as success — the
+  status line shows the error and the device list is unchanged.
+
+---
+
+## 7. Reduced threat model caveat
 
 The web client operates under a **reduced threat model** compared to the
 mobile and desktop clients. Browsers lack a secure enclave, and key
