@@ -46,6 +46,7 @@ No server ever sees plaintext or owns identity; relays are cryptographically bli
 | `clients/desktop`, `clients/ios`, `clients/android` | Scaffolded, not yet implemented |
 | `docs/` | Threat model, dependency pinning rationale, security audit tracker |
 | `spec/` | Versioned wire-format specification (protobuf) |
+| [audit-plan.md](docs/audit-plan.md) | External audit plan |
 
 ## Local development setup
 
