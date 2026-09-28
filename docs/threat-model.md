@@ -148,6 +148,22 @@ and §10, not v1).
   from flooding a relay; abuse control is the separate proof-of-work/rate-limiting item in
   `PLAN.md` §3 and §10.
 
+### 4.55 Web client layer (browser/WASM: reduced threat model)
+
+- **Trusted to**: keep identity keys, session state, and message history encrypted at rest in
+  the browser profile's IndexedDB (AES-256-GCM via WebCrypto, fail-closed on a bad key or
+  corrupt data), and to derive safety numbers from the real identity keys.
+- **Not trusted to**: provide enclave-grade key protection — browsers have no secure enclave,
+  so key material in WASM/IndexedDB is weaker than on mobile/desktop. This is the documented
+  **reduced threat model** for web (`PLAN.md` §5): the client ships with a clear in-app
+  warning about it, shown before first use (`threatModelWarning()` in `clients/web/src/api.ts`).
+- **Metadata exposure**: none beyond the transport layers above while messages are in flight;
+  locally, the same filesystem/profile risks as §4.3 apply, plus the browser profile itself —
+  clearing site data or opening another profile loses identity and history (backup
+  export/import is the only recovery path).
+- **Status note**: this layer is implemented and covered by the web test suite; the
+  *reduced* rating is about the platform's key-storage strength, not about missing features.
+
 ### 4.6 DHT layer (Kademlia peer/prekey-bundle discovery)
 
 - **Trusted to**: eventually resolve a lookup for a peer's current address or prekey bundle,
