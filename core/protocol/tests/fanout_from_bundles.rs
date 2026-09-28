@@ -65,13 +65,13 @@ fn builds_from_public_bundles_and_removal_is_observable() {
     let mut fanout = FanoutSession::establish_from_bundles(
         &sender,
         &[
-            (DeviceId(1), public_bundle(&device_one)),
-            (DeviceId(2), public_bundle(&device_two)),
+            (DeviceId(1), *device_one.identity_key(), public_bundle(&device_one)),
+            (DeviceId(2), *device_two.identity_key(), public_bundle(&device_two)),
         ],
     )
     .expect("establish_from_bundles");
 
-    let mut before = fanout.devices();
+    let mut before: Vec<_> = fanout.devices().collect();
     before.sort();
     assert_eq!(
         before,
@@ -81,7 +81,7 @@ fn builds_from_public_bundles_and_removal_is_observable() {
 
     fanout.remove_device(DeviceId(1)).expect("remove device 1");
 
-    let after = fanout.devices();
+    let after: Vec<_> = fanout.devices().collect();
     assert!(
         !after.contains(&DeviceId(1)),
         "removed device must be absent from devices(): {after:?}"
@@ -110,11 +110,16 @@ fn single_device_boundary() {
     let sender = generate_identity_key_pair();
     let only = generate_identity_key_pair();
 
-    let mut fanout =
-        FanoutSession::establish_from_bundles(&sender, &[(DeviceId(7), public_bundle(&only))])
-            .expect("establish_from_bundles");
+    let mut fanout = FanoutSession::establish_from_bundles(
+        &sender,
+        &[(DeviceId(7), *only.identity_key(), public_bundle(&only))],
+    )
+    .expect("establish_from_bundles");
 
-    assert_eq!(fanout.devices(), vec![DeviceId(7)]);
+    assert_eq!(
+        fanout.devices().collect::<Vec<_>>(),
+        vec![DeviceId(7)]
+    );
 
     let ciphertexts = fanout.encrypt_to_all(b"only you").expect("encrypt");
     assert_eq!(ciphertexts.len(), 1, "one ciphertext for one device");
@@ -126,15 +131,17 @@ fn removing_the_last_device_leaves_no_recipients() {
     let sender = generate_identity_key_pair();
     let only = generate_identity_key_pair();
 
-    let mut fanout =
-        FanoutSession::establish_from_bundles(&sender, &[(DeviceId(3), public_bundle(&only))])
-            .expect("establish_from_bundles");
+    let mut fanout = FanoutSession::establish_from_bundles(
+        &sender,
+        &[(DeviceId(3), *only.identity_key(), public_bundle(&only))],
+    )
+    .expect("establish_from_bundles");
     fanout.remove_device(DeviceId(3)).expect("remove device 3");
 
     assert!(
-        fanout.devices().is_empty(),
+        fanout.devices().next().is_none(),
         "no recipients remain: {:?}",
-        fanout.devices()
+        fanout.devices().collect::<Vec<_>>()
     );
     assert!(
         fanout
@@ -168,8 +175,8 @@ fn duplicate_device_id_is_rejected() {
     let result = FanoutSession::establish_from_bundles(
         &sender,
         &[
-            (DeviceId(1), public_bundle(&a)),
-            (DeviceId(1), public_bundle(&b)),
+            (DeviceId(1), *a.identity_key(), public_bundle(&a)),
+            (DeviceId(1), *b.identity_key(), public_bundle(&b)),
         ],
     );
     let Err(e) = result else {
@@ -188,9 +195,11 @@ fn sender_only_session_cannot_decrypt() {
     let sender = generate_identity_key_pair();
     let recipient = generate_identity_key_pair();
 
-    let mut fanout =
-        FanoutSession::establish_from_bundles(&sender, &[(DeviceId(1), public_bundle(&recipient))])
-            .expect("establish_from_bundles");
+    let mut fanout = FanoutSession::establish_from_bundles(
+        &sender,
+        &[(DeviceId(1), *recipient.identity_key(), public_bundle(&recipient))],
+    )
+    .expect("establish_from_bundles");
     let ciphertexts = fanout.encrypt_to_all(b"hi").expect("encrypt");
     assert_eq!(ciphertexts.len(), 1);
 
@@ -208,7 +217,7 @@ fn tampered_bundle_is_rejected_as_an_establishment_failure() {
 
     let result = FanoutSession::establish_from_bundles(
         &sender,
-        &[(DeviceId(1), tampered_bundle(&recipient))],
+        &[(DeviceId(1), *recipient.identity_key(), tampered_bundle(&recipient))],
     );
     let Err(e) = result else {
         panic!("a tampered bundle must be rejected, got Ok");
@@ -216,6 +225,36 @@ fn tampered_bundle_is_rejected_as_an_establishment_failure() {
     assert!(
         matches!(e, FanoutError::Establishment(DeviceId(1), _)),
         "a tampered bundle must surface as Establishment(1, _), got: {e:?}"
+    );
+}
+
+/// The reviewer's blocking case, pinned as a regression guard: an attacker who
+/// controls bundle delivery substitutes a *well-formed* bundle carrying their own
+/// identity key and their own valid self-signatures. PQXDH accepts such a bundle —
+/// its signature checks only prove the bundle is internally consistent — so without
+/// an out-of-band binding the session would establish cleanly and every later
+/// `encrypt_to_all` ciphertext would be addressed to the attacker. The constructor
+/// must reject it with `IdentityMismatch` (not `Establishment`, and not Ok) because
+/// the identity does not match the one the caller vouched for.
+#[test]
+fn substituted_bundle_is_rejected_as_an_identity_mismatch() {
+    let sender = generate_identity_key_pair();
+    let victim_device = generate_identity_key_pair();
+    let attacker = generate_identity_key_pair();
+
+    // The caller vouches (from the primary-signed device list) that device 1 belongs
+    // to `victim_device` — but the bundle handed over is the attacker's, fully valid
+    // and self-consistent, so PQXDH itself would accept it.
+    let result = FanoutSession::establish_from_bundles(
+        &sender,
+        &[(DeviceId(1), *victim_device.identity_key(), public_bundle(&attacker))],
+    );
+    let Err(e) = result else {
+        panic!("an attacker-substituted bundle must be rejected, got Ok");
+    };
+    assert!(
+        matches!(e, FanoutError::IdentityMismatch { device: DeviceId(1) }),
+        "a substituted bundle must surface as IdentityMismatch, got: {e:?}"
     );
 }
 
@@ -228,5 +267,8 @@ fn establish_from_identity_keypairs_still_works() {
 
     let fanout = FanoutSession::establish(&sender, &[(DeviceId(5), &recipient)])
         .expect("establish must still accept identity keypairs");
-    assert_eq!(fanout.devices(), vec![DeviceId(5)]);
+    assert_eq!(
+        fanout.devices().collect::<Vec<_>>(),
+        vec![DeviceId(5)]
+    );
 }
