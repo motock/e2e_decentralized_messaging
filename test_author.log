@@ -130,3 +130,8 @@ echo "=== crypto/
 [step 54] bash: echo "=== introducing commit ==="; git log --oneline -- core/protocol/tests/device_revocation.rs; echo "=== 069a300 stat
    [read-heavy nudge: 6 reads in a row]
 [step 55] checkpoint: 
+[step 56] bash: git log --oneline -1; echo "--- test file committed & clean? ---"; git status --short -- core/protocol/tests/device_revo
+[step 57] no tool call (1 consecutive): 'The checkpoint committed my work (`e880c4e`), the test file is clean in the tree, and the suite is R'
+[step 58] done rejected — worktree dirty, asking agent to commit
+[step 59] bash: git status --short; echo "--- diff of test_author.log ---"; git diff -- test_author.log | head -30
+[step 60] bash: git add -A && git commit -q -m "chore(DR-2): record test-authoring session log" && git status --short && echo "--- clean
