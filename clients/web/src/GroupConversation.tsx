@@ -158,6 +158,24 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     const [decryptionWarning, setDecryptionWarning] = useState<string>('');
 
     const transportRef = useRef<GroupTransport>(transport ?? new RelayTransport());
+
+    // RelayTransport allows only ONE request in flight (see its one-in-flight
+    // constraint): a second concurrent op overwrites the single pending slot and
+    // the first caller's promise never settles. The receive loop polls
+    // pickupEnvelope on an interval while the send path fires sendEnvelope
+    // without awaiting, so a send landing mid-poll would hang that poll forever
+    // — pollInFlightRef would stay true and the receive loop would be dead for
+    // the rest of the session. Funnel every transport op through this chain so
+    // ops are serialized instead of overlapping.
+    const transportQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+    const runTransportOp = <T,>(op: () => Promise<T>): Promise<T> => {
+        const next = transportQueueRef.current.then(op, op);
+        transportQueueRef.current = next.then(
+            () => undefined,
+            () => undefined,
+        );
+        return next;
+    };
     const gateRef = useRef<StorageGate | undefined>(storageGate);
     // Track whether we've attempted to load persisted state so we don't
     // overwrite it with an empty group on the first render.
@@ -200,7 +218,10 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         // (gateRef) written from a permissive default. Leaving gateRef untouched
         // is what keeps a LATER render that does supply real props correct.
         if (!identityProp || !selfRecipientId) {
-            setError('Group messaging unavailable: no identity supplied.');
+            // The render path already prefixes this with "Group conversation
+            // unavailable: ", so keep the message itself free of a second
+            // "unavailable" clause.
+            setError('no identity supplied.');
             setReady(false);
             return;
         }
@@ -339,8 +360,8 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 const currentSelf = selfIdentityRef.current;
                 if (!currentGroup || !currentSelf) return;
 
-                const envelope: Uint8Array = await transportRef.current.pickupEnvelope(
-                    selfRecipientId!,
+                const envelope: Uint8Array = await runTransportOp(() =>
+                    transportRef.current.pickupEnvelope(selfRecipientId!),
                 );
 
                 // Dedup: the relay may return the same envelope on consecutive polls.
@@ -449,7 +470,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         try {
             let bundleBytes: Uint8Array;
             try {
-                bundleBytes = await transportRef.current.lookupPrekey(trimmedId);
+                bundleBytes = await runTransportOp(() =>
+                    transportRef.current.lookupPrekey(trimmedId),
+                );
             } catch {
                 setPeerError('Peer not found');
                 return;
@@ -529,9 +552,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         // Conversation.tsx's send path. Demo members are local-only (no relay
         // address) so they are not sent over the wire.
         for (const member of realMembers) {
-            void transportRef.current
-                .sendEnvelope(member.recipientId, new Uint8Array(ciphertext))
-                .catch((e) => {
+            void runTransportOp(() =>
+                transportRef.current.sendEnvelope(member.recipientId, new Uint8Array(ciphertext)),
+            ).catch((e) => {
                     console.warn('sendEnvelope failed for group member', {
                         recipientId: member.recipientId,
                         error: e instanceof Error ? e.message : String(e),

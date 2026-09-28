@@ -123,6 +123,19 @@ export default function App() {
     // without this GroupConversation would build its own RelayTransport.
     const groupTransport = React.useMemo(() => new RelayTransport(relayUrl), [relayUrl]);
 
+    // Close the superseded transport when relayUrl changes so its socket does
+    // not leak. Deliberately ref-based rather than a plain unmount cleanup:
+    // React StrictMode double-invokes effects (mount → cleanup → mount) with
+    // the SAME memoized instance, so an unmount cleanup would close the live
+    // transport and never reopen it. This only closes an instance that was
+    // genuinely replaced.
+    const prevGroupTransportRef = React.useRef<RelayTransport | null>(null);
+    React.useEffect(() => {
+        const prev = prevGroupTransportRef.current;
+        prevGroupTransportRef.current = groupTransport;
+        if (prev && prev !== groupTransport) prev.close();
+    }, [groupTransport]);
+
     const handleRelayUrlChange = React.useCallback((url: string) => {
         if (url === '') {
             // Reset: clear the override and fall back to the default resolution.

@@ -340,6 +340,70 @@ describe('GroupConversation real-peer member distribution', () => {
         expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
 
+    // ── Transport serialization ─────────────────────────────────────────────
+    //
+    // RelayTransport allows only ONE request in flight: a second concurrent op
+    // overwrites its single pending slot and the first caller's promise never
+    // settles. The receive loop polls while the send path fires sendEnvelope
+    // without awaiting, so an unserialized send landing mid-poll would hang the
+    // poll forever and permanently kill the receive loop. GroupConversation
+    // funnels every transport op through one queue; this pins that.
+    test('transport ops are serialized: a send issued while another op is in flight waits its turn', async () => {
+        const peerId = 'peer-serialized-base64-id';
+        prekeyBundles[peerId] = fakePeerKey(peerId);
+
+        let releaseFirstSend: () => void = () => {};
+        const firstSendGate = new Promise<void>((resolve) => {
+            releaseFirstSend = resolve;
+        });
+        let sendCalls = 0;
+        const transport = {
+            lookupPrekey: vi.fn(async (recipientId: string): Promise<Uint8Array> => {
+                const bundle = prekeyBundles[recipientId];
+                if (!bundle) throw new Error('relay: recipient not found');
+                return bundle;
+            }),
+            sendEnvelope: vi.fn(async (): Promise<void> => {
+                sendCalls += 1;
+                // Hold the transport's single in-flight slot on the first send.
+                if (sendCalls === 1) await firstSendGate;
+            }),
+            pickupEnvelope: vi.fn(async (): Promise<Uint8Array> => {
+                throw new Error('NotFound');
+            }),
+        };
+
+        render(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+
+        fireEvent.click(await screen.findByTestId('create-group-button'));
+        await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
+
+        fireEvent.change(screen.getByTestId('group-peer-id-input'), { target: { value: peerId } });
+        fireEvent.click(screen.getByTestId('add-peer-button'));
+        await waitFor(() => expect(screen.getByTestId(`member-${peerId}`)).toBeInTheDocument());
+
+        // Send #1 — its sendEnvelope blocks, holding the single in-flight slot.
+        fireEvent.change(screen.getByTestId('group-message-input'), { target: { value: 'first' } });
+        fireEvent.click(screen.getByTestId('group-send-button'));
+        await waitFor(() => expect(transport.sendEnvelope).toHaveBeenCalledTimes(1));
+
+        // Send #2 while #1 is still in flight. Serialized: it must NOT start.
+        fireEvent.change(screen.getByTestId('group-message-input'), { target: { value: 'second' } });
+        fireEvent.click(screen.getByTestId('group-send-button'));
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(transport.sendEnvelope).toHaveBeenCalledTimes(1);
+
+        // Release #1; #2 then runs.
+        releaseFirstSend();
+        await waitFor(() => expect(transport.sendEnvelope).toHaveBeenCalledTimes(2));
+    });
+
     // ── Criterion 3: the no-props path fails closed ─────────────────────────
     //
     // The shipped group view was a demo sandbox because it was rendered with no
