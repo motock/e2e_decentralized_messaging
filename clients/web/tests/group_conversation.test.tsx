@@ -103,7 +103,7 @@ const noopTransport = {
 
 describe('GroupConversation', () => {
     test('creates a group, adds members, and sends a message all current members decrypt', async () => {
-        render(<GroupConversation />);
+        render(<GroupConversation identity={selfIdentity} selfRecipientId={selfRecipientId} transport={noopTransport} />);
 
         const createBtn = await screen.findByTestId('create-group-button');
         fireEvent.click(createBtn);
