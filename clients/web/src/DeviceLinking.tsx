@@ -21,6 +21,12 @@
  *  - **Safety-number confirmation** gate: the user must enter the safety
  *    number they see on the other device; a mismatch aborts the link (fail
  *    closed).
+ *  - **Linked-device management** (DR-3): the devices currently linked to
+ *    this account are listed with a per-device revoke control. Revoking
+ *    requires an explicit confirmation step, the last remaining device
+ *    additionally requires confirming the lock-out risk, and the outcome is
+ *    reported honestly — a refused or failed revocation is never shown as
+ *    success.
  *
  * Security properties:
  *  - Fail closed: malformed payloads and mismatched safety numbers never
@@ -41,6 +47,8 @@ import {
     beginScan,
     confirmLink,
     initialLinkingState,
+    revokeDevice,
+    type LinkedDevice,
     type LinkingState,
 } from './device_linking';
 import { SealGlyph } from './design/SealGlyph';
@@ -338,14 +346,34 @@ function QrCodeSvg({ payload }: { payload: string }): React.ReactElement {
 
 export interface DeviceLinkingProps {
     localIdentityKey: Uint8Array;
+    /**
+     * The devices currently linked to this account. When provided, a
+     * "Linked devices" section lists them with a per-device revoke control.
+     */
+    linkedDevices?: LinkedDevice[];
 }
 
-export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }) => {
+/** Outcome of the last revocation attempt, for honest reporting. */
+interface RevocationOutcome {
+    /** The device the attempt was for. */
+    deviceId: string;
+    /** True only when the device was actually removed. */
+    ok: boolean;
+    /** Human-readable detail: success note, refusal reason, or error. */
+    message: string;
+    /** True when the refusal is the last-device confirmation gate. */
+    requiresConfirmation?: boolean;
+}
+
+export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey, linkedDevices }) => {
     const [state, setState] = useState<LinkingState>(initialLinkingState());
     const [mode, setMode] = useState<'display' | 'scan' | null>(null);
     const [scanInput, setScanInput] = useState('');
     const [confirmInput, setConfirmInput] = useState('');
     const [wasmReady, setWasmReady] = useState(false);
+    const [devices, setDevices] = useState<LinkedDevice[]>(linkedDevices ?? []);
+    const [pendingRevoke, setPendingRevoke] = useState<string | null>(null);
+    const [revocation, setRevocation] = useState<RevocationOutcome | null>(null);
 
     useEffect(() => {
         let cancelled = false;
@@ -354,6 +382,11 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }
         });
         return () => { cancelled = true; };
     }, []);
+
+    // Keep the local device list in sync when the caller passes a new list.
+    useEffect(() => {
+        if (linkedDevices) setDevices(linkedDevices);
+    }, [linkedDevices]);
 
     const handleDisplay = async () => {
         setMode('display');
@@ -380,6 +413,53 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }
         setMode(null);
         setScanInput('');
         setConfirmInput('');
+    };
+
+    // --- Revocation (DR-3) -------------------------------------------------
+
+    /** Stage a revoke: nothing is removed until the user confirms. */
+    const handleRevokeClick = (deviceId: string) => {
+        setPendingRevoke(deviceId);
+        setRevocation(null);
+    };
+
+    const handleCancelRevoke = () => {
+        setPendingRevoke(null);
+    };
+
+    /** Perform the staged revoke and report the outcome honestly. */
+    const handleConfirmRevoke = async () => {
+        const deviceId = pendingRevoke;
+        if (deviceId === null) return;
+        setPendingRevoke(null);
+
+        const isLastDevice = devices.length === 1;
+        const result = await revokeDevice(
+            { ...state, linkedDevices: devices },
+            deviceId,
+            // The last remaining device needs the explicit lock-out confirmation;
+            // the UI's confirm button IS that confirmation.
+            { confirmLastDevice: isLastDevice },
+        );
+
+        if (result.ok) {
+            setDevices(result.state.linkedDevices);
+            setState(result.state);
+            setRevocation({
+                deviceId,
+                ok: true,
+                message: `Device ${deviceId} revoked. It can no longer receive messages.`,
+            });
+        } else {
+            // Failure: the state is untouched by revokeDevice; report the
+            // refusal/error and do NOT claim success.
+            setRevocation({
+                deviceId,
+                ok: false,
+                message: result.error ?? 'Revocation failed',
+                requiresConfirmation: result.requiresConfirmation,
+            });
+        }
     };
 
     if (!wasmReady) {
@@ -472,6 +552,60 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }
                     <p role="alert" className="link-error">Linking aborted: {state.error}</p>
                     <button className="link-button-secondary" onClick={handleAbort}>Start over</button>
                 </div>
+            )}
+
+            {devices.length > 0 && (
+                <section className="linked-devices" aria-label="Linked devices">
+                    <h3>Linked devices</h3>
+                    <ul className="linked-devices-list">
+                        {devices.map((device) => (
+                            <li key={device.deviceId} className="linked-device-row">
+                                <span className="linked-device-id">{device.deviceId}</span>
+                                {pendingRevoke === device.deviceId ? (
+                                    <span className="linked-device-confirm">
+                                        <span className="linked-device-confirm-text">
+                                            Remove {device.deviceId}
+                                            {devices.length === 1
+                                                ? ' — this is your last linked device' : ''}?
+                                        </span>
+                                        <button
+                                            className="link-button-primary"
+                                            onClick={handleConfirmRevoke}
+                                        >
+                                            Confirm revoke
+                                        </button>
+                                        <button
+                                            className="link-button-secondary"
+                                            aria-label={`Revoke device ${device.deviceId}`}
+                                            onClick={handleCancelRevoke}
+                                        >
+                                            Keep device
+                                        </button>
+                                    </span>
+                                ) : (
+                                    <button
+                                        className="link-button-secondary"
+                                        aria-label={`Revoke device ${device.deviceId}`}
+                                        onClick={() => handleRevokeClick(device.deviceId)}
+                                    >
+                                        Revoke
+                                    </button>
+                                )}
+                            </li>
+                        ))}
+                    </ul>
+                    {revocation && (
+                        <p
+                            data-testid="revocation-status"
+                            role={revocation.ok ? 'status' : 'alert'}
+                            className={revocation.ok ? 'revocation-ok' : 'revocation-error'}
+                        >
+                            {revocation.ok
+                                ? `Device ${revocation.deviceId} revoked`
+                                : `Revocation failed for device ${revocation.deviceId}: ${revocation.message}`}
+                        </p>
+                    )}
+                </section>
             )}
         </div>
     );
