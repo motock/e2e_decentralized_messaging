@@ -13,6 +13,9 @@
 //! impl SignedRevocation {
 //!     pub fn sign(primary: &IdentityKeyPair, device: DeviceId, version: u64)
 //!         -> Result<Self, RevocationError>;
+//!     /// Serialized public identity key of the signing primary — the account binding,
+//!     /// recoverable from the record alone.
+//!     pub fn account(&self) -> &[u8];
 //!     pub fn device(&self) -> DeviceId;
 //!     pub fn version(&self) -> u64;
 //!     pub fn to_bytes(&self) -> Vec<u8>;
@@ -43,9 +46,12 @@
 //! `revocation_version` does not advance.
 //!
 //! `IdentityKey` is `libsignal_protocol::IdentityKey`; a keypair's public half comes from
-//! `crypto::IdentityKeyPairExt::public_identity`. `remove_device` and every existing
-//! `FanoutError` variant keep their current signatures and meanings — this is an additive path,
-//! not a replacement.
+//! `crypto::IdentityKeyPairExt::public_identity`. The signed payload binds the *account*
+//! (the signing primary's serialized public identity key) alongside the device id and
+//! version, so a revocation is attributable to its account from the record alone and
+//! cannot be verified against a different account's primary. `remove_device` and every
+//! existing `FanoutError` variant keep their current signatures and meanings — this is an
+//! additive path, not a replacement.
 
 use crypto::{generate_identity_key_pair, IdentityKeyPair, IdentityKeyPairExt};
 use protocol::fanout::{DeviceId, FanoutSession, RevocationError, SignedRevocation};
@@ -331,6 +337,54 @@ fn revoking_an_already_revoked_device_is_rejected() {
         1,
         "a rejected re-revocation must not advance the version"
     );
+}
+
+#[test]
+fn revocation_is_bound_to_its_account_in_the_signed_material() {
+    // The record must name the account it belongs to, and that binding must be part of
+    // the signed material: a revocation produced for one account must not verify (or
+    // apply) against another account's primary, and the account must be recoverable
+    // from the record alone so a receiver can attribute it without out-of-band context.
+    let (mut fanout, _devices) = fanout_with_devices(2);
+    let account_primary = generate_identity_key_pair();
+    let other_primary = generate_identity_key_pair();
+    let other_pub = other_primary.public_identity();
+
+    let revocation = SignedRevocation::sign(&account_primary, DeviceId(1), 1).expect("sign");
+    assert_eq!(
+        revocation.account(),
+        account_primary
+            .public_identity()
+            .serialize()
+            .into_vec()
+            .as_slice(),
+        "the account binding must be recoverable from the record alone"
+    );
+
+    // The binding is checked before the signature: a well-formed signature by the
+    // *right* key for the *wrong* account must still be rejected.
+    assert!(matches!(
+        revocation.verify(&other_pub),
+        Err(RevocationError::NotEntitled)
+    ));
+    assert!(matches!(
+        fanout.apply_revocation(&revocation, &other_pub),
+        Err(RevocationError::NotEntitled)
+    ));
+    assert!(
+        !fanout.is_revoked(DeviceId(1)),
+        "a revocation verified against the wrong account's primary must not take effect"
+    );
+    assert_eq!(
+        fanout.revocation_version(),
+        0,
+        "a cross-account rejection must not advance the version"
+    );
+
+    // The binding survives the wire round-trip.
+    let restored = SignedRevocation::from_bytes(&revocation.to_bytes()).expect("parse");
+    assert_eq!(restored.account(), revocation.account());
+    assert!(restored.verify(&account_primary.public_identity()).is_ok());
 }
 
 #[test]

@@ -177,8 +177,10 @@ pub enum RevocationError {
     /// an unrecognized layout. Fails closed: nothing is partially applied.
     #[error("malformed signed revocation")]
     Malformed,
-    /// The revocation was not signed by the account primary's identity key. A device
-    /// (or any other party) cannot revoke itself or a sibling device.
+    /// The revocation was not signed by the account primary's identity key, or it
+    /// carries a different account's binding than the primary it was verified against.
+    /// A device (or any other party) cannot revoke itself or a sibling device, and a
+    /// revocation for one account cannot be verified against another account's primary.
     #[error("revocation not signed by the account primary")]
     NotEntitled,
     /// The offered device-list version is not strictly newer than the version already
@@ -201,9 +203,15 @@ pub enum RevocationError {
 /// This is the *verifiable* half of the revocation contract: a signed fact about the
 /// account's device list that any peer can check against the account primary's public
 /// identity key before acting on it, rather than a sender-side decision nobody else can
-/// audit. The signature covers a domain-separated encoding of the revoked device id and
-/// the device-list version, so a revocation cannot be transplanted onto another device
-/// or replayed at a stale version and still verify.
+/// audit. The signature covers a domain-separated encoding of the *account binding* (the
+/// signing primary's serialized public identity key), the revoked device id and the
+/// device-list version, so a revocation cannot be transplanted onto another device,
+/// another account, or replayed at a stale version and still verify.
+///
+/// The account binding is part of the record and part of the signed material: a
+/// verifier holding revocations for several accounts can attribute each one to its
+/// account from the record alone (`account`), and entitlement is checked against the
+/// key the record itself names rather than a caller's out-of-band choice of key.
 ///
 /// The signing primitive is `libsignal`'s own Curve25519 signature
 /// (`PrivateKey::calculate_signature_for_multipart_message` /
@@ -212,6 +220,11 @@ pub enum RevocationError {
 /// than inventing a second scheme ("don't reinvent crypto").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedRevocation {
+    /// The account this revocation belongs to, as the serialized public identity key
+    /// of the primary that signed it. This is *inside* the record (and inside the
+    /// signed payload), so a verifier can tell from the record alone whose device list
+    /// it updates — the account binding is not supplied out of band by the caller.
+    account: Box<[u8]>,
     device: DeviceId,
     version: u64,
     signature: Box<[u8]>,
@@ -222,10 +235,16 @@ pub struct SignedRevocation {
 /// message type can never verify as the other.
 const REVOCATION_CONTEXT: &[u8] = b"DR-2 device revocation v1";
 
-/// Canonical bytes a revocation signature commits to: context || device id || version.
-fn revocation_payload(device: DeviceId, version: u64) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(REVOCATION_CONTEXT.len() + 12);
+/// Canonical bytes a revocation signature commits to: context || account || device id
+/// || version, where `account` is the serialized public identity key of the signing
+/// primary. Binding the account into the signed material is what makes the record
+/// self-describing: a peer holding revocations for several accounts can attribute each
+/// one to its account from the record alone, and entitlement is checked against the
+/// key the record itself names rather than a caller's out-of-band choice of key.
+fn revocation_payload(account: &[u8], device: DeviceId, version: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(REVOCATION_CONTEXT.len() + account.len() + 12);
     payload.extend_from_slice(REVOCATION_CONTEXT);
+    payload.extend_from_slice(account);
     payload.extend_from_slice(&device.0.to_be_bytes());
     payload.extend_from_slice(&version.to_be_bytes());
     payload
@@ -245,7 +264,15 @@ impl SignedRevocation {
         device: DeviceId,
         version: u64,
     ) -> Result<Self, RevocationError> {
-        let payload = revocation_payload(device, version);
+        // The account binding is the signing primary's own serialized public identity
+        // key: it is recoverable from the record, so a receiver can determine which
+        // account a revocation is for without out-of-band context.
+        let account: Box<[u8]> = primary
+            .public_key()
+            .serialize()
+            .into_vec()
+            .into_boxed_slice();
+        let payload = revocation_payload(&account, device, version);
         let signature = primary
             .private_key()
             .calculate_signature_for_multipart_message(
@@ -254,12 +281,20 @@ impl SignedRevocation {
             )
             .map_err(|_| RevocationError::SigningFailed)?;
         Ok(Self {
+            account,
             device,
             version,
             // `calculate_signature_for_multipart_message` already returns the boxed
             // slice we store; no conversion needed.
             signature,
         })
+    }
+
+    /// The account this revocation belongs to, as the serialized public identity key of
+    /// the primary that signed it. Recoverable from the record alone, so a receiver can
+    /// determine which account's device list it updates without out-of-band context.
+    pub fn account(&self) -> &[u8] {
+        &self.account
     }
 
     /// The device this revocation removes from the account's device list.
@@ -274,12 +309,16 @@ impl SignedRevocation {
     }
 
     /// Serialize for transport. The layout is self-delimiting: a 1-byte version tag, the
-    /// 4-byte device id, the 8-byte device-list version, then the signature length and
+    /// account binding (length-prefixed serialized public identity key), the 4-byte
+    /// device id, the 8-byte device-list version, then the signature length and
     /// signature bytes, so `from_bytes` can reject truncated input as
     /// [`RevocationError::Malformed`] instead of mis-parsing it.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 4 + 8 + 4 + self.signature.len());
-        out.push(0x01); // layout version
+        let mut out =
+            Vec::with_capacity(1 + 4 + self.account.len() + 4 + 8 + 4 + self.signature.len());
+        out.push(0x02); // layout version: 0x01 predates the account binding
+        out.extend_from_slice(&(self.account.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.account);
         out.extend_from_slice(&self.device.0.to_be_bytes());
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
@@ -292,24 +331,55 @@ impl SignedRevocation {
     /// # Errors
     ///
     /// Returns [`RevocationError::Malformed`] for empty, truncated, or unrecognized
-    /// input. Parsing never verifies; call [`verify`](Self::verify) before acting.
+    /// input — including the pre-binding 0x01 layout, which carries no account binding
+    /// and so cannot be attributed to an account. Parsing never verifies; call
+    /// [`verify`](Self::verify) before acting.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RevocationError> {
-        if bytes.len() < 1 + 4 + 8 + 4 {
+        // 1-byte layout tag + 4-byte account length + 4-byte device id + 8-byte version
+        // + 4-byte signature length.
+        if bytes.len() < 1 + 4 + 4 + 8 + 4 {
             return Err(RevocationError::Malformed);
         }
-        if bytes[0] != 0x01 {
+        if bytes[0] != 0x02 {
             return Err(RevocationError::Malformed);
         }
-        let device = DeviceId(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]));
+        let account_len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+        let device_start = 5 + account_len;
+        let account_end = device_start;
+        if bytes.len() < account_end + 4 + 8 + 4 || account_len == 0 {
+            return Err(RevocationError::Malformed);
+        }
+        let account = bytes[5..account_end].to_vec().into_boxed_slice();
+        let device = DeviceId(u32::from_be_bytes([
+            bytes[account_end],
+            bytes[account_end + 1],
+            bytes[account_end + 2],
+            bytes[account_end + 3],
+        ]));
+        let version_start = device_start + 4;
         let version = u64::from_be_bytes([
-            bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+            bytes[version_start],
+            bytes[version_start + 1],
+            bytes[version_start + 2],
+            bytes[version_start + 3],
+            bytes[version_start + 4],
+            bytes[version_start + 5],
+            bytes[version_start + 6],
+            bytes[version_start + 7],
         ]);
-        let sig_len = u32::from_be_bytes([bytes[13], bytes[14], bytes[15], bytes[16]]) as usize;
-        let sig_start = 17;
+        let sig_len_start = version_start + 8;
+        let sig_len = u32::from_be_bytes([
+            bytes[sig_len_start],
+            bytes[sig_len_start + 1],
+            bytes[sig_len_start + 2],
+            bytes[sig_len_start + 3],
+        ]) as usize;
+        let sig_start = sig_len_start + 4;
         if bytes.len() != sig_start + sig_len || sig_len == 0 {
             return Err(RevocationError::Malformed);
         }
         Ok(Self {
+            account,
             device,
             version,
             signature: bytes[sig_start..].to_vec().into_boxed_slice(),
@@ -327,7 +397,15 @@ impl SignedRevocation {
     /// Returns [`RevocationError::NotEntitled`] unless `primary` produced this exact
     /// revocation.
     pub fn verify(&self, primary: &libsignal_protocol::IdentityKey) -> Result<(), RevocationError> {
-        let payload = revocation_payload(self.device, self.version);
+        // The account binding is checked *first*: the record names the account it
+        // belongs to, and a revocation for one account must not verify against
+        // another account's primary even if some key happened to satisfy the
+        // signature check.
+        let primary_bytes = primary.serialize().into_vec();
+        if self.account.as_ref() != primary_bytes.as_slice() {
+            return Err(RevocationError::NotEntitled);
+        }
+        let payload = revocation_payload(&self.account, self.device, self.version);
         // Fails closed: a wrong-length signature is `false`, not an exception, so a
         // verification failure can never be mistaken for a verified revocation.
         let ok = primary
