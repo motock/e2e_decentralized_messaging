@@ -3,8 +3,11 @@
 An open-source, decentralized, end-to-end encrypted messenger built on the real
 [Signal Protocol](https://signal.org/docs/) (`libsignal`) — X3DH/PQXDH session setup, the Double
 Ratchet, and Sender Keys for groups — over a peer-to-peer transport (`libp2p`) with blind
-store-and-forward relays for offline delivery. See `PLAN.md` for the full design rationale and
-`docs/threat-model.md` for the adversary model.
+store-and-forward relays for offline delivery. That paragraph is the **target architecture**;
+what is built and tested today is the Rust core, the relay, the WASM/UniFFI bindings, and the
+web and desktop clients — the iOS, Android, and scaffolded desktop clients are not implemented
+yet (see `PLAN.md` §6.5 for the current-state vs target-state breakdown). See `PLAN.md` for the
+full design rationale and `docs/threat-model.md` for the adversary model.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
