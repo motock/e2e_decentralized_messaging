@@ -92,6 +92,11 @@ The hard part of "decentralized Signal." Approach:
 - Sessions and Sender Keys are **per-device** (sender fan-out per recipient device, as Signal does).
 - **History sync** between a user's own devices is an explicit later epic (it's genuinely hard without a
   server); v1 ships per-device history + encrypted backup export/import for migration.
+- **Revocation/unlinking** is the inverse of linking and is specified (semantics only) in
+  `spec/v0.md` §8: unlinking a device revokes its `DeviceAddress`, drops its prekey bundle from
+  the account's `DiscoveryRecord`, tears down its sessions, and rejects its Sealed Sender
+  certificates, propagated as a signed, monotonically versioned device list. The wire shapes are
+  Phase 6 work; revoking the *primary* device is an open item (`spec/v0.md` §7).
 
 ---
 
@@ -170,7 +175,7 @@ fanning out to all platforms.
 | **3 — Transport (online)** | libp2p stack, DHT prekey publication/lookup, direct delivery between two online peers. | Two-node integration tests; DHT lookup contract tests. |
 | **4 — Relays & offline** | Self-hostable relay binary, blind store-and-forward, **Sealed Sender**. | Relay cannot decrypt/identify sender (asserted); offline deliver-on-reconnect. |
 | **5 — First client (desktop/Tauri)** | One platform end-to-end on the shared core — fastest iteration loop. | E2E smoke: two clients exchange verified messages. |
-| **6 — Multi-device** | Device linking (QR + safety number), per-device sessions. | Linking flow tests; per-device fan-out. |
+| **6 — Multi-device** | Device linking (QR + safety number), per-device sessions, device revocation/unlinking (semantics fixed in `spec/v0.md` §8). | Linking flow tests; per-device fan-out; revocation propagation (a revoked device's messages are rejected once the signed device-list update is observed). |
 | **7 — Groups** | Sender Keys group sessions, membership changes. | Group encrypt/decrypt, member add/remove key rotation, negative (removed member can't read new msgs). |
 | **8 — All platforms** | UniFFI iOS+Android, WASM web. | Per-binding contract tests against core API. |
 | **9 — Hardening** | External security audit, fuzzing, metadata analysis, safety-number UX, backup/restore polish, optional Tor/mixnet transport. | Fuzz wire parser; metadata leakage review; audit findings closed. |
