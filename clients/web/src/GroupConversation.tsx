@@ -182,14 +182,25 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
 
     useEffect(() => {
         let cancelled = false;
+        // Criterion 3 — fail closed. With no identity/selfRecipientId the group
+        // view must not silently pretend to be connected: no throwaway demo
+        // identity, no receive loop, and crucially no persisted-config ref
+        // (gateRef) written from a permissive default. Leaving gateRef untouched
+        // is what keeps a LATER render that does supply real props correct.
+        if (!identityProp || !selfRecipientId) {
+            setError('Group messaging unavailable: no identity supplied.');
+            setReady(false);
+            return;
+        }
+        // Sync prop-derived refs on every run so a re-render that supplies real
+        // props (after a no-props render) uses them instead of the defaults
+        // captured by useRef on the first render.
+        if (transport) transportRef.current = transport;
+        if (storageGate) gateRef.current = storageGate;
+        setError(null);
         ensureWasmInit()
             .then(async () => {
                 if (cancelled) return;
-                // EXPERIMENT ONLY - fail closed when no identity prop.
-                if (!identityProp || !selfRecipientId) {
-                    setError('Group messaging unavailable: no identity supplied.');
-                    return;
-                }
                 const self = identityProp;
                 const demoMembers: DemoMember[] = DEMO_MEMBER_NAMES.map((name) => {
                     const identity = generate_identity();
