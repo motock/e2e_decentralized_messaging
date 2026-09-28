@@ -74,3 +74,23 @@ co
 [step 34] done rejected — worktree dirty, asking agent to commit
 [step 35] bash: git status --porcelain; echo "--- ignored? ---"; git check-ignore -v test_author.log; echo "--- head ---"; head -5 test_
 [step 36] bash: git add -A && git commit -q -m "chore: add test-author session log" && git status --porcelain && echo "--- clean ---" &&
+[step 37] DONE: Test suite for GRP-3 is written, confirmed RED for the right reason, and committed. Working tree is clean.
+
+**Commits:**
+- `8005a95` — `test(web): grade GRP-3 group_to_bytes/group_from_bytes ambient declarations` (the test suite)
+- `5bb9d0e` — `chore: add test-author session log` (harness artifact, committed to leave a clean tree)
+
+**File:** `clients/web/tests/wasm_bindings_declarations.test.ts` (5 tests, ~135 lines).
+
+**Approach (behavioral, not source-text grading):** the tests compile small TypeScript fixtures against the committed ambient declaration using the repo's own `tsc`, with fixtures written to a temp dir *outside* the repo. That guarantees the relative import `../../../core/bindings/wasm/pkg/index.js` can only resolve through `src/wasm-bindings.d.ts` — never through a generated wasm-pack `pkg/index.d.ts`, even if `prepare-wasm` has run. Diagnostics are grouped per fixture file and asserted individually.
+
+**Coverage:**
+- Happy path: a `GroupHandle` round-trips through `group_to_bytes` → `Uint8Array` → `group_from_bytes` → `GroupHandle` with zero diagnostics.
+- Additive/no-regression: pre-existing exports (`IdentityHandle`, `GroupHandle`, `SessionHandle`, `WasmError`, `generate_identity`, `group_create`, `group_encrypt`, `derive_safety_number`, …) still resolve — asserted as membership, not an exact export list, so later sibling stories can extend the declaration freely.
+- Negative/boundary: `group_from_bytes('not-bytes')` must be TS2345; assigning `group_to_bytes(...)` to `string` and `group_from_bytes(...)` to `number` must each be TS2322. These pin parameter/return types without freezing private declaration details.
+
+**RED confirmed:** `npx vitest run tests/wasm_bindings_declarations.test.ts` → 4 failed / 1 passed, every failure being `TS2305: Module '...' has no exported member 'group_to_bytes'/'group_from_bytes'` — failing because the implementation is missing, not because of test logic.
+
+**Green-ability verified:** compiling the same fixtures against a scratch declaration (in a temp dir, never touching the implementation file) produced a clean round-trip and exactly TS2345/TS2322 for the negatives, so the suite passes once the declarations exist.
+
+No implementation file was created or edited, and nothing was pushed.
