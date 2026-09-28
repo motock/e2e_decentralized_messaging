@@ -173,7 +173,7 @@ fanning out to all platforms.
 | **1 — Crypto core** | Identity generation, X3DH/PQXDH session setup, Double Ratchet 1:1 encrypt/decrypt. | Unit tests against **published Signal test vectors**; negative tests (tampered ciphertext, replay, out-of-order). |
 | **2 — Storage** | Encrypted SQLCipher store for keys/sessions/messages; backup export/import. | Round-trip + corruption/negative tests; fail-closed on bad key. |
 | **3 — Transport (online)** | libp2p stack, DHT prekey publication/lookup, direct delivery between two online peers. | Two-node integration tests; DHT lookup contract tests. |
-| **4 — Relays & offline** | Self-hostable relay binary, blind store-and-forward, **Sealed Sender**. | Relay cannot decrypt/identify sender (asserted); offline deliver-on-reconnect. |
+| **4 — Relays & offline** | Self-hostable relay binary, blind store-and-forward with durable SQLite store, **Sealed Sender**. | Relay state persists across restarts; envelopes survive restarts and are retained only until their TTL expires, enforced by wall‑clock expiry. |
 | **5 — First client (desktop/Tauri)** | One platform end-to-end on the shared core — fastest iteration loop. | E2E smoke: two clients exchange verified messages. |
 | **6 — Multi-device** | Device linking (QR + safety number), per-device sessions, device revocation/unlinking (semantics fixed in `spec/v0.md` §8). | Linking flow tests; per-device fan-out; revocation propagation (a revoked device's messages are rejected once the signed device-list update is observed). |
 | **7 — Groups** | Sender Keys group sessions, membership changes. | Group encrypt/decrypt, member add/remove key rotation, negative (removed member can't read new msgs). |

@@ -135,19 +135,9 @@ and §10, not v1).
 
 ### 4.5 Relay layer (self-hostable store-and-forward node)
 
-- **Trusted to**: store and forward opaque ciphertext envelopes for offline delivery, within
-  a bounded TTL, without being able to decrypt them.
-- **Explicitly not trusted with**: message content (protected by the E2E layer above it,
-  independent of relay behavior) or, ideally, the cryptographic sender field (Sealed Sender).
-  A relay is assumed **actively malicious** in this model, not merely curious — see §5.1.
-- **Metadata exposure**: recipient routing hint, envelope size/count, connection timing and
-  source IP of whoever connects to push/pull envelopes, retention of undelivered envelopes
-  for up to the TTL window. Sealed Sender does **not** remove the source IP/peer ID a relay
-  observes when a sender pushes an envelope — a relay can still correlate "who connected,
-  when, with what envelope size" even though it cannot read the sealed sender-identity field
-  inside the envelope. This also means Sealed Sender alone does not stop an abusive sender
-  from flooding a relay; abuse control is the separate proof-of-work/rate-limiting item in
-  `PLAN.md` §3 and §10.
+- **Trusted to**: store and forward opaque ciphertext envelopes for offline delivery, within a bounded TTL, without being able to decrypt them. The relay's state now persists across restarts; envelopes survive restarts and are retained only until their TTL expires, enforced by wall‑clock expiry. The store uses plain SQLite via rusqlite without SQLCipher, so there is no at‑rest encryption; this is an accepted limitation because the relay only holds sender‑encrypted ciphertext and the threat model already assumes a relay can read its own storage.
+- **Explicitly not trusted with**: message content (protected by the E2E layer above it, independent of relay behavior) or, ideally, the cryptographic sender field (Sealed Sender). A relay is assumed **actively malicious** in this model, not merely curious — see §5.1.
+- **Metadata exposure**: recipient routing hint, envelope size/count, connection timing and source IP of whoever connects to push/pull envelopes, retention of undelivered envelopes for up to the TTL window. Sealed Sender does **not** remove the source IP/peer ID a relay observes when a sender pushes an envelope — a relay can still correlate "who connected, when, with what envelope size" even though it cannot read the sealed sender‑identity field inside the envelope. This also means Sealed Sender alone does not stop an abusive sender from flooding a relay; abuse control is the separate proof‑of‑work/rate‑limiting item in `PLAN.md` §3 and §10.
 
 ### 4.55 Web client layer (browser/WASM: reduced threat model)
 
@@ -195,9 +185,7 @@ compromised by an attacker who gains full read/write access to its storage and l
   or reorder envelopes (availability/integrity-of-delivery attack, not confidentiality); 
   refuse service entirely (DoS against users who depend on that relay).
 - **Mitigation already in design**: relays are swappable (§ Locked decisions in `PLAN.md`) —
-  a single malicious relay cannot prevent delivery if the client retries via another relay or
-  direct P2P. Sealed Sender bounds what a compromised relay learns about the sender. Short
-  TTLs bound how long a compromised relay can retain undelivered envelopes.
+  a single malicious relay cannot prevent delivery if the client retries via another relay or direct P2P. Sealed Sender bounds what a compromised relay learns about the sender. Wall‑clock TTL enforcement bounds how long a compromised relay can retain undelivered envelopes.
 - **Residual risk / open item**: a relay that is the *only* one a recipient is reachable
   through can still mount a targeted denial-of-service or timing-correlation attack; relay
   diversity is a deployment-level mitigation, not a protocol guarantee, and should be called
