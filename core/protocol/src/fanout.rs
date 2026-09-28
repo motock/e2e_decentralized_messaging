@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use libsignal_protocol::IdentityKeyPair;
+use libsignal_protocol::{IdentityKeyPair, PreKeyBundle};
 use rand::TryRngCore;
 use thiserror::Error;
 
@@ -538,6 +538,83 @@ impl FanoutSession {
             revoked_devices: BTreeMap::new(),
             revocation_version: 0,
         })
+    }
+
+    /// Establish a *sender-only* fan-out from public device material alone.
+    ///
+    /// This is the constructor a production caller needs: a web client holds only the
+    /// public prekey bundle of each linked device — never that device's private
+    /// identity key — so [`establish`](Self::establish), which builds the receiver
+    /// side internally from full `IdentityKeyPair`s, is unreachable outside a test.
+    /// Here each entry runs only the sender (Alice) half of PQXDH against the
+    /// device-supplied bundle, exactly as `DoubleRatchetSession::new_alice` intends.
+    ///
+    /// The bundle type is `libsignal_protocol`'s `PreKeyBundle` — the type
+    /// `DoubleRatchetSession::publish_bundle` emits and `crypto::session::bundle_from_bytes`
+    /// parses from wire bytes, so a caller with a device's serialized bundle can build
+    /// one without ever touching private key material.
+    ///
+    /// # Sender-only semantics
+    ///
+    /// The session holds **no inbound ratchet state**: `receiver_sessions` and
+    /// `identity_to_device` are deliberately left empty. [`decrypt_as`](Self::decrypt_as)
+    /// therefore returns [`FanoutError::UnknownIdentity`] on any input — a sender-only
+    /// session cannot decrypt, which is correct, because it never held the recipient
+    /// side of the ratchet. This is also why the reverse map stays empty: populating it
+    /// without a matching receiver session would make `decrypt_as` panic on the
+    /// `receiver_sessions` lookup instead of erroring, and the map cannot be keyed from
+    /// a bundle anyway (the public-key identity hasher is private to `crypto`).
+    ///
+    /// # Errors
+    ///
+    /// Same negative paths as [`establish`](Self::establish): an empty `devices`
+    /// returns [`FanoutError::NoDevices`], a repeated `DeviceId` returns
+    /// [`FanoutError::DuplicateDevice`], and a bundle that fails PQXDH (malformed,
+    /// tampered, or stale) returns [`FanoutError::Establishment`] naming the device.
+    /// Unlike `establish`, a repeated *identity* across two device ids cannot be
+    /// detected here — the public-key identity hasher is private — so two devices
+    /// sharing one identity key would establish two independent sessions rather than
+    /// surfacing [`FanoutError::DuplicateIdentity`].
+    pub fn establish_from_bundles(
+        sender: &IdentityKeyPair,
+        devices: &[(DeviceId, PreKeyBundle)],
+    ) -> Result<Self, FanoutError> {
+        if devices.is_empty() {
+            return Err(FanoutError::NoDevices);
+        }
+
+        let mut sender_sessions: BTreeMap<DeviceId, DoubleRatchetSession> = BTreeMap::new();
+
+        for (device_id, bundle) in devices {
+            if sender_sessions.contains_key(device_id) {
+                return Err(FanoutError::DuplicateDevice(*device_id));
+            }
+
+            let outbound = block_on(DoubleRatchetSession::new_alice(sender, bundle))
+                .map_err(|e| FanoutError::Establishment(*device_id, e))?;
+            sender_sessions.insert(*device_id, outbound);
+        }
+
+        // Sender-only: no receiver sessions and no identity→device reverse map. See the
+        // doc comment for why leaving both empty is the safe choice.
+        Ok(Self {
+            sender_sessions,
+            identity_to_device: BTreeMap::new(),
+            receiver_sessions: BTreeMap::new(),
+            revoked_devices: BTreeMap::new(),
+            revocation_version: 0,
+        })
+    }
+
+    /// The device ids this fan-out currently delivers to, in ascending order.
+    ///
+    /// This is the observable half of device revocation: after
+    /// [`remove_device`](Self::remove_device) or [`apply_revocation`](Self::apply_revocation),
+    /// the removed device is absent from this list and the next
+    /// [`encrypt_to_all`](Self::encrypt_to_all) emits no ciphertext for it. Without
+    /// this accessor a caller could only infer removal from ciphertext counts.
+    pub fn devices(&self) -> Vec<DeviceId> {
+        self.sender_sessions.keys().copied().collect()
     }
 
     /// Encrypt `plaintext` once per currently-tracked device and return the resulting
