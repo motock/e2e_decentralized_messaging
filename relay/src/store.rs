@@ -171,10 +171,7 @@ fn temp_sibling(path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "relay-store".to_string());
-    path.with_file_name(format!(
-        ".{file_name}.tmp-{}",
-        std::process::id()
-    ))
+    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
 }
 
 /// A blind store that holds ciphertext envelopes with TTL, optionally persisted

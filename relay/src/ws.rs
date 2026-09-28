@@ -116,8 +116,7 @@ fn persistent_stores() -> &'static PersistentStores {
         let prekeys_path = dir.join("prekeys.db");
         let store = Mailbox::open(&mailbox_path, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)
             .unwrap_or_else(|_| Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT));
-        let prekeys = RelayStore::open(&prekeys_path)
-            .unwrap_or_else(|_| RelayStore::new());
+        let prekeys = RelayStore::open(&prekeys_path).unwrap_or_else(|_| RelayStore::new());
         PersistentStores { store, prekeys }
     })
 }
