@@ -120,6 +120,11 @@ IndexedDB store, so it survives a page reload:
 - Per-peer sender sessions are saved before each send and restored lazily when
   a peer is next messaged.
 - Message history is stored alongside the session state.
+- Group conversations persist their real-peer roster, their message history, and
+  the group ratchet blob. The blob is saved before each send and on every
+  membership change, so a reload resumes the existing group session rather than
+  rebuilding one — a rebuilt session would rewind to chain-key positions
+  already used.
 
 Limits that remain: clearing site data or opening the app in another browser or
 on another device starts fresh, and a message can still be lost if the tab dies
@@ -129,10 +134,13 @@ once it has been rendered. A death in that window loses the message permanently
 — the ratchet has already advanced past it and the relay keeps no copy. A
 failed save is surfaced where it is actionable: a failed pre-send save stops
 the send with "Could not save session state; message not sent", and a failed
-save after a decrypt shows a warning in the conversation. The startup
-receiver-session save and the message-history write are logged to the console
-only — if the startup save fails, the session continues in memory for that
-page load.
+save after a decrypt shows a warning in the conversation. A group record that
+cannot be read back — a corrupt or truncated ratchet blob — is never silently
+replaced with a fresh session: the group is left unrestored and the
+conversation shows an error asking you to clear this site's stored data. The
+startup receiver-session save and the message-history write are logged to the
+console only — if the startup save fails, the session continues in memory for
+that page load.
 
 ## Encrypted storage API
 
