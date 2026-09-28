@@ -37,33 +37,78 @@ jobs:
       # TEMPORARY DIAGNOSTIC -- REMOVE BEFORE MERGE.
       # The desktop lib unit-test binary (clients_desktop_tauri-*.exe) fails to
       # load on Windows with 0xc0000139 STATUS_ENTRYPOINT_NOT_FOUND once
-      # core_storage's vendored SQLCipher/OpenSSL is linked into it. The process
-      # dies before running any test, so dump the binary's DLL import table to
-      # identify which import cannot be resolved.
-      - name: Diagnose desktop lib test binary imports (windows)
+      # core_storage's vendored SQLCipher/OpenSSL is linked into it. `dumpbin
+      # /DEPENDENTS` already showed that exe imports ONLY system DLLs -- no
+      # libssl/libcrypto/sqlite -- so no third-party DLL is missing and the
+      # unresolved symbol must be a FUNCTION inside a system DLL. This step
+      # resolves every imported function with the loader's own GetProcAddress
+      # and reports the ones that do not resolve, with `cargo test -p storage
+      # --lib` as a control (that target links the same static SQLCipher and
+      # passes on this runner today).
+      - name: Resolve desktop lib test binary imports (windows)
         if: matrix.os == 'windows-latest'
         continue-on-error: true
         shell: pwsh
         run: |
-          cargo test -p clients-desktop-tauri --lib --locked --no-run 2>&1 | Select-Object -Last 5
-          $exes = Get-ChildItem target/debug/deps/clients_desktop_tauri-*.exe -ErrorAction SilentlyContinue
-          if (-not $exes) { Write-Host "DIAG: no clients_desktop_tauri test exe found"; exit 0 }
+          $ErrorActionPreference = 'Continue'
+          cargo test -p clients-desktop-tauri --lib --locked --no-run 2>&1 | Select-Object -Last 3
+          $exe = Get-ChildItem target/debug/deps/clients_desktop_tauri-*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { Write-Host "DIAG: no clients_desktop_tauri test exe found"; exit 0 }
+          Write-Host "DIAG exe: $($exe.FullName)"
 
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           $dumpbin = Get-ChildItem (Join-Path $vs "VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dumpbin) { Write-Host "DIAG: dumpbin not found"; exit 0 }
 
-          foreach ($e in $exes) {
-            Write-Host "===== DIAG imports: $($e.Name) ====="
-            & $dumpbin.FullName /DEPENDENTS $e.FullName
+          $raw = & $dumpbin.FullName /IMPORTS $exe.FullName 2>&1
+          $raw | Set-Content -Path imports.txt
+
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Ldr {
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr LoadLibraryA(string name);
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr GetProcAddress(IntPtr h, string name);
+          }
+          "@
+
+          $cur = $null; $h = [IntPtr]::Zero; $missing = @(); $checked = 0; $dlls = 0
+          foreach ($line in $raw) {
+            if ($line -match '^\s+(\S+\.dll)\s*$') {
+              $cur = $Matches[1]; $dlls++
+              $h = [Ldr]::LoadLibraryA($cur)
+              if ($h -eq [IntPtr]::Zero) { Write-Host "DIAG: could not load $cur from the default search order" }
+              continue
+            }
+            if (-not $cur) { continue }
+            if ($line -match '^\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
+              $fn = $Matches[1]
+              $checked++
+              if ($h -eq [IntPtr]::Zero) { $missing += "${cur}!${fn} (DLL not loadable)"; continue }
+              if ([Ldr]::GetProcAddress($h, $fn) -eq [IntPtr]::Zero) { $missing += "${cur}!${fn}" }
+            }
+          }
+          Write-Host "DIAG: $dlls DLLs, $checked imported functions resolved"
+          if ($missing.Count -eq 0) {
+            Write-Host "DIAG: EVERY import resolves -- the missing entrypoint is NOT in this exe's import table"
+          } else {
+            Write-Host "DIAG: $($missing.Count) UNRESOLVED:"
+            $missing | ForEach-Object { Write-Host "DIAG MISSING: $_" }
           }
 
-          Write-Host "===== DIAG ssl/crypto/sqlite DLLs reachable on PATH ====="
-          foreach ($p in ($env:PATH -split ';' | Where-Object { $_ })) {
-            Get-ChildItem -Path (Join-Path $p '*') -Include 'libssl*.dll','libcrypto*.dll','sqlite*.dll' -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "$($_.FullName)  v$($_.VersionInfo.FileVersion)" }
-          }
+          Write-Host "===== DIAG: run the exe directly and read the event log ====="
+          & $exe.FullName --list 2>&1 | Select-Object -First 5
+          Write-Host "DIAG exe-exit=$LASTEXITCODE"
+          Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'clients_desktop_tauri|bcryptprimitives|entry point|SideBySide' } |
+            ForEach-Object { Write-Host "DIAG EVENT: $($_.Message -replace '\s+',' ')" }
+
+          Write-Host "===== DIAG control: storage lib tests (same static SQLCipher+OpenSSL) ====="
+          cargo test -p storage --lib --locked 2>&1 | Select-Object -Last 8
+          Write-Host "DIAG storage-exit=$LASTEXITCODE"
       - run: cargo test --workspace --locked
 
   lint:
