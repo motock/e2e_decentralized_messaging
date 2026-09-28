@@ -10,8 +10,8 @@
 //! - A "restart" is modelled by dropping the store and reopening the same path.
 //! - Durability must not weaken the TTL mitigation: an entry whose TTL elapsed
 //!   while the relay was down must NOT be resurrected.
-//! - A corrupt/truncated store fails closed: it starts empty or refuses to
-//!   start, but never panics and never serves garbage.
+//! - A corrupt store fails closed: it refuses to open or starts empty, but never
+//!   panics and never serves garbage.
 //! - The store stays blind: persistence adds no payload accessor.
 //!
 //! The rate limiter and PoW challenges are deliberately NOT persisted (a fresh
@@ -55,7 +55,8 @@ fn envelope_survives_a_restart() {
 
     let mb = open_mailbox(&path, 8);
     assert_eq!(
-        mb.dequeue("recipient-id").expect("envelope must survive the restart"),
+        mb.dequeue("recipient-id")
+            .expect("envelope must survive the restart"),
         envelope,
         "an undelivered envelope must still be delivered after a restart"
     );
@@ -74,7 +75,9 @@ fn prekey_survives_a_restart() {
 
     let store = open_store(&path);
     assert_eq!(
-        store.pickup("recipient-id").expect("prekey must survive the restart"),
+        store
+            .pickup("recipient-id")
+            .expect("prekey must survive the restart"),
         bundle,
         "a published prekey bundle must still be found after a restart"
     );
@@ -109,7 +112,10 @@ fn expired_entries_are_not_resurrected_by_a_restart() {
     let mb = open_mailbox(&path, 8);
     let result = mb.dequeue("recipient-id");
     assert!(
-        matches!(result, Err(MailboxError::Expired) | Err(MailboxError::NotFound)),
+        matches!(
+            result,
+            Err(MailboxError::Expired) | Err(MailboxError::NotFound)
+        ),
         "a zero-TTL envelope must not be resurrected by a restart, got: {result:?}"
     );
 
@@ -156,7 +162,10 @@ fn fifo_order_and_depth_cap_hold_across_a_restart() {
 
 #[test]
 fn corrupt_or_empty_store_fails_closed_without_panicking() {
-    for (tag, bytes) in [("corrupt", &b"this is not a relay store"[..]), ("empty", &b""[..])] {
+    for (tag, bytes) in [
+        ("corrupt", &b"this is not a relay store"[..]),
+        ("empty", &b""[..]),
+    ] {
         let path = temp_path(tag);
         std::fs::write(&path, bytes).expect("write file");
 
@@ -207,7 +216,10 @@ fn stores_at_different_paths_are_isolated() {
         Err(MailboxError::NotFound),
         "a store at one path must not see another path's envelopes"
     );
-    assert_eq!(mb_a.dequeue("recipient-id").expect("still there"), vec![0x11]);
+    assert_eq!(
+        mb_a.dequeue("recipient-id").expect("still there"),
+        vec![0x11]
+    );
 
     let pk_a = open_store(&temp_path("isolation-pk-a"));
     pk_a.store("recipient-id", vec![0x22], Duration::from_secs(60))
@@ -218,7 +230,28 @@ fn stores_at_different_paths_are_isolated() {
         Err(StoreError::NotFound),
         "a store at one path must not see another path's prekeys"
     );
-    assert_eq!(pk_a.pickup("recipient-id").expect("still there"), vec![0x22]);
+    assert_eq!(
+        pk_a.pickup("recipient-id").expect("still there"),
+        vec![0x22]
+    );
+}
+
+// ── boundary: two handles onto one path observe one store ────────────────────
+
+#[test]
+fn handles_onto_one_store_share_state() {
+    let path = temp_path("shared-handle");
+    let mb = open_mailbox(&path, 8);
+    let second = mb.clone_handle();
+    mb.enqueue("recipient-id", vec![0x33], Duration::from_secs(60))
+        .expect("enqueue");
+    assert_eq!(
+        second
+            .dequeue("recipient-id")
+            .expect("visible through the other handle"),
+        vec![0x33],
+        "a second handle must observe the first handle's writes"
+    );
 }
 
 // ── blindness: persistence adds no payload accessor ──────────────────────────
@@ -237,72 +270,47 @@ fn persistence_constructor_is_registered_and_the_store_stays_blind() {
     }
 }
 
-// ── hostile: valid magic, out-of-range expiry/count must fail closed ─────────
-
-/// Hand-build a persisted file with valid magic/version and a hostile body.
-fn hostile_file(tag: &str, count: u32, body: &[u8]) -> PathBuf {
-    let path = temp_path(tag);
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"RDST");
-    bytes.push(1); // STORE_FORMAT_VERSION
-    bytes.extend_from_slice(&count.to_be_bytes());
-    bytes.extend_from_slice(body);
-    std::fs::write(&path, bytes).expect("write hostile file");
-    path
-}
+// ── hostile: an edited store file must fail closed, never panic ──────────────
 
 #[test]
-fn valid_magic_with_hostile_expiry_fails_closed_without_panicking() {
-    // A file with valid magic/version but an expiry that cannot exist as a
-    // SystemTime must fail closed at open(), not panic during listener startup.
+fn out_of_range_expiry_fails_closed_without_panicking() {
+    // Fault injection below the store API: write rows straight into a real SQLite
+    // file whose expiry cannot exist as a SystemTime. `Duration::new` panics when
+    // nanos >= 1s, so trusting the column would panic during listener startup.
     for (tag, secs, nanos) in [
-        ("secs-overflow", u64::MAX, 0u32),
-        ("nanos-overflow", 1, 2_000_000_000), // nanos >= 1s: Duration::new would panic
-        ("both", u64::MAX, u32::MAX),
+        ("nanos-overflow", 1i64, 2_000_000_000i64), // nanos >= 1s
+        ("negative-secs", -1i64, 0i64),
     ] {
-        let mut body = Vec::new();
-        body.extend_from_slice(&("recipient-id".len() as u32).to_be_bytes());
-        body.extend_from_slice(b"recipient-id");
-        body.extend_from_slice(&secs.to_be_bytes());
-        body.extend_from_slice(&nanos.to_be_bytes());
-        body.extend_from_slice(&1u32.to_be_bytes()); // value_len
-        body.push(0x11);
-
-        let path = hostile_file(&format!("expiry-{tag}"), 1, &body);
-        if let Ok(store) = RelayStore::open(&path) {
-            assert_eq!(
-                store.count(),
-                0,
-                "{tag}: an out-of-range expiry must fail closed, not serve garbage"
-            );
-            assert_eq!(store.pickup("recipient-id"), Err(StoreError::NotFound));
+        let path = temp_path(&format!("hostile-expiry-{tag}"));
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open raw sqlite");
+            conn.execute_batch(
+                "CREATE TABLE prekeys (
+                     recipient_id TEXT PRIMARY KEY, value BLOB NOT NULL,
+                     expiry_secs INTEGER NOT NULL, expiry_nanos INTEGER NOT NULL);
+                 CREATE TABLE envelopes (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT, recipient_id TEXT NOT NULL,
+                     value BLOB NOT NULL, expiry_secs INTEGER NOT NULL, expiry_nanos INTEGER NOT NULL);",
+            )
+            .expect("schema");
+            conn.execute(
+                "INSERT INTO prekeys (recipient_id, value, expiry_secs, expiry_nanos)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["recipient-id", vec![0x11u8], secs, nanos],
+            )
+            .expect("hostile row");
         }
-        if let Ok(mb) = Mailbox::open(&path, 8) {
-            assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
-        }
-    }
-}
 
-#[test]
-fn valid_magic_with_hostile_count_and_depth_fails_closed_without_aborting() {
-    // count = u32::MAX with no entries: trusting it for pre-allocation would
-    // attempt ~4 billion buckets and abort the process.
-    let path = hostile_file("count-u32-max", u32::MAX, &[]);
-    if let Ok(store) = RelayStore::open(&path) {
-        assert_eq!(store.count(), 0, "a hostile count must not serve garbage");
-        assert_eq!(store.pickup("recipient-id"), Err(StoreError::NotFound));
-    }
-    if let Ok(mb) = Mailbox::open(&path, 8) {
-        assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
-    }
-
-    // depth = u32::MAX with no entries: same allocation-abort vector for the FIFO.
-    let mut body = Vec::new();
-    body.extend_from_slice(&("recipient-id".len() as u32).to_be_bytes());
-    body.extend_from_slice(b"recipient-id");
-    body.extend_from_slice(&u32::MAX.to_be_bytes()); // depth
-    let path = hostile_file("depth-u32-max", 1, &body);
-    if let Ok(mb) = Mailbox::open(&path, 8) {
-        assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
+        let store = RelayStore::open(&path).expect("open must not fail on a valid database");
+        let result = store.pickup("recipient-id");
+        assert!(
+            matches!(result, Err(StoreError::Expired) | Err(StoreError::NotFound)),
+            "{tag}: an out-of-range expiry must fail closed, not be delivered, got: {result:?}"
+        );
+        assert_eq!(
+            store.count(),
+            0,
+            "{tag}: the discarded entry must not be counted as stored"
+        );
     }
 }

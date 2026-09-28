@@ -78,55 +78,7 @@ const POW_DIFFICULTY: u32 = 20;
 /// PoW context string (binds solutions to this relay's WS path).
 const POW_CONTEXT: &[u8] = b"ws-relay-v1";
 
-/// Persistent store handles shared by every WS listener in this process.
-///
-/// Envelopes and prekey bundles are the relay's *durable* state: a listener that
-/// restarts (or a second listener process-wide) must still deliver undelivered
-/// envelopes and serve published prekey bundles. They live behind a
-/// process-global [`OnceLock`] so every `WsState` sees the same backing store,
-/// opened at a fixed path under the OS temp dir.
-struct PersistentStores {
-    store: Mailbox,
-    prekeys: RelayStore,
-}
-
-/// Process-global persistent store (envelopes + prekeys), initialised lazily.
-///
-/// Deliberately holds ONLY the durable state. The rate limiter and the PoW
-/// challenge set are per-listener (see [`WsState::new`]): sharing them
-/// process-globally would let one listener's traffic throttle or validate
-/// another's — e.g. a fresh listener must never inherit a spent rate-limit
-/// budget or a stale challenge from an earlier listener.
-static PERSISTENT_STORES: std::sync::OnceLock<PersistentStores> = std::sync::OnceLock::new();
-
-/// Fixed on-disk location for the persistent store, under the OS temp dir.
-///
-/// The relay is a single self-hostable process; the store path is derived from
-/// the process identity so concurrent test processes do not collide.
-fn persistent_store_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("relay-ws-store-{}", std::process::id()))
-}
-
-/// Open (or lazily initialise) the process-global persistent store.
-fn persistent_stores() -> &'static PersistentStores {
-    PERSISTENT_STORES.get_or_init(|| {
-        let dir = persistent_store_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let mailbox_path = dir.join("mailbox.db");
-        let prekeys_path = dir.join("prekeys.db");
-        let store = Mailbox::open(&mailbox_path, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)
-            .unwrap_or_else(|_| Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT));
-        let prekeys = RelayStore::open(&prekeys_path).unwrap_or_else(|_| RelayStore::new());
-        PersistentStores { store, prekeys }
-    })
-}
-
 /// Shared state for the WS listener: the store, rate limiter, and active PoW challenges.
-///
-/// `store` and `prekeys` are handles onto the process-global persistent store
-/// (envelopes + prekeys survive a listener restart). `rate_limiter` and
-/// `challenges` are constructed FRESH for every listener — they are
-/// per-listener state and must never be read from any global.
 struct WsState {
     store: Mailbox,
     /// Prekey bundles are stored separately from envelopes so lookup_prekey doesn't
@@ -139,10 +91,12 @@ struct WsState {
 
 impl WsState {
     fn new(rate_limit_per_minute: u32) -> Self {
-        let persistent = persistent_stores();
+        // In-memory by default: a listener built from `RelayOptions` has no store
+        // path to open, and a restart losing state is the behaviour pinned today.
+        // Surfacing a configurable path is RD-3's job.
         Self {
-            store: Mailbox::clone_handle(&persistent.store),
-            prekeys: RelayStore::clone_handle(&persistent.prekeys),
+            store: Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
+            prekeys: RelayStore::new(),
             rate_limiter: Mutex::new(RateLimiter::per_identity(rate_limit_per_minute)),
             challenges: Mutex::new(std::collections::HashMap::new()),
         }

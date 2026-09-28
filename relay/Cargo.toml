@@ -38,6 +38,11 @@ tokio-tungstenite = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
+# Durable store. Plain SQLite WITHOUT the SQLCipher feature: the relay holds only
+# sender-encrypted ciphertext, and the threat model already assumes a relay can read
+# its own storage, so at-rest encryption is defense in depth rather than a contract
+# term. `bundled` compiles SQLite in, so no system libsqlite3 is required.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 futures = "0.3"

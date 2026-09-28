@@ -4796,6 +4796,7 @@ dependencies = [
  "futures",
  "libp2p",
  "rand 0.9.4",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

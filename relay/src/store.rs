@@ -1,8 +1,8 @@
-use std::collections::{HashMap, VecDeque};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tracing::warn;
 
 /// Errors returned by the blind store-and-forward.
 #[derive(Debug, PartialEq)]
@@ -11,7 +11,7 @@ pub enum StoreError {
     Expired,
     /// No envelope found for the recipient.
     NotFound,
-    /// The on-disk store could not be opened, read, or written.
+    /// The store could not be opened, read, or written.
     Io(String),
 }
 
@@ -27,151 +27,73 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Magic prefix written at the head of every persisted store file.
-///
-/// A file that does not start with these bytes is treated as corrupt: the store
-/// fails closed (starts empty) rather than serving garbage.
-const STORE_MAGIC: &[u8; 4] = b"RDST";
-
-/// On-disk format version. Bumping it invalidates older files (fail closed).
-const STORE_FORMAT_VERSION: u8 = 1;
-
-/// Load a persisted map from `path`, failing closed.
-///
-/// Returns an empty map when the file does not exist (a fresh path behaves
-/// exactly like the in-memory constructor). A file that is unreadable, has the
-/// wrong magic/version, or does not parse is treated as corrupt: the store
-/// starts EMPTY rather than serving garbage, and never panics.
-fn load_map(path: &Path) -> HashMap<String, (Vec<u8>, SystemTime)> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return HashMap::new(),
-    };
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return HashMap::new();
-    }
-    decode_map(&bytes).unwrap_or_default()
+fn io_err(e: rusqlite::Error) -> StoreError {
+    StoreError::Io(e.to_string())
 }
 
-/// Decode the persisted map format: magic || version || count || entries.
+/// Open a SQLite store at `path`, or an anonymous in-memory one when `None`.
 ///
-/// Entry = key_len(u32 BE) || key || expiry_secs(u64 BE) || expiry_nanos(u32 BE)
-///         || value_len(u32 BE) || value. Returns `None` on any truncation or
-///         trailing garbage so the caller can fail closed to an empty store.
-fn decode_map(bytes: &[u8]) -> Option<HashMap<String, (Vec<u8>, SystemTime)>> {
-    if bytes.len() < 5 || &bytes[..4] != STORE_MAGIC || bytes[4] != STORE_FORMAT_VERSION {
+/// Durability comes from SQLite: `journal_mode=WAL` plus `synchronous=FULL` means a
+/// committed transaction survives a killed process or power loss. The previous
+/// hand-rolled framing could not offer that without an fsync of both the file and its
+/// parent directory, because a rename does not order against the write it publishes.
+///
+/// The schema is created here, so opening a file that is not a SQLite database fails
+/// now — at startup — rather than on the first request. Callers get `Err` and can
+/// refuse to start instead of serving garbage.
+fn open_db(path: Option<&Path>) -> Result<Connection, StoreError> {
+    let conn = match path {
+        Some(path) => Connection::open(path),
+        None => Connection::open_in_memory(),
+    }
+    .map_err(io_err)?;
+    // `journal_mode` reports the mode it settled on, so it must be read rather than
+    // executed. On an in-memory database this returns "memory" and changes nothing.
+    let _mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .map_err(io_err)?;
+    conn.execute_batch("PRAGMA synchronous=FULL;")
+        .map_err(io_err)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS prekeys (
+             recipient_id TEXT PRIMARY KEY,
+             value        BLOB NOT NULL,
+             expiry_secs  INTEGER NOT NULL,
+             expiry_nanos INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS envelopes (
+             seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+             recipient_id TEXT NOT NULL,
+             value        BLOB NOT NULL,
+             expiry_secs  INTEGER NOT NULL,
+             expiry_nanos INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS envelopes_fifo ON envelopes (recipient_id, seq);",
+    )
+    .map_err(io_err)?;
+    Ok(conn)
+}
+
+/// Decompose an expiry instant into the integer pair stored on disk.
+fn expiry_parts(at: SystemTime) -> (i64, i64) {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => (since.as_secs() as i64, since.subsec_nanos() as i64),
+        // Before the epoch: already expired, so any past value is equivalent.
+        Err(_) => (0, 0),
+    }
+}
+
+/// Rebuild a `SystemTime` from the persisted integer pair.
+///
+/// Returns `None` for values that cannot exist: negative or >= 1s nanoseconds, or a
+/// second count outside `SystemTime`'s range. `Duration::new` panics on the first and
+/// `checked_add` fails on the second, so both are rejected here — a store whose bytes
+/// were edited by hand fails closed instead of panicking during listener startup.
+fn expiry_from_parts(secs: i64, nanos: i64) -> Option<SystemTime> {
+    if !(0..1_000_000_000).contains(&nanos) || secs < 0 {
         return None;
     }
-    let mut rest = &bytes[5..];
-    let count = read_u32(&mut rest)? as usize;
-    // `count` is file-controlled: a hostile count (up to u32::MAX) must not
-    // drive a huge pre-allocation. Reserve nothing and let the map grow as
-    // entries are actually decoded; a truncated file fails closed below.
-    let mut map = HashMap::new();
-    for _ in 0..count {
-        let key_len = read_u32(&mut rest)? as usize;
-        if rest.len() < key_len {
-            return None;
-        }
-        let key = String::from_utf8(rest[..key_len].to_vec()).ok()?;
-        rest = &rest[key_len..];
-        let expiry_secs = read_u64(&mut rest)?;
-        let expiry_nanos = read_u32(&mut rest)?;
-        let expiry = expiry_from_parts(expiry_secs, expiry_nanos)?;
-        let value_len = read_u32(&mut rest)? as usize;
-        if rest.len() < value_len {
-            return None;
-        }
-        let value = rest[..value_len].to_vec();
-        rest = &rest[value_len..];
-        map.insert(key, (value, expiry));
-    }
-    if !rest.is_empty() {
-        // Trailing bytes: the file was truncated or hand-mangled — fail closed.
-        return None;
-    }
-    Some(map)
-}
-
-fn read_u32(bytes: &mut &[u8]) -> Option<u32> {
-    if bytes.len() < 4 {
-        return None;
-    }
-    let value = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    *bytes = &bytes[4..];
-    Some(value)
-}
-
-fn read_u64(bytes: &mut &[u8]) -> Option<u64> {
-    if bytes.len() < 8 {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[..8]);
-    *bytes = &bytes[8..];
-    Some(u64::from_be_bytes(buf))
-}
-
-/// Build a `SystemTime` from raw persisted seconds/nanos, rejecting values that
-/// cannot exist.
-///
-/// A hostile file can carry any u64/u32 pair. `Duration::new` panics when the
-/// nanos exceed one second, and `SystemTime + Duration` panics on overflow, so
-/// both are checked here and a malformed expiry fails closed (`None`) instead of
-/// panicking at `open()` during listener startup.
-fn expiry_from_parts(secs: u64, nanos: u32) -> Option<SystemTime> {
-    if nanos >= 1_000_000_000 {
-        return None;
-    }
-    let duration = Duration::new(secs, nanos);
-    SystemTime::UNIX_EPOCH.checked_add(duration)
-}
-
-/// Encode a map into the persisted format (see [`decode_map`]).
-fn encode_map(map: &HashMap<String, (Vec<u8>, SystemTime)>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(STORE_MAGIC);
-    out.push(STORE_FORMAT_VERSION);
-    out.extend_from_slice(&(map.len() as u32).to_be_bytes());
-    // Deterministic order: sort by key so the file is reproducible.
-    let mut keys: Vec<&String> = map.keys().collect();
-    keys.sort();
-    for key in keys {
-        let (value, expiry) = &map[key];
-        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
-        out.extend_from_slice(key.as_bytes());
-        let since_epoch = expiry
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO);
-        out.extend_from_slice(&since_epoch.as_secs().to_be_bytes());
-        out.extend_from_slice(&(since_epoch.subsec_nanos() as u32).to_be_bytes());
-        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
-        out.extend_from_slice(value);
-    }
-    out
-}
-
-/// Atomically replace the file at `path` with `bytes`.
-///
-/// Writes to a sibling temp file and renames over the target so a crash mid-write
-/// can never leave a half-written store behind.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
-    }
-    let tmp = temp_sibling(path);
-    std::fs::write(&tmp, bytes).map_err(|e| StoreError::Io(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| StoreError::Io(e.to_string()))
-}
-
-/// A unique temp-file path next to `path` (same directory, `.tmp-<pid>` suffix).
-fn temp_sibling(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "relay-store".to_string());
-    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos as u32))
 }
 
 /// A blind store that holds ciphertext envelopes with TTL, optionally persisted
@@ -181,13 +103,10 @@ fn temp_sibling(path: &Path) -> PathBuf {
 /// [`RelayStore::open`] (backed by a file, so entries survive a restart).
 ///
 /// Handles can be shared: [`RelayStore::clone_handle`] returns a new handle onto
-/// the SAME underlying map (and the same backing file), so multiple listeners in
-/// one process observe one durable store.
+/// the SAME underlying database, so multiple listeners in one process observe one
+/// durable store.
 pub struct RelayStore {
-    inner: Arc<Mutex<HashMap<String, (Vec<u8>, SystemTime)>>>,
-    /// When set, every mutation is flushed to this path so a later
-    /// `RelayStore::open` on the same path sees the same state.
-    path: Option<Arc<PathBuf>>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Default for RelayStore {
@@ -197,35 +116,31 @@ impl Default for RelayStore {
 }
 
 impl RelayStore {
-    /// Create a new empty store.
+    /// Create a new empty in-memory store.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-            path: None,
+            conn: Arc::new(Mutex::new(open_db(None).expect("in-memory sqlite store"))),
         }
     }
 
     /// Open (or create) a persisted store at `path`.
     ///
     /// A fresh path starts empty and behaves exactly like [`RelayStore::new`].
-    /// A corrupt or truncated file fails closed: the store starts empty rather
-    /// than serving garbage, and never panics.
+    /// A file that is not a SQLite database fails closed with [`StoreError::Io`]
+    /// rather than serving garbage, and never panics.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let map = load_map(path);
         Ok(Self {
-            inner: Arc::new(Mutex::new(map)),
-            path: Some(Arc::new(path.to_path_buf())),
+            conn: Arc::new(Mutex::new(open_db(Some(path))?)),
         })
     }
 
-    /// Return a second handle onto the same underlying map and backing file.
+    /// Return a second handle onto the same underlying database.
     ///
     /// Mutations through either handle are visible through the other, and both
     /// persist to the same path.
     pub fn clone_handle(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
-            path: self.path.clone(),
+            conn: Arc::clone(&self.conn),
         }
     }
 
@@ -236,53 +151,71 @@ impl RelayStore {
         envelope: Vec<u8>,
         ttl: Duration,
     ) -> Result<(), StoreError> {
-        let expiry = SystemTime::now() + ttl;
-        let mut map = self.inner.lock().unwrap();
-        map.insert(recipient_id.to_string(), (envelope, expiry));
-        self.persist(&map)?;
+        let (secs, nanos) = expiry_parts(SystemTime::now() + ttl);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO prekeys (recipient_id, value, expiry_secs, expiry_nanos)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(recipient_id) DO UPDATE SET
+                 value        = excluded.value,
+                 expiry_secs  = excluded.expiry_secs,
+                 expiry_nanos = excluded.expiry_nanos",
+            params![recipient_id, envelope, secs, nanos],
+        )
+        .map_err(io_err)?;
         Ok(())
     }
 
     /// Pick up the envelope for a recipient if it exists and is not expired.
     pub fn pickup(&self, recipient_id: &str) -> Result<Vec<u8>, StoreError> {
-        let mut map = self.inner.lock().unwrap();
-        match map.get(recipient_id) {
-            None => Err(StoreError::NotFound),
-            Some((_, expiry)) if *expiry <= SystemTime::now() => {
-                // expired, remove
-                map.remove(recipient_id);
-                self.persist(&map)?;
-                Err(StoreError::Expired)
-            }
-            Some((envelope, _)) => {
-                let data = envelope.clone();
-                map.remove(recipient_id);
-                self.persist(&map)?;
-                Ok(data)
-            }
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Vec<u8>, i64, i64)> = conn
+            .query_row(
+                "SELECT value, expiry_secs, expiry_nanos FROM prekeys WHERE recipient_id = ?1",
+                params![recipient_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(io_err)?;
+        let Some((value, secs, nanos)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        conn.execute(
+            "DELETE FROM prekeys WHERE recipient_id = ?1",
+            params![recipient_id],
+        )
+        .map_err(io_err)?;
+        match expiry_from_parts(secs, nanos) {
+            // An unrepresentable expiry is treated as expired: never served.
+            Some(expiry) if expiry > SystemTime::now() => Ok(value),
+            _ => Err(StoreError::Expired),
         }
     }
 
     /// Purge the stored envelope for a recipient regardless of TTL.
     pub fn purge(&self, recipient_id: &str) -> Result<(), StoreError> {
-        let mut map = self.inner.lock().unwrap();
-        map.remove(recipient_id);
-        self.persist(&map)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM prekeys WHERE recipient_id = ?1",
+            params![recipient_id],
+        )
+        .map_err(io_err)?;
         Ok(())
     }
 
     /// Return the number of stored envelopes (including expired ones that haven't been cleaned yet).
     pub fn count(&self) -> usize {
-        let map = self.inner.lock().unwrap();
-        map.len()
-    }
-
-    /// Flush the current map to disk when this store is persisted.
-    fn persist(&self, map: &HashMap<String, (Vec<u8>, SystemTime)>) -> Result<(), StoreError> {
-        match &self.path {
-            None => Ok(()),
-            Some(path) => atomic_write(path, &encode_map(map)),
-        }
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM prekeys", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|n| n.max(0) as usize)
+        .unwrap_or_else(|e| {
+            // Unreachable for a store that opened cleanly (the schema is created at
+            // open), so this is a real fault worth surfacing rather than hiding.
+            warn!("store: count failed: {e}");
+            0
+        })
     }
 
     /// Introspect whether a public method is exposed.
@@ -303,10 +236,9 @@ pub enum MailboxError {
     Expired,
     /// The recipient's live queue is already at `max_depth`.
     QueueFull,
+    /// The queue could not be read or written.
+    Io(String),
 }
-
-/// Opaque envelope with its expiry instant, queued FIFO per recipient.
-type Queue = VecDeque<(Vec<u8>, SystemTime)>;
 
 /// Per-recipient FIFO queue of opaque envelopes.
 ///
@@ -321,10 +253,13 @@ type Queue = VecDeque<(Vec<u8>, SystemTime)>;
 /// restart).
 pub struct Mailbox {
     max_depth: usize,
-    queues: Arc<Mutex<HashMap<String, Queue>>>,
-    /// When set, every mutation is flushed to this path so a later
-    /// `Mailbox::open` on the same path sees the same queues.
-    path: Option<Arc<PathBuf>>,
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Default for Mailbox {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)
+    }
 }
 
 impl Mailbox {
@@ -332,34 +267,30 @@ impl Mailbox {
     pub fn new(max_depth: usize) -> Self {
         Self {
             max_depth,
-            queues: Arc::new(Mutex::new(HashMap::new())),
-            path: None,
+            conn: Arc::new(Mutex::new(open_db(None).expect("in-memory sqlite mailbox"))),
         }
     }
 
     /// Open (or create) a persisted mailbox at `path`.
     ///
     /// A fresh path starts empty and behaves exactly like [`Mailbox::new`]. A
-    /// corrupt or truncated file fails closed: the mailbox starts empty rather
-    /// than serving garbage, and never panics.
+    /// file that is not a SQLite database fails closed with [`StoreError::Io`]
+    /// rather than serving garbage, and never panics.
     pub fn open(path: &Path, max_depth: usize) -> Result<Self, StoreError> {
-        let queues = load_queues(path);
         Ok(Self {
             max_depth,
-            queues: Arc::new(Mutex::new(queues)),
-            path: Some(Arc::new(path.to_path_buf())),
+            conn: Arc::new(Mutex::new(open_db(Some(path))?)),
         })
     }
 
-    /// Return a second handle onto the same underlying queues and backing file.
+    /// Return a second handle onto the same underlying database.
     ///
     /// Mutations through either handle are visible through the other, and both
     /// persist to the same path.
     pub fn clone_handle(&self) -> Self {
         Self {
             max_depth: self.max_depth,
-            queues: Arc::clone(&self.queues),
-            path: self.path.clone(),
+            conn: Arc::clone(&self.conn),
         }
     }
 
@@ -374,17 +305,22 @@ impl Mailbox {
         ttl: Duration,
     ) -> Result<(), MailboxError> {
         let now = SystemTime::now();
-        let mut queues = self.queues.lock().unwrap();
-        let queue = queues.entry(recipient_id.to_string()).or_default();
-        queue.retain(|(_, expiry)| *expiry > now);
-        if queue.len() >= self.max_depth {
-            if queue.is_empty() {
-                queues.remove(recipient_id);
-            }
+        let (secs, nanos) = expiry_parts(now + ttl);
+        // One connection behind one mutex: the read-modify-write below is serialized
+        // across every handle, so concurrent senders cannot both pass the depth check.
+        let conn = self.conn.lock().unwrap();
+        let expired = expired_seqs(&conn, recipient_id, now).map_err(mailbox_io_err)?;
+        delete_seqs(&conn, &expired).map_err(mailbox_io_err)?;
+        let live = count_live(&conn, recipient_id, now).map_err(mailbox_io_err)?;
+        if live >= self.max_depth {
             return Err(MailboxError::QueueFull);
         }
-        queue.push_back((envelope, now + ttl));
-        self.persist(&queues);
+        conn.execute(
+            "INSERT INTO envelopes (recipient_id, value, expiry_secs, expiry_nanos)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![recipient_id, envelope, secs, nanos],
+        )
+        .map_err(|e| MailboxError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -395,118 +331,155 @@ impl Mailbox {
     /// [`MailboxError::Expired`] when the queue held only expired envelopes.
     pub fn dequeue(&self, recipient_id: &str) -> Result<Vec<u8>, MailboxError> {
         let now = SystemTime::now();
-        let mut queues = self.queues.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, value, expiry_secs, expiry_nanos FROM envelopes
+                 WHERE recipient_id = ?1 ORDER BY seq",
+            )
+            .map_err(|e| MailboxError::Io(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![recipient_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| MailboxError::Io(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MailboxError::Io(e.to_string()))?;
+        drop(stmt);
+
         let mut discarded_expired = false;
-        let mut found: Option<Vec<u8>> = None;
-        let empty_after = if let Some(queue) = queues.get_mut(recipient_id) {
-            while let Some((envelope, expiry)) = queue.pop_front() {
-                if expiry > now {
-                    found = Some(envelope);
-                    break;
-                }
-                discarded_expired = true;
+        for (seq, value, secs, nanos) in rows {
+            // An unrepresentable expiry is discarded rather than delivered.
+            let live = matches!(
+                expiry_from_parts(secs, nanos),
+                Some(expiry) if expiry > now
+            );
+            delete_seqs(&conn, &[seq]).map_err(mailbox_io_err)?;
+            if live {
+                return Ok(value);
             }
-            queue.is_empty()
+            discarded_expired = true;
+        }
+        if discarded_expired {
+            Err(MailboxError::Expired)
         } else {
-            return Err(MailboxError::NotFound);
-        };
-        if empty_after {
-            queues.remove(recipient_id);
-        }
-        self.persist(&queues);
-        match found {
-            Some(envelope) => Ok(envelope),
-            None if discarded_expired => Err(MailboxError::Expired),
-            None => Err(MailboxError::NotFound),
-        }
-    }
-
-    /// Flush the current queues to disk when this mailbox is persisted.
-    fn persist(&self, queues: &HashMap<String, Queue>) {
-        if let Some(path) = &self.path {
-            // Persisting is best-effort for the FIFO: a write failure must not
-            // change the in-memory answer the caller already got.
-            let _ = atomic_write(path, &encode_queues(queues));
+            Err(MailboxError::NotFound)
         }
     }
 }
 
-/// Load persisted queues from `path`, failing closed to empty on any problem.
-fn load_queues(path: &Path) -> HashMap<String, Queue> {
-    match std::fs::read(path) {
-        Ok(bytes) => decode_queues(&bytes).unwrap_or_default(),
-        Err(_) => HashMap::new(),
-    }
+/// Map a SQLite failure from a queue statement onto the mailbox's error type.
+fn mailbox_io_err(e: rusqlite::Error) -> MailboxError {
+    MailboxError::Io(e.to_string())
 }
 
-/// Decode the persisted queue format (same framing as [`decode_map`], but each
-/// key holds a FIFO list of `(value, expiry)` pairs).
-fn decode_queues(bytes: &[u8]) -> Option<HashMap<String, Queue>> {
-    if bytes.len() < 5 || &bytes[..4] != STORE_MAGIC || bytes[4] != STORE_FORMAT_VERSION {
-        return None;
-    }
-    let mut rest = &bytes[5..];
-    let count = read_u32(&mut rest)? as usize;
-    // File-controlled count: never pre-allocate from it (see `decode_map`).
-    let mut queues: HashMap<String, Queue> = HashMap::new();
-    for _ in 0..count {
-        let key_len = read_u32(&mut rest)? as usize;
-        if rest.len() < key_len {
-            return None;
-        }
-        let key = String::from_utf8(rest[..key_len].to_vec()).ok()?;
-        rest = &rest[key_len..];
-        let depth = read_u32(&mut rest)? as usize;
-        // File-controlled depth: never pre-allocate from it (see `decode_map`).
-        let mut queue = Queue::new();
-        for _ in 0..depth {
-            let value_len = read_u32(&mut rest)? as usize;
-            if rest.len() < value_len {
-                return None;
-            }
-            let value = rest[..value_len].to_vec();
-            rest = &rest[value_len..];
-            let expiry_secs = read_u64(&mut rest)?;
-            let expiry_nanos = read_u32(&mut rest)?;
-            let expiry = expiry_from_parts(expiry_secs, expiry_nanos)?;
-            queue.push_back((value, expiry));
-        }
-        queues.insert(key, queue);
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-    Some(queues)
+/// Sequences of `recipient_id`'s already-expired envelopes, oldest first.
+fn expired_seqs(
+    conn: &Connection,
+    recipient_id: &str,
+    now: SystemTime,
+) -> Result<Vec<i64>, rusqlite::Error> {
+    let mut stmt = conn
+        .prepare("SELECT seq, expiry_secs, expiry_nanos FROM envelopes WHERE recipient_id = ?1")?;
+    let rows = stmt
+        .query_map(params![recipient_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, secs, nanos)| {
+            !matches!(expiry_from_parts(*secs, *nanos), Some(expiry) if expiry > now)
+        })
+        .map(|(seq, _, _)| seq)
+        .collect())
 }
 
-/// Encode queues into the persisted format (see [`decode_queues`]).
-fn encode_queues(queues: &HashMap<String, Queue>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(STORE_MAGIC);
-    out.push(STORE_FORMAT_VERSION);
-    out.extend_from_slice(&(queues.len() as u32).to_be_bytes());
-    let mut keys: Vec<&String> = queues.keys().collect();
-    keys.sort();
-    for key in keys {
-        let queue = &queues[key];
-        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
-        out.extend_from_slice(key.as_bytes());
-        out.extend_from_slice(&(queue.len() as u32).to_be_bytes());
-        for (value, expiry) in queue {
-            out.extend_from_slice(&(value.len() as u32).to_be_bytes());
-            out.extend_from_slice(value);
-            let since_epoch = expiry
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO);
-            out.extend_from_slice(&since_epoch.as_secs().to_be_bytes());
-            out.extend_from_slice(&(since_epoch.subsec_nanos() as u32).to_be_bytes());
-        }
-    }
-    out
+/// Number of `recipient_id`'s envelopes that have not expired.
+fn count_live(
+    conn: &Connection,
+    recipient_id: &str,
+    now: SystemTime,
+) -> Result<usize, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT expiry_secs, expiry_nanos FROM envelopes WHERE recipient_id = ?1")?;
+    let rows = stmt
+        .query_map(params![recipient_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(secs, nanos)| {
+            matches!(expiry_from_parts(*secs, *nanos), Some(expiry) if expiry > now)
+        })
+        .count())
 }
 
-impl Default for Mailbox {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)
+/// Delete envelopes by sequence number. An empty slice is a no-op.
+fn delete_seqs(conn: &Connection, seqs: &[i64]) -> Result<(), rusqlite::Error> {
+    for seq in seqs {
+        conn.execute("DELETE FROM envelopes WHERE seq = ?1", params![seq])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drop the table out from under an open store so every statement against it
+    /// fails. There is no cheaper way to make SQLite refuse a write through the
+    /// public API, and the datastore is the boundary where fault injection belongs.
+    fn break_table(conn: &Arc<Mutex<Connection>>, table: &str) {
+        conn.lock()
+            .unwrap()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+
+    /// A failing store must REPORT the failure. The previous implementation
+    /// persisted with `let _ = atomic_write(...)`, so a sender was told `ok` for an
+    /// envelope that was never written and was gone on the next restart.
+    #[test]
+    fn mailbox_write_failure_is_reported_not_swallowed() {
+        let mb = Mailbox::new(4);
+        break_table(&mb.conn, "envelopes");
+        let result = mb.enqueue("recipient-id", vec![0xAA], Duration::from_secs(60));
+        assert!(
+            matches!(result, Err(MailboxError::Io(_))),
+            "an unwritable store must surface the failure, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn mailbox_read_failure_is_reported_not_swallowed() {
+        let mb = Mailbox::new(4);
+        break_table(&mb.conn, "envelopes");
+        let result = mb.dequeue("recipient-id");
+        assert!(
+            matches!(result, Err(MailboxError::Io(_))),
+            "an unreadable store must surface the failure, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relay_store_write_failure_is_reported_not_swallowed() {
+        let store = RelayStore::new();
+        break_table(&store.conn, "prekeys");
+        let result = store.store("recipient-id", vec![0xAA], Duration::from_secs(60));
+        assert!(
+            matches!(result, Err(StoreError::Io(_))),
+            "an unwritable store must surface the failure, got: {result:?}"
+        );
     }
 }
