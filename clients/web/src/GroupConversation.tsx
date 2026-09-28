@@ -54,6 +54,119 @@ export interface GroupMessage {
     // decrypted from the relay. Omitted/undefined for backward compat with
     // persisted messages from before this field existed.
     sentByMe?: boolean;
+    // ── GRP-7: sender attribution for received messages ─────────────────
+    // Stable identity of the sender of a RECEIVED message: the hex-encoded
+    // public identity key of the group member the envelope's wrapper roster
+    // attributes it to. Undefined for messages sent by the local user, and for
+    // a received message whose sender cannot be uniquely identified from the
+    // roster (fail closed — no attribution rather than a wrong one).
+    senderId?: string;
+    // Short, stable, human-readable label derived from `senderId` (the first
+    // four bytes of the sender's public key, hex-encoded) — what the UI shows.
+    senderLabel?: string;
+    // Stable fingerprint of the group membership this message belongs to, so
+    // messages can be grouped instead of collapsing into one flat log.
+    groupId?: string;
+    // ── GRP-7: send outcome ─────────────────────────────────────────────
+    // How the fan-out to the group's real members actually went. `sent` only
+    // when every member's sendEnvelope resolved; `partial` when some did and
+    // some did not; `failed` when none did. Undefined for received messages.
+    sendStatus?: 'sent' | 'partial' | 'failed';
+    sendFailures?: number;
+    sendTotal?: number;
+    sendError?: string;
+}
+
+/** Byte-wise equality for two public identity keys. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+/** Lowercase hex of a byte string. */
+function toHex(bytes: Uint8Array): string {
+    return Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+/** The short, stable sender label the UI renders (first 4 key bytes, hex). */
+function shortSenderLabel(publicBytes: Uint8Array): string {
+    return toHex(publicBytes.slice(0, 4));
+}
+
+/** A stable fingerprint of a group's membership, so messages can be grouped. */
+function groupFingerprint(members: Array<{ recipientId: string }>): string {
+    const joined = members
+        .map((m) => m.recipientId)
+        .sort()
+        .join('|');
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < joined.length; i++) {
+        hash ^= joined.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+}
+
+/**
+ * Parse the wrapper roster out of a Sender Keys group ciphertext.
+ *
+ * Wire format (core/protocol/src/group.rs, `encrypt_as`):
+ *
+ *   nonce(12) | payload_len(u32 LE) | AES-GCM payload | wrapper_count(u8)
+ *     | (member_pubkey(33) | sealed_len(u16 LE) | sealed)*
+ *
+ * Returns the public keys of the members the sender addressed, or `null` when
+ * the bytes are not a structurally valid group ciphertext. `null` is a
+ * fail-closed signal: the caller must neither attribute nor decrypt it.
+ */
+function parseWrapperRoster(envelope: Uint8Array): Uint8Array[] | null {
+    if (envelope.length < 12 + 4 + 1) return null;
+    const view = new DataView(envelope.buffer as ArrayBuffer, envelope.byteOffset, envelope.byteLength);
+    const payloadLen = view.getUint32(12, true);
+    let pos = 16 + payloadLen;
+    if (pos + 1 > envelope.length) return null;
+    const count = envelope[pos];
+    pos += 1;
+    const roster: Uint8Array[] = [];
+    for (let i = 0; i < count; i++) {
+        if (pos + 33 + 2 > envelope.length) return null;
+        roster.push(envelope.slice(pos, pos + 33));
+        pos += 33;
+        const sealedLen = view.getUint16(pos, true);
+        pos += 2;
+        if (pos + sealedLen > envelope.length) return null;
+        pos += sealedLen;
+    }
+    return roster;
+}
+
+/**
+ * The sender of a received envelope: the one known real member whose public
+ * key is absent from the roster. `GroupSession::new` ignores the sender's own
+ * public key and starts with an empty member list, so a sender addresses every
+ * member *except itself* — the sender is exactly the member missing from the
+ * roster, while the local user's own key is always present.
+ *
+ * Returns `null` when that member is not unique (an empty roster, or a sender
+ * whose view of the group omits more than one member): fail closed rather than
+ * attribute a message to the wrong member.
+ */
+function findSenderFromRoster(
+    roster: Uint8Array[],
+    selfPublicBytes: Uint8Array,
+    knownMembers: Array<{ recipientId: string; publicBytes: Uint8Array }>,
+): { recipientId: string; publicBytes: Uint8Array } | null {
+    const candidates = knownMembers.filter(
+        (m) =>
+            !bytesEqual(m.publicBytes, selfPublicBytes) &&
+            !roster.some((key) => bytesEqual(key, m.publicBytes)),
+    );
+    return candidates.length === 1 ? candidates[0] : null;
 }
 
 /**
@@ -156,6 +269,11 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     const [addingPeer, setAddingPeer] = useState(false);
     const [peerError, setPeerError] = useState<string | null>(null);
     const [decryptionWarning, setDecryptionWarning] = useState<string>('');
+    // GRP-7: the outcome of the most recent group send, surfaced in the UI the
+    // way Conversation.tsx surfaces a direct-send failure (its `status` line).
+    // Per-message outcomes live on the message itself, so a later successful
+    // send never hides an earlier failure.
+    const [sendError, setSendError] = useState<string | null>(null);
 
     const transportRef = useRef<GroupTransport>(transport ?? new RelayTransport());
 
@@ -198,6 +316,13 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     const selfIdentityRef = useRef<InstanceType<typeof IdentityHandle> | null>(null);
     useEffect(() => { groupRef.current = group; }, [group]);
     useEffect(() => { selfIdentityRef.current = selfIdentity; }, [selfIdentity]);
+    // GRP-7: the real (on-the-wire) members, mirrored into a ref so the
+    // receive-loop effect can attribute a picked-up envelope without
+    // re-subscribing the poll interval on every membership change. Demo
+    // members are local-only identities with no relay address, so they are
+    // never on the wire and are not attribution candidates.
+    const knownMembersRef = useRef<RealMember[]>([]);
+    useEffect(() => { knownMembersRef.current = realMembers; }, [realMembers]);
 
     // Keep the prop-derived refs fresh WITHOUT re-running the one-time init.
     // The init effect below rebuilds the GroupHandle and re-reads persisted
@@ -372,6 +497,29 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 // Decrypt — fail closed. A tampered/corrupted envelope throws
                 // here; we surface a warning and never render any plaintext.
 
+                // GRP-7: parse the wrapper roster BEFORE decrypting. The roster
+                // is the list of members the sender addressed, so if the local
+                // user's own key is not in it this envelope was not addressed to
+                // us (a non-member's envelope, or a malformed one) — reject it
+                // without producing any plaintext.
+                const roster = parseWrapperRoster(envelope);
+                const selfPublicBytes = currentSelf.public_bytes();
+                if (!roster || !roster.some((key) => bytesEqual(key, selfPublicBytes))) {
+                    console.warn('group envelope is not addressed to this member; discarded');
+                    setDecryptionWarning(
+                        'A received group message was not addressed to this member and was discarded.',
+                    );
+                    return;
+                }
+                // Attribute the message to the one known member missing from the
+                // roster (the sender never addresses itself). Ambiguous -> no
+                // attribution, never a wrong one.
+                const sender = findSenderFromRoster(
+                    roster,
+                    selfPublicBytes,
+                    knownMembersRef.current,
+                );
+
                 let plaintext: Uint8Array;
                 try {
                     plaintext = group_decrypt(currentGroup, currentSelf, envelope);
@@ -396,6 +544,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                         timestamp: Date.now(),
                         decryptResults: {},
                         sentByMe: false,
+                        senderId: sender ? toHex(sender.publicBytes) : undefined,
+                        senderLabel: sender ? shortSenderLabel(sender.publicBytes) : undefined,
+                        groupId: groupFingerprint(knownMembersRef.current),
                     },
                 ]);
             } catch (e) {
@@ -537,7 +688,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         void persistGroupState(updatedMembers);
     };
 
-    const send = () => {
+    const send = async () => {
         if (!group || !selfIdentity || !input.trim()) return;
         const plaintextBytes = new TextEncoder().encode(input);
         let ciphertext: Uint8Array;
@@ -551,16 +702,45 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         // over the relay, addressed by each member's recipient ID — mirroring
         // Conversation.tsx's send path. Demo members are local-only (no relay
         // address) so they are not sent over the wire.
-        for (const member of realMembers) {
-            void runTransportOp(() =>
-                transportRef.current.sendEnvelope(member.recipientId, new Uint8Array(ciphertext)),
-            ).catch((e) => {
+        //
+        // GRP-7: this fan-out is AWAITED and its per-member outcome is recorded
+        // rather than swallowed by a fire-and-forget `.catch(console.warn)`.
+        // `allSettled` (not `all`) is deliberate: one member's relay failure
+        // must not be reported as a blanket failure of a send that did reach
+        // the others, and a rejected entry must not be silently counted as a
+        // success either.
+        const sendOutcomes = await Promise.allSettled(
+            realMembers.map((member) =>
+                runTransportOp(() =>
+                    transportRef.current.sendEnvelope(member.recipientId, new Uint8Array(ciphertext)),
+                ).catch((e) => {
                     console.warn('sendEnvelope failed for group member', {
                         recipientId: member.recipientId,
                         error: e instanceof Error ? e.message : String(e),
                     });
-                });
-        }
+                    throw e;
+                }),
+            ),
+        );
+        const sendTotal = sendOutcomes.length;
+        const sendFailures = sendOutcomes.filter((o) => o.status === 'rejected').length;
+        const sendStatus: GroupMessage['sendStatus'] =
+            sendFailures === 0 ? 'sent' : sendFailures === sendTotal ? 'failed' : 'partial';
+        const firstFailure = sendOutcomes.find((o) => o.status === 'rejected') as
+            | PromiseRejectedResult
+            | undefined;
+        const failureMessage = firstFailure
+            ? firstFailure.reason instanceof Error
+                ? firstFailure.reason.message
+                : String(firstFailure.reason)
+            : undefined;
+        setSendError(
+            sendStatus === 'sent'
+                ? null
+                : sendStatus === 'partial'
+                  ? `Sent to ${sendTotal - sendFailures} of ${sendTotal} members.`
+                  : `Failed to send: ${failureMessage ?? 'relay unavailable'}`,
+        );
         // Every known demo member (whether currently in the group or removed)
         // attempts to decrypt, surfacing the real per-member outcome from the
         // actual crypto - including a removed member's decrypt genuinely
@@ -585,6 +765,11 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 timestamp: Date.now(),
                 decryptResults,
                 sentByMe: true,
+                groupId: groupFingerprint(realMembers),
+                sendStatus,
+                sendFailures,
+                sendTotal,
+                sendError: failureMessage,
             },
         ]);
         setInput('');
@@ -661,8 +846,35 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                             <p className="group-empty">No messages yet.</p>
                         ) : (
                             messages.map((msg) => (
-                                <div key={msg.id} data-testid={`message-${msg.id}`} className="group-msg">
+                                <div
+                                    key={msg.id}
+                                    data-testid={`message-${msg.id}`}
+                                    data-group-id={msg.groupId}
+                                    className="group-msg"
+                                >
+                                    {!msg.sentByMe && msg.senderLabel && (
+                                        <span
+                                            className="group-msg-sender"
+                                            data-testid={`sender-${msg.id}`}
+                                            title={msg.senderId}
+                                        >
+                                            {msg.senderLabel}
+                                        </span>
+                                    )}
                                     <p className="group-msg-text">{msg.plaintext}</p>
+                                    {msg.sentByMe && msg.sendStatus && (
+                                        <span
+                                            className={`group-msg-status status-${msg.sendStatus}`}
+                                            data-testid={`send-status-${msg.id}`}
+                                            title={msg.sendError}
+                                        >
+                                            {msg.sendStatus === 'sent'
+                                                ? 'sent'
+                                                : msg.sendStatus === 'partial'
+                                                  ? `sent to ${(msg.sendTotal ?? 0) - (msg.sendFailures ?? 0)} of ${msg.sendTotal ?? 0}`
+                                                  : 'failed'}
+                                        </span>
+                                    )}
                                     <ul className="group-msg-receipts">
                                         {Object.entries(msg.decryptResults).map(([name, result]) => (
                                             <li
@@ -692,6 +904,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                     </div>
                     {decryptionWarning && (
                         <p className="group-warning" role="alert">{decryptionWarning}</p>
+                    )}
+                    {sendError && (
+                        <p className="group-warning group-send-error" role="alert">{sendError}</p>
                     )}
                 </>
             )}
