@@ -277,3 +277,56 @@ async fn missing_kind_falls_through_to_a_kind_filtered_pickup() {
     );
     assert_eq!(envelope_bytes(&resp), envelope, "the untagged envelope must be delivered intact");
 }
+
+/// Cross-recipient collision regression (GRP-6 rework): sender-keys fan-out
+/// sends ONE ciphertext to every group member, so every member's mailbox row
+/// holds the SAME envelope bytes. The kind tag must therefore be keyed by
+/// (recipient_id, envelope bytes), not by the bytes alone — otherwise the
+/// first member's delivery removes the tag every other member's row still
+/// needs, those rows go untagged, and `tag.is_none()` hands the group
+/// envelope to ANY polling loop (a direct loop cannot decrypt it, and the
+/// relay has already destructively dequeued it — the message is lost).
+///
+/// Two recipients, identical envelope bytes, kind "group": A's group poll
+/// delivers and removes only A's tag; B's DIRECT poll must NOT receive the
+/// envelope, and B's GROUP poll must.
+#[tokio::test]
+async fn same_envelope_for_two_recipients_keeps_each_recipients_tag() {
+    let handle = ws::start_ws_listener_for_test(60).await;
+    let mut stream = ws_connect(handle.addr).await;
+
+    let recipient_a = "kind-fanout-a";
+    let recipient_b = "kind-fanout-b";
+    // Identical bytes to both recipients — the sender-keys fan-out shape.
+    let envelope = vec![0xC1u8; 48];
+
+    let resp = send_envelope(&mut stream, recipient_a, &envelope, Some("group")).await;
+    assert_eq!(resp["ok"], true, "send to A must succeed: {resp}");
+    let resp = send_envelope(&mut stream, recipient_b, &envelope, Some("group")).await;
+    assert_eq!(resp["ok"], true, "send to B must succeed: {resp}");
+
+    // A's group loop picks up its copy. Pre-fix this removed the single
+    // content-keyed tag that B's row also pointed at.
+    let resp = pickup_envelope(&mut stream, recipient_a, Some("group")).await;
+    assert_eq!(resp["ok"], true, "A's group poll must deliver: {resp}");
+    assert_eq!(envelope_bytes(&resp), envelope, "A must receive the envelope intact");
+
+    // B's DIRECT poll must not receive (or destroy) the group envelope.
+    let resp = pickup_envelope(&mut stream, recipient_b, Some("direct")).await;
+    assert_eq!(
+        resp["ok"], false,
+        "B's direct poll must not consume the group envelope after A's delivery: {resp}"
+    );
+    assert_eq!(
+        resp["error"], "NotFound",
+        "B's direct poll must report NotFound, not an error that discards it: {resp}"
+    );
+
+    // B's GROUP poll must still deliver it.
+    let resp = pickup_envelope(&mut stream, recipient_b, Some("group")).await;
+    assert_eq!(
+        resp["ok"], true,
+        "B's group poll must still deliver after A's copy was taken: {resp}"
+    );
+    assert_eq!(envelope_bytes(&resp), envelope, "B must receive the envelope intact");
+}

@@ -106,7 +106,11 @@ const POW_CONTEXT: &[u8] = b"ws-relay-v1";
 const MAX_PICKUP_SCAN: usize = 1024;
 
 /// Shared state for the WS listener: the store, rate limiter, and active PoW challenges.
-struct WsState {
+///
+/// `pub` (with `#[doc(hidden)]` test constructors) so integration tests can
+/// drive `handle_request` directly against a fault-injected store — the test
+/// listener's in-memory store cannot fail.
+pub struct WsState {
     store: Mailbox,
     /// Prekey bundles are stored separately from envelopes so lookup_prekey doesn't
     /// collide with pickup_envelope. We use a second RelayStore keyed by a prefix.
@@ -114,8 +118,12 @@ struct WsState {
     rate_limiter: Mutex<RateLimiter>,
     /// Currently active PoW challenges, keyed by a challenge ID (the nonce hex).
     challenges: Mutex<std::collections::HashMap<String, Challenge>>,
-    /// Out-of-band envelope-kind routing tags (GRP-6), keyed by the SHA-256 hex of
-    /// the queued envelope bytes.
+    /// TTL granted to a stored envelope at BOTH enqueue sites (the send path and
+    /// the foreign-kind re-queue). Defaults to [`DEFAULT_ENVELOPE_TTL`]; a test
+    /// may shorten it to make expiry behaviour observable over the wire.
+    pub envelope_ttl: Duration,
+    /// Out-of-band envelope-kind routing tags (GRP-6), keyed by
+    /// `(recipient_id, SHA-256 hex of the queued envelope bytes)`.
     ///
     /// The kind is NON-CONTENT routing metadata: it arrives as a sibling JSON field
     /// of `send_envelope` — never inside the ciphertext — and is held here, beside
@@ -123,16 +131,27 @@ struct WsState {
     /// byte-for-byte unchanged. Each entry also records the envelope's absolute
     /// expiry (see [`EnvelopeKind`]). An entry is removed when its envelope is
     /// delivered, or pruned once its recorded expiry has passed.
-    envelope_kinds: Mutex<std::collections::HashMap<String, EnvelopeKind>>,
-    /// TTL granted to a stored envelope at BOTH enqueue sites (the send path and
-    /// the foreign-kind re-queue). Defaults to [`DEFAULT_ENVELOPE_TTL`]; a test
-    /// may shorten it to make expiry behaviour observable over the wire.
-    envelope_ttl: Duration,
+    ///
+    /// The recipient is part of the key: with sender-keys fan-out the SAME
+    /// ciphertext bytes are queued for every group member (one `send_envelope`
+    /// per member, identical `envelope` field by design), so a content-only key
+    /// would make every member's row share one tag. The first member's delivery
+    /// would then remove the tag the other members' rows still need, leaving
+    /// them untagged — and untagged envelopes fall through to ANY polling loop,
+    /// so a direct loop could consume (and fail to decrypt) a group message the
+    /// relay has already destructively dequeued. Keying by recipient keeps each
+    /// member's tag independent.
+    pub envelope_kinds: Mutex<std::collections::HashMap<String, EnvelopeKind>>,
 }
 
-/// SHA-256 hex digest of `bytes` — the key under which an envelope's out-of-band
-/// kind tag is remembered (see `WsState::envelope_kinds`).
-fn envelope_kind_key(envelope: &[u8]) -> String {
+/// SHA-256 hex digest of `bytes` — the envelope half of the key under which an
+/// envelope's out-of-band kind tag is remembered (see
+/// `WsState::envelope_kinds`). The caller prefixes the recipient id; the
+/// recipient MUST be part of the key because sender-keys fan-out queues the
+/// same ciphertext bytes for every group member.
+///
+/// `pub` (doc-hidden) for the same reason as `WsState`: tests seed the tag map.
+pub fn envelope_kind_key(envelope: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(envelope);
@@ -160,9 +179,9 @@ fn envelope_kind_key(envelope: &[u8]) -> String {
 /// poll is handed the other loop's mail — the very misdelivery GRP-6
 /// exists to prevent. Tag and row must therefore expire like with like.
 #[derive(Clone)]
-struct EnvelopeKind {
-    kind: String,
-    expiry: SystemTime,
+pub struct EnvelopeKind {
+    pub kind: String,
+    pub expiry: SystemTime,
 }
 
 /// The full-precision clock used ONLY for kind-tag expiry bookkeeping.
@@ -199,6 +218,26 @@ fn prune_expired_kinds(
 }
 
 impl WsState {
+    /// Test-only constructor: builds the default state (in-memory store,
+    /// production envelope TTL) so an integration test can override the
+    /// fields it needs (a file-backed `store`, a shortened `envelope_ttl`)
+    /// and drive `handle_request` directly. Not part of the wire contract.
+    ///
+    /// Takes the overridable pieces as arguments so the remaining fields
+    /// (prekeys, rate limiter, challenges) can stay private: struct-update
+    /// syntax against this constructor would otherwise require every field
+    /// to be public. `envelope_ttl` is accepted for call-site symmetry with
+    /// `start_ws_listener_for_test_with_ttl` and is IGNORED — the default
+    /// TTL stands; a test that needs a different TTL sets the public
+    /// `envelope_ttl` field afterwards.
+    #[doc(hidden)]
+    pub fn new_with(store: Mailbox, rate_limit_per_minute: u32, _envelope_ttl: Duration) -> Self {
+        Self {
+            store,
+            ..Self::new(rate_limit_per_minute)
+        }
+    }
+
     fn new(rate_limit_per_minute: u32) -> Self {
         // In-memory by default: a listener built from `RelayOptions` has no store
         // path to open, and a restart losing state is the behaviour pinned today.
@@ -217,7 +256,7 @@ impl WsState {
 /// Request frame: all operations share this envelope.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op")]
-enum WsRequest {
+pub enum WsRequest {
     #[serde(rename = "challenge")]
     Challenge { recipient_id: String },
     #[serde(rename = "publish_prekey")]
@@ -501,7 +540,7 @@ fn prekey_store_error_response(e: StoreError) -> WsResponse {
 /// This is the security-critical path: PoW and rate-limit gates are enforced here
 /// before any store/pickup operation. Failures return an error response and do NOT
 /// perform the requested operation (fail closed / deny by default).
-async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
+pub async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
     // Rate-limit identity: use the recipient_id as the identity key. This is the
     // same per-identity model as the libp2p path.
     let now = Duration::from_secs(
@@ -679,7 +718,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 let tag_now = tag_now();
                 prune_expired_kinds(&mut kinds, tag_now);
                 kinds.insert(
-                    envelope_kind_key(&envelope_bytes),
+                    format!("{recipient_id}\u{0}{}", envelope_kind_key(&envelope_bytes)),
                     EnvelopeKind {
                         kind: kind.clone(),
                         // The absolute expiry is captured NOW, at send time,
@@ -746,7 +785,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     }
                     Err(e) => return WsResponse::err(format!("StoreError: {e:?}")),
                 };
-                let key = envelope_kind_key(&envelope_bytes);
+                let key = format!("{recipient_id}\u{0}{}", envelope_kind_key(&envelope_bytes));
                 let entry = state.envelope_kinds.lock().await.get(&key).cloned();
                 let tag = entry.as_ref().map(|e| e.kind.clone());
                 let accepted = match &kind {
@@ -756,6 +795,10 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 };
                 if accepted {
                     if entry.is_some() {
+                        // Remove only THIS recipient's entry: the same
+                        // ciphertext bytes may be queued for other members
+                        // (sender-keys fan-out), and their tags must survive
+                        // this delivery.
                         state.envelope_kinds.lock().await.remove(&key);
                     }
                     delivered = Some((envelope_bytes, tag));
@@ -802,7 +845,7 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     // arm on the dequeue path above.
                     warn!(
                         recipient = %truncate_id(&recipient_id),
-                        "ws: store io error on envelope re-queue: {err:?}"
+                        "ws: store error on envelope re-queue: {err:?}"
                     );
                     return mailbox_requeue_error_response(err);
                 }
