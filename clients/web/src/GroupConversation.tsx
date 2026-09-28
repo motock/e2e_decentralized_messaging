@@ -181,6 +181,17 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     useEffect(() => { groupRef.current = group; }, [group]);
     useEffect(() => { selfIdentityRef.current = selfIdentity; }, [selfIdentity]);
 
+    // Keep the prop-derived refs fresh WITHOUT re-running the one-time init.
+    // The init effect below rebuilds the GroupHandle and re-reads persisted
+    // state, so it must only re-run when the identity itself changes — not on a
+    // relay-URL change, which would silently rebuild the group and drop
+    // in-memory ratchet state. Declared before the init effect so it runs first
+    // on the render that supplies real props.
+    useEffect(() => {
+        if (transport) transportRef.current = transport;
+        if (storageGate) gateRef.current = storageGate;
+    }, [transport, storageGate]);
+
     useEffect(() => {
         let cancelled = false;
         // Criterion 3 — fail closed. With no identity/selfRecipientId the group
