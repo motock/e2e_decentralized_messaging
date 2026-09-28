@@ -20,7 +20,7 @@
 //!     pub fn verify(&self, primary: &IdentityKey) -> Result<(), RevocationError>;
 //! }
 //!
-//! pub enum RevocationError {
+//! pub enum RevocationError {   // derives Debug + Display (thiserror)
 //!     SigningFailed,
 //!     Malformed,
 //!     NotEntitled,
@@ -32,10 +32,15 @@
 //! impl FanoutSession {
 //!     pub fn apply_revocation(&mut self, revocation: &SignedRevocation, primary: &IdentityKey)
 //!         -> Result<(), RevocationError>;
+//!     /// Highest revocation version observed; 0 until the first revocation is applied.
 //!     pub fn revocation_version(&self) -> u64;
+//!     /// True only for a device this session has applied a revocation for.
 //!     pub fn is_revoked(&self, device: DeviceId) -> bool;
 //! }
 //! ```
+//!
+//! A rejected `apply_revocation` must leave the session unchanged: no device becomes revoked and
+//! `revocation_version` does not advance.
 //!
 //! `IdentityKey` is `libsignal_protocol::IdentityKey`; a keypair's public half comes from
 //! `crypto::IdentityKeyPairExt::public_identity`. `remove_device` and every existing
