@@ -76,6 +76,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -148,10 +149,32 @@ fn envelope_kind_key(envelope: &[u8]) -> String {
 /// let an unrequested-kind envelope live forever while the victim's loop
 /// keeps polling, and the per-recipient cap would then reject every later
 /// send with `QueueFull` — a mailbox wedge.
+///
+/// The expiry is a full-precision [`SystemTime`], NOT a `Duration` derived
+/// from the second-truncated request clock (`now`, ws.rs `handle_request`):
+/// the store stamps each row's expiry from full-precision
+/// `SystemTime::now()` (see `store::expiry_parts`), so a tag derived from
+/// the floored clock would expire up to a second BEFORE its row. Inside
+/// that window the tag is pruned while the row is still live, the accept
+/// rule treats the un-tagged envelope as a fall-through, and a filtered
+/// poll is handed the other loop's mail — the very misdelivery GRP-6
+/// exists to prevent. Tag and row must therefore expire like with like.
 #[derive(Clone)]
 struct EnvelopeKind {
     kind: String,
-    expiry: Duration,
+    expiry: SystemTime,
+}
+
+/// The full-precision clock used ONLY for kind-tag expiry bookkeeping.
+///
+/// Deliberately separate from `handle_request`'s `now` (floored to whole
+/// seconds): `now` is also the rate-limiter's and PoW's clock, and changing
+/// its precision would silently change those gates' semantics. The store
+/// compares row expiries against full-precision `SystemTime::now()`
+/// (`store::enqueue`/`dequeue`), so the tag must be measured the same way
+/// to guarantee a tag never expires strictly before its row.
+fn tag_now() -> SystemTime {
+    SystemTime::now()
 }
 
 /// Drop `envelope_kinds` entries whose recorded expiry has passed, so the map
@@ -165,7 +188,13 @@ struct EnvelopeKind {
 /// That is acceptable because every entry is only created after its sender
 /// solved the proof-of-work challenge, which bounds how fast the map — and
 /// the cost of each prune — can grow.
-fn prune_expired_kinds(kinds: &mut std::collections::HashMap<String, EnvelopeKind>, now: Duration) {
+fn prune_expired_kinds(
+    kinds: &mut std::collections::HashMap<String, EnvelopeKind>,
+    now: SystemTime,
+) {
+    // Like-with-like: `entry.expiry` is a full-precision SystemTime (see
+    // `EnvelopeKind`), so the comparison must be too. A Duration floored to
+    // whole seconds would prune tags up to a second before their rows expire.
     kinds.retain(|_, entry| entry.expiry > now);
 }
 
@@ -651,15 +680,20 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 // entry only exists after its sender solved the PoW
                 // challenge, which bounds how fast the map — and this prune —
                 // can grow.
-                prune_expired_kinds(&mut kinds, now);
+                let tag_now = tag_now();
+                prune_expired_kinds(&mut kinds, tag_now);
                 kinds.insert(
                     envelope_kind_key(&envelope_bytes),
                     EnvelopeKind {
                         kind: kind.clone(),
                         // The absolute expiry is captured NOW, at send time,
                         // so the foreign-kind re-queue can preserve the
-                        // envelope's original lease (FIX 2).
-                        expiry: now + state.envelope_ttl,
+                        // envelope's original lease (FIX 2). Full precision
+                        // (tag_now, not the floored `now`): the store stamps
+                        // the row's expiry from full-precision
+                        // SystemTime::now(), and a tag must never expire
+                        // strictly before its row.
+                        expiry: tag_now + state.envelope_ttl,
                     },
                 );
             }
@@ -682,10 +716,11 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
             }
             // Drop kind entries whose envelope has already expired so the map
             // does not grow without bound across polls (FIX 3, see
-            // prune_expired_kinds).
+            // prune_expired_kinds). Full-precision clock, like with like —
+            // see `tag_now`.
             {
                 let mut kinds = state.envelope_kinds.lock().await;
-                prune_expired_kinds(&mut kinds, now);
+                prune_expired_kinds(&mut kinds, tag_now());
             }
             // Deliver the oldest queued envelope whose out-of-band kind the
             // caller accepts (GRP-6). With no filter the oldest live envelope is
