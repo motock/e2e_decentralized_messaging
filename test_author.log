@@ -1,0 +1,6 @@
+PIPELINE_TRANSPORT_NUM_CTX is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_NUM_CTX instead.
+PIPELINE_TRANSPORT_TEMPERATURE is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_TEMPERATURE instead.
+PIPELINE_TRANSPORT_MAX_STEPS is set in the environment but is a transport-only value that backend.py overwrites on every dispatch - it has no effect as an input; set PIPELINE_LOCAL_MAX_STEPS instead.
+[boot] pid=36988 model=deepseek-v4.1-flash:cloud endpoint=http://localhost:11434 provider=ollama steps=120 timeout=8100.0s
+[step 0] LLM call failed: Client error '429 Too Many Requests' for url 'http://localhost:11434/api/chat'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/429
