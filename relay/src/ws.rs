@@ -467,21 +467,17 @@ fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
 ///
 /// Mirrors [`mailbox_send_error_response`] and RES-1's redaction rule: the
 /// `Io` class carries raw SQLite text (absolute database path, schema
-/// detail) that must never reach the peer, so it is logged server-side —
-/// with the recipient truncated — and the peer gets the fixed generic
-/// `StoreError` body. Exposed for tests: the fault is not reachable through
-/// the test listener, whose store opens in memory.
-pub fn mailbox_requeue_error_response(e: MailboxError) -> WsResponse {
-    match e {
-        MailboxError::Io(msg) => {
-            warn!("ws: store io error on envelope re-queue: {msg}");
-            WsResponse::err("StoreError")
-        }
-        // The re-queue only runs after a successful dequeue of a live
-        // envelope; QueueFull/NotFound/Expired are unreachable here, kept
-        // for exhaustiveness with the same generic form.
-        other => WsResponse::err(format!("StoreError: {other:?}")),
-    }
+/// detail) that must never reach the peer, so the peer gets the fixed
+/// generic `StoreError` body. The caller logs the detail server-side — with
+/// the recipient truncated, the only identifier shape allowed in a log —
+/// because the recipient is in scope at the call site, not here. Exposed
+/// for tests: the fault is not reachable through the test listener, whose
+/// store opens in memory.
+pub fn mailbox_requeue_error_response(_e: MailboxError) -> WsResponse {
+    // No warn! here: the call site owns the log line (it has the recipient
+    // for truncate_id), and this helper must stay signature-stable for the
+    // unit test that pins the generic body.
+    WsResponse::err("StoreError")
 }
 
 /// Map a [`StoreError`] from `prekeys.store` (publish_prekey) to a WS error response.
@@ -775,9 +771,16 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 // recorded expiry is dropped (tag removed) rather than
                 // re-queued. Only a TAGGED envelope can be foreign (untagged
                 // ones are accepted above), so `entry` is present here.
+                //
+                // `remaining` is measured against the tag's full-precision
+                // clock (tag_now), like with like: the floored `now` would
+                // overstate the remaining lease by up to a second, re-arming
+                // the row past its tag and reopening the misdelivery window
+                // on every poll.
+                let tag_now = tag_now();
                 let remaining = entry
                     .as_ref()
-                    .map(|e| e.expiry.saturating_sub(now))
+                    .map(|e| e.expiry.duration_since(tag_now).unwrap_or(Duration::ZERO))
                     .unwrap_or(Duration::ZERO);
                 scanned += 1;
                 if remaining.is_zero() {
@@ -787,16 +790,21 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                     }
                     continue;
                 }
-                if state
-                    .store
-                    .enqueue(&recipient_id, envelope_bytes.clone(), remaining)
-                    .is_err()
+                if let Err(err) =
+                    state
+                        .store
+                        .enqueue(&recipient_id, envelope_bytes.clone(), remaining)
                 {
                     // The generic body: never fold the store's Io detail (a
                     // SQLite string that can carry a filesystem path) into
-                    // the wire error. The helper logs the detail server-side
-                    // with the recipient truncated.
-                    return WsResponse::err("StoreError");
+                    // the wire error. The helper keeps the detail
+                    // server-side; the truncated warn here mirrors the Io
+                    // arm on the dequeue path above.
+                    warn!(
+                        recipient = %truncate_id(&recipient_id),
+                        "ws: store io error on envelope re-queue: {err:?}"
+                    );
+                    return mailbox_requeue_error_response(err);
                 }
                 if scanned > MAX_PICKUP_SCAN {
                     break; // every live envelope is foreign to this caller
