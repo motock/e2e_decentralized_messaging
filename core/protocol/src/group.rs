@@ -153,11 +153,21 @@ pub struct GroupSession {
 
 impl GroupSession {
     /// Create a new group session with the given sender's public identity key.
-    pub fn new(sender_pub: PublicIdentityKey) -> Self {
-        // Derive an initial chain key from the sender's public key using HKDF with empty salt.
-        let hk = Hkdf::<Sha256>::new(None, &sender_pub.to_bytes());
+    ///
+    /// The initial chain key is a fresh CSPRNG secret, NOT a derivation of
+    /// `sender_pub`. The sender's public key is, by definition, known to every
+    /// observer of the wire, so a chain key derived from it is recomputable by
+    /// any passive observer: they could ratchet it forward exactly like
+    /// [`encrypt_as`](Self::encrypt_as) does and rederive every per-message
+    /// payload key without holding any private key, reducing the per-member
+    /// key sealing to theater. A CSPRNG seed makes the chain key an actual
+    /// secret that exists only inside this session (and in [`Self::to_bytes`]
+    /// output, which callers MUST encrypt at rest — see that method's docs).
+    pub fn new(_sender_pub: PublicIdentityKey) -> Self {
         let mut ck = [0u8; 32];
-        hk.expand(b"chain", &mut ck).expect("hkdf expand chain");
+        OsRng
+            .try_fill_bytes(&mut ck)
+            .expect("OS CSPRNG must be available");
         Self {
             members: Vec::new(),
             chain_key: Cell::new(ck),
@@ -390,9 +400,9 @@ impl GroupSession {
 
     /// Encrypt plaintext as the sender. Returns ciphertext bytes.
     ///
-    /// `_sender` is not read: the chain key already commits to the sender's identity (derived
-    /// in [`GroupSession::new`] from their public key), so there is nothing further to check
-    /// here — the parameter exists to make the call site's intent explicit.
+    /// `_sender` is not read: the per-message key is sealed to every member's identity key, so
+    /// membership in the group is what grants decryption — there is nothing further to check
+    /// here. The parameter exists to make the call site's intent explicit.
     ///
     /// Ratchets the session's chain key forward before returning (see the module-level
     /// "Chain-key ratchet" doc), so every message — even repeated calls with identical
@@ -690,6 +700,32 @@ mod tests {
                 "treating the sealed blob's leading bytes as the AES key must not decrypt"
             );
         }
+
+        // THE attack that motivated the secret-seed fix: the sender's public key is public
+        // information (it is on the wire in the wrapper, and members publish it anyway), so a
+        // chain key derived from it is recomputable by anyone. An attacker who replays the
+        // exact derivation GroupSession::new used to perform — HKDF-Extract(salt=None,
+        // IKM=sender_pub) then Expand(b"chain"), followed by encrypt_as's own ratchet labels —
+        // must NOT recover a key that decrypts the payload. This is what a passive observer
+        // would try first, and it is exactly what the old public-seed derivation handed them.
+        let attacker_hk = Hkdf::<Sha256>::new(None, &sender.public().to_bytes());
+        let mut attacker_chain_key = [0u8; 32];
+        attacker_hk
+            .expand(b"chain", &mut attacker_chain_key)
+            .unwrap();
+        let attacker_hk2 = Hkdf::<Sha256>::new(None, &attacker_chain_key);
+        let mut attacker_msg_key = [0u8; 32];
+        attacker_hk2.expand(b"msg", &mut attacker_msg_key).unwrap();
+        let cipher_from_public_key = Aes256Gcm::new_from_slice(&attacker_msg_key)
+            .expect("32 bytes is a valid AES-256 key length");
+        assert!(
+            cipher_from_public_key
+                .decrypt(Nonce::from_slice(nonce_bytes), payload)
+                .is_err(),
+            "a chain key derived from the sender's PUBLIC key must not decrypt the payload — \
+             if this fails, the initial chain key is derivable from public information and the \
+             per-member sealing is theater"
+        );
     }
 
     #[test]
