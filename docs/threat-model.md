@@ -185,9 +185,7 @@ compromised by an attacker who gains full read/write access to its storage and l
   or reorder envelopes (availability/integrity-of-delivery attack, not confidentiality); 
   refuse service entirely (DoS against users who depend on that relay).
 - **Mitigation already in design**: relays are swappable (§ Locked decisions in `PLAN.md`) —
-  a single malicious relay cannot prevent delivery if the client retries via another relay or
-  direct P2P. Sealed Sender bounds what a compromised relay learns about the sender. Short
-  Wall‑clock TTL enforcement bounds how long a compromised relay can retain undelivered envelopes.
+  a single malicious relay cannot prevent delivery if the client retries via another relay or direct P2P. Sealed Sender bounds what a compromised relay learns about the sender. Wall‑clock TTL enforcement bounds how long a compromised relay can retain undelivered envelopes.
 - **Residual risk / open item**: a relay that is the *only* one a recipient is reachable
   through can still mount a targeted denial-of-service or timing-correlation attack; relay
   diversity is a deployment-level mitigation, not a protocol guarantee, and should be called
