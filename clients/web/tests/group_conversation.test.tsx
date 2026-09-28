@@ -129,7 +129,7 @@ describe('GroupConversation', () => {
     });
 
     test('a removed member cannot decrypt a message sent after their removal', async () => {
-        render(<GroupConversation />);
+        render(<GroupConversation identity={selfIdentity} selfRecipientId={selfRecipientId} transport={noopTransport} />);
 
         fireEvent.click(await screen.findByTestId('create-group-button'));
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
