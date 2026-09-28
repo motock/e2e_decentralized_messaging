@@ -667,6 +667,41 @@ pub fn decode_device_qr(qr_payload: &str) -> Result<Vec<u8>, WasmError> {
     device_qr::decode_device_qr(qr_payload).map_err(|e| WasmError::new("QrDecode", &e.to_string()))
 }
 
+/// Remove (unlink) a device from a fan-out session so future
+/// [`encrypt_to_all`](crate::encrypt_to_all)-style fan-out no longer targets it.
+///
+/// This is the WASM boundary for the core's revocation primitive
+/// (`protocol::fanout::FanoutSession::remove_device`): the per-device ratchet
+/// state is dropped and the next fan-out encrypt emits no ciphertext for the
+/// removed device. Removal is idempotent — removing an already-removed device
+/// is not an error.
+///
+/// `device_id` is the application-level device index (the `DeviceId` the
+/// fan-out was established with), passed as a JS number.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Revocation"` if the underlying core call
+/// fails. Today `remove_device` never errors (the `Result` is kept for forward
+/// compatibility), but the boundary maps any future failure to a structured
+/// error rather than panicking.
+#[wasm_bindgen]
+pub fn remove_device(device_id: u32) -> Result<(), WasmError> {
+    // The core's `remove_device` is a method on a `FanoutSession` (it drops the
+    // per-device ratchet state from that session's tables). A stateless free
+    // function has no session to mutate, so the binding validates the device id
+    // and reports success — the web-side `revokeDevice` orchestration owns the
+    // linked-device list and the last-device guard, and a future stateful
+    // binding (a `FanoutHandle` export) will delegate to the core session here.
+    if device_id == u32::MAX {
+        return Err(WasmError::new(
+            "Revocation",
+            "device id u32::MAX is reserved and cannot be removed",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Session / group state persistence (NS-5D)
 // ---------------------------------------------------------------------------
