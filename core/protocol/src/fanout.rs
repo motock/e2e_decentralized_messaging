@@ -30,6 +30,11 @@
 //!   that device; the recipient device's own ratchet state on its own device is
 //!   unaffected. Future messages from the sender simply stop targeting it. This is the
 //!   behaviour PLAN.md §4 ("Multi-device") requires for device revocation.
+//! - **Revocation is verifiable.** Alongside the local drop, `apply_revocation` accepts a
+//!   `SignedRevocation` — a primary-signed, monotonically versioned device-list update
+//!   (spec/v0.md §8) — and acts on it only after verifying the signature against the
+//!   account primary's public identity key. The local shortcut and the verifiable path
+//!   coexist; neither replaces the other.
 //! - **No cross-device key reuse.** A device's identity is used exactly as the
 //!   `DoubleRatchetSession` facade expects: as the bundle signatory on the receive side
 //!   and as the addressable peer on the send side. There is no shared symmetric key
@@ -38,6 +43,7 @@
 use std::collections::BTreeMap;
 
 use libsignal_protocol::IdentityKeyPair;
+use rand::TryRngCore;
 use thiserror::Error;
 
 use crypto::{DoubleRatchetSession, IdentityKeyPairExt};
@@ -153,6 +159,185 @@ pub enum FanoutError {
     DeviceMismatch { claimed: DeviceId, actual: DeviceId },
 }
 
+/// Errors the verifiable revocation path can surface to its caller.
+///
+/// Distinct from [`FanoutError`]: the verifiable path is an additive layer over the
+/// fan-out, not a reshaping of it, so its failure modes get their own enum. Per the
+/// project's Secure by Design standard, callers relaying these across a network trust
+/// boundary must not forward the `Display` text verbatim — return a generic reason to
+/// the peer and log the full detail locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RevocationError {
+    /// The underlying `libsignal` signing call failed while producing a
+    /// `SignedRevocation`. Unreachable in practice for the Curve25519 keys this
+    /// workspace generates, but propagated rather than panicking.
+    #[error("revocation signing failed")]
+    SigningFailed,
+    /// The bytes were not a parseable signed revocation — wrong length, truncated, or
+    /// an unrecognized layout. Fails closed: nothing is partially applied.
+    #[error("malformed signed revocation")]
+    Malformed,
+    /// The revocation was not signed by the account primary's identity key. A device
+    /// (or any other party) cannot revoke itself or a sibling device.
+    #[error("revocation not signed by the account primary")]
+    NotEntitled,
+    /// The offered device-list version is not strictly newer than the version already
+    /// held. The device list is monotonically versioned (spec/v0.md §8.3), so an equal
+    /// version is a replay and an older one is stale; both are rejected.
+    #[error("stale device-list version: holding {held}, offered {offered}")]
+    StaleVersion { held: u64, offered: u64 },
+    /// The revocation names a device this fan-out has never linked. Rejecting it keeps
+    /// the device list and the fan-out's session table consistent.
+    #[error("revocation names device {0}, which is not linked in this fan-out")]
+    UnknownDevice(DeviceId),
+    /// The named device is already revoked. Re-revoking is a no-op at best and a
+    /// version-bumping replay at worst, so it is rejected instead of silently accepted.
+    #[error("device {0} is already revoked")]
+    AlreadyRevoked(DeviceId),
+}
+
+/// A primary-signed, monotonically versioned device revocation (spec/v0.md §8).
+///
+/// This is the *verifiable* half of the revocation contract: a signed fact about the
+/// account's device list that any peer can check against the account primary's public
+/// identity key before acting on it, rather than a sender-side decision nobody else can
+/// audit. The signature covers a domain-separated encoding of the revoked device id and
+/// the device-list version, so a revocation cannot be transplanted onto another device
+/// or replayed at a stale version and still verify.
+///
+/// The signing primitive is `libsignal`'s own Curve25519 signature
+/// (`PrivateKey::calculate_signature_for_multipart_message` /
+/// `PublicKey::verify_signature`) — the same audited Ed25519-over-Curve25519 primitive
+/// that underlies the device-linking signatures in `crypto` — reused unmodified rather
+/// than inventing a second scheme ("don't reinvent crypto").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedRevocation {
+    device: DeviceId,
+    version: u64,
+    signature: Box<[u8]>,
+}
+
+/// Domain-separation prefix for revocation signatures. Distinct from the device-linking
+/// prefix inside `libsignal`'s alternate-identity primitive so a signature over one
+/// message type can never verify as the other.
+const REVOCATION_CONTEXT: &[u8] = b"DR-2 device revocation v1";
+
+/// Canonical bytes a revocation signature commits to: context || device id || version.
+fn revocation_payload(device: DeviceId, version: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(REVOCATION_CONTEXT.len() + 12);
+    payload.extend_from_slice(REVOCATION_CONTEXT);
+    payload.extend_from_slice(&device.0.to_be_bytes());
+    payload.extend_from_slice(&version.to_be_bytes());
+    payload
+}
+
+impl SignedRevocation {
+    /// Sign a revocation of `device` at device-list `version` with the account
+    /// primary's identity key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevocationError::SigningFailed`] if the underlying `libsignal` signing
+    /// call fails (unreachable in practice for this workspace's Curve25519 keys, but
+    /// propagated rather than panicking).
+    pub fn sign(
+        primary: &IdentityKeyPair,
+        device: DeviceId,
+        version: u64,
+    ) -> Result<Self, RevocationError> {
+        let payload = revocation_payload(device, version);
+        let signature = primary
+            .private_key()
+            .calculate_signature_for_multipart_message(&[&payload], &mut rand::rngs::OsRng.unwrap_err())
+            .map_err(|_| RevocationError::SigningFailed)?;
+        Ok(Self {
+            device,
+            version,
+            signature: signature.into(),
+        })
+    }
+
+    /// The device this revocation removes from the account's device list.
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// The device-list version this revocation carries. Must be strictly greater than
+    /// the version a peer already holds for the update to be accepted.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Serialize for transport. The layout is self-delimiting: a 1-byte version tag, the
+    /// 4-byte device id, the 8-byte device-list version, then the signature length and
+    /// signature bytes, so `from_bytes` can reject truncated input as
+    /// [`RevocationError::Malformed`] instead of mis-parsing it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 4 + 8 + 4 + self.signature.len());
+        out.push(0x01); // layout version
+        out.extend_from_slice(&self.device.0.to_be_bytes());
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&(self.signature.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Parse bytes produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevocationError::Malformed`] for empty, truncated, or unrecognized
+    /// input. Parsing never verifies; call [`verify`](Self::verify) before acting.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RevocationError> {
+        if bytes.len() < 1 + 4 + 8 + 4 {
+            return Err(RevocationError::Malformed);
+        }
+        if bytes[0] != 0x01 {
+            return Err(RevocationError::Malformed);
+        }
+        let device = DeviceId(u32::from_be_bytes([
+            bytes[1], bytes[2], bytes[3], bytes[4],
+        ]));
+        let version = u64::from_be_bytes([
+            bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+        ]);
+        let sig_len = u32::from_be_bytes([bytes[13], bytes[14], bytes[15], bytes[16]]) as usize;
+        let sig_start = 17;
+        if bytes.len() != sig_start + sig_len || sig_len == 0 {
+            return Err(RevocationError::Malformed);
+        }
+        Ok(Self {
+            device,
+            version,
+            signature: bytes[sig_start..].to_vec().into_boxed_slice(),
+        })
+    }
+
+    /// Verify the signature against the account primary's public identity key.
+    ///
+    /// Fails closed: any malformed or mismatched signature is
+    /// [`RevocationError::NotEntitled`] rather than an exception, so a verification
+    /// failure can never be mistaken for a verified revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RevocationError::NotEntitled`] unless `primary` produced this exact
+    /// revocation.
+    pub fn verify(&self, primary: &libsignal_protocol::IdentityKey) -> Result<(), RevocationError> {
+        let payload = revocation_payload(self.device, self.version);
+        // Fails closed: a wrong-length signature is `false`, not an exception, so a
+        // verification failure can never be mistaken for a verified revocation.
+        let ok = primary
+            .public_key()
+            .verify_signature(&payload, &self.signature);
+        if ok {
+            Ok(())
+        } else {
+            Err(RevocationError::NotEntitled)
+        }
+    }
+}
+
 /// Per-device session fan-out for 1:1 messaging.
 ///
 /// A `FanoutSession` owns one outbound `DoubleRatchetSession` per linked device, all
@@ -184,6 +369,15 @@ pub struct FanoutSession {
     /// store is per-party: the sender's outbound ratchet state cannot double as the
     /// recipient's inbound ratchet state.
     receiver_sessions: BTreeMap<DeviceId, DoubleRatchetSession>,
+    /// Devices revoked via the *verifiable* path (`apply_revocation`), with the
+    /// device-list version that revoked them. Kept separate from the local
+    /// `remove_device` shortcut so the two mechanisms stay independently auditable:
+    /// `remove_device` is a sender-side drop with no signature, while a device here was
+    /// removed on the strength of a primary-signed, version-checked revocation.
+    revoked_devices: BTreeMap<DeviceId, u64>,
+    /// The highest device-list version this fan-out has accepted. Monotonically
+    /// non-decreasing (spec/v0.md §8.3); starts at 0 before any revocation is applied.
+    revocation_version: u64,
 }
 
 impl FanoutSession {
@@ -260,6 +454,8 @@ impl FanoutSession {
             sender_sessions,
             identity_to_device,
             receiver_sessions,
+            revoked_devices: BTreeMap::new(),
+            revocation_version: 0,
         })
     }
 
@@ -369,6 +565,88 @@ impl FanoutSession {
         // public API does not support.
         self.identity_to_device.retain(|_, d| *d != device_id);
         Ok(())
+    }
+
+    /// Apply a *verifiable* device revocation: verify the primary's signature, check the
+    /// device-list version is strictly newer, then revoke the named device.
+    ///
+    /// This is the additive counterpart to [`remove_device`](Self::remove_device).
+    /// `remove_device` is the local sender-side shortcut — no signature, no version, no
+    /// effect on any other party's view of the device list. `apply_revocation` is the
+    /// path spec/v0.md §8 requires for a revocation a peer *observes*: the update is
+    /// acted on only after the signature verifies against the account primary's public
+    /// identity key and the version advances monotonically. Both paths end in the same
+    /// state — the device's ratchet state is dropped and the next
+    /// [`encrypt_to_all`](Self::encrypt_to_all) no longer targets it — and both coexist.
+    ///
+    /// The checks run in a fixed order and all of them fail closed, before any state
+    /// changes: signature ([`RevocationError::NotEntitled`]), version
+    /// ([`RevocationError::StaleVersion`]), device linked
+    /// ([`RevocationError::UnknownDevice`]), device not already revoked
+    /// ([`RevocationError::AlreadyRevoked`]). A rejected update leaves the version and
+    /// the revoked set untouched.
+    ///
+    /// # Errors
+    ///
+    /// See above; on any error nothing is applied.
+    pub fn apply_revocation(
+        &mut self,
+        revocation: &SignedRevocation,
+        primary: &libsignal_protocol::IdentityKey,
+    ) -> Result<(), RevocationError> {
+        // 1. Entitlement: only the account primary may revoke. This check is first so a
+        //    forged update is rejected before any of its contents are considered.
+        revocation.verify(primary)?;
+
+        // 2. Monotonic version (§8.3): an equal version is a replay, an older one is
+        //    stale; both must be rejected without advancing the held version.
+        let offered = revocation.version();
+        let held = self.revocation_version;
+        if offered <= held {
+            return Err(RevocationError::StaleVersion { held, offered });
+        }
+
+        // 3. Re-revoking an already-revoked device is rejected rather than silently
+        //    accepted: the only legitimate way to name a revoked device again is a
+        //    *newer* device-list update that re-links it under a fresh identity key
+        //    (§8.4), which arrives as a new device, not a re-revocation. This check
+        //    precedes the linked-device check because a revoked device has already had
+        //    its session state dropped — it is no longer linked, but it is still *known*
+        //    to the device list, and "already revoked" is the accurate rejection.
+        let device = revocation.device();
+        if self.revoked_devices.contains_key(&device) {
+            return Err(RevocationError::AlreadyRevoked(device));
+        }
+
+        // 4. The named device must actually be linked in this fan-out. Revoking a device
+        //    the fan-out never knew about would desynchronize the signed device list
+        //    from the session table.
+        if !self.sender_sessions.contains_key(&device) {
+            return Err(RevocationError::UnknownDevice(device));
+        }
+
+        // All checks passed: apply. The ratchet-state drop is exactly what
+        // `remove_device` does — the verifiable path adds the signature and version
+        // checks, it does not change what revocation means locally.
+        self.sender_sessions.remove(&device);
+        self.receiver_sessions.remove(&device);
+        self.identity_to_device.retain(|_, d| *d != device);
+        self.revoked_devices.insert(device, offered);
+        self.revocation_version = offered;
+        Ok(())
+    }
+
+    /// The highest device-list version this fan-out has accepted (0 before any
+    /// revocation). Monotonically non-decreasing; rejected updates never advance it.
+    pub fn revocation_version(&self) -> u64 {
+        self.revocation_version
+    }
+
+    /// Whether `device` has been revoked via the verifiable path. A device dropped only
+    /// through the local [`remove_device`](Self::remove_device) shortcut is *removed*,
+    /// not revoked — it is no longer linked, so it cannot be revoked either.
+    pub fn is_revoked(&self, device: DeviceId) -> bool {
+        self.revoked_devices.contains_key(&device)
     }
 }
 
