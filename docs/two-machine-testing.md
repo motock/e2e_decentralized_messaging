@@ -65,6 +65,21 @@ on first visit, and publishes a prekey bundle to the relay (see step 2).
 > independent identities, just like two separate machines. See
 > [Same-machine approximation](#same-machine-approximation).
 
+### Revoking a linked device
+
+The **Link** tab also lists the devices currently linked to the account
+(**Linked devices**). To unlink one:
+
+1. Click **Revoke** on the device's row (labelled `Revoke device <id>`).
+2. Confirm with **Confirm revoke** — nothing is removed until you confirm;
+   **Keep device** cancels.
+3. Revoking the **last remaining device** warns that it is your only linked
+   device; the confirmation acknowledges that lock-out risk explicitly.
+4. A successful revocation removes the device from the list and it stops
+   receiving messages. An unknown device id or a failed revocation is
+   reported as an error in the revocation status line — it is never shown
+   as success.
+
 ---
 
 ## 2. Self-host the relay with `--ws-listen`

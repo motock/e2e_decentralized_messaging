@@ -66,4 +66,10 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
    localIdentityKey: Uint8Array,
    remoteIdentityKey: Uint8Array,
  ): string;
+
+ // Device revocation / unlinking (DR-3): drop a linked device so future
+ // fan-out encryption no longer targets it. `deviceId` is the fan-out
+ // `DeviceId` index. Idempotent — removing an already-removed device is not
+ // an error. Throws a WasmError (kind "Revocation") on failure.
+ export function remove_device(deviceId: number): void;
 }

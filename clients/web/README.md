@@ -77,6 +77,27 @@ URLs. No relay URL is baked into the prebuilt artifact, so the same zip works
 against any relay; see "Configuring the relay endpoint" below for the full
 resolution order.
 
+## Device linking and revocation
+
+The **Link** tab links a new device to this account via a QR code with a
+safety-number confirmation gate (see `src/device_linking.ts`):
+
+1. The new device displays its QR code (or you enter its linking code manually).
+2. Both devices show a safety number; you confirm it out-of-band.
+3. On match the link proceeds and the device appears under **Linked devices**.
+
+Devices can be removed again from the same **Linked devices** section:
+
+- Each linked device has a **Revoke** control (labelled `Revoke device <id>`).
+- Revoking requires an explicit **Confirm revoke** step — nothing is removed
+  until you confirm, and **Keep device** cancels.
+- Revoking the **last remaining device** additionally warns that it is your
+  only linked device; the confirmation is the explicit acknowledgement of that
+  lock-out risk.
+- The outcome is reported honestly: a successful revocation removes the device
+  from the list (it can no longer receive messages), while an unknown device or
+  a failed revocation is reported as an error and never shown as success.
+
 ## Security Headers for Production Hosting
 
 When deploying the static bundle to a web server or CDN, add the following security headers (the exact syntax depends on your host):
