@@ -5,7 +5,9 @@
 //! resolution. The acceptance criteria this module exists to satisfy: no finding may sit
 //! untriaged, no critical/high-severity finding may ship in an `Open` or `Untriaged` state, and
 //! any finding the team deliberately decides not to fix (`WontFix`) must carry a documented risk
-//! acceptance rather than a silent shrug.
+//! acceptance rather than a silent shrug. A finding closed out by a later change records that
+//! change in [`Finding::resolution`] (e.g. `"resolved-by-GRP-1"`) so the ledger names *what*
+//! closed it rather than only that it is closed.
 //!
 //! The findings below are drawn from this project's own internal security reviews (the
 //! code-reviewer and security-engineer passes already run against the sender-keys group
@@ -36,6 +38,10 @@ pub enum Status {
     Triaged,
     /// A fix has landed and been verified.
     Fixed,
+    /// The finding is closed out, and [`Finding::resolution`] names the change that closed it
+    /// (e.g. a later story that fixed the true root cause). Distinct from [`Status::Fixed`] so
+    /// the ledger records *what* closed it, not only that it is closed.
+    Resolved,
     /// The team has decided not to fix this, with an explicit, documented reason
     /// (`Finding::risk_acceptance`).
     WontFix,
@@ -55,6 +61,10 @@ pub struct Finding {
     /// other status (there is nothing to justify about a finding still being worked or already
     /// fixed).
     pub risk_acceptance: String,
+    /// How the finding was closed out, when a later change is what closed it: `None` for findings
+    /// whose status already records their outcome, `Some("...")` to name the change that resolved
+    /// it (e.g. `Some("resolved-by-GRP-1")`).
+    pub resolution: Option<String>,
 }
 
 /// The tracked set of external (and internally-surfaced) security audit findings for this
@@ -68,9 +78,13 @@ pub fn load_findings() -> Vec<Finding> {
             description: "GroupSession::encrypt_as embedded the raw sender-key chain key in \
                 plaintext inside every member's wire-format wrapper, so any passive observer of \
                 the ciphertext bytes — not just group members — could read a wrapper's chain key \
-                directly, rederive the AES key, and decrypt without holding any private key."
+                directly, rederive the AES key, and decrypt without holding any private key. \
+                (This fix stopped the raw chain key appearing on the wire, but was later found \
+                incomplete: the per-message key was still a deterministic function of the \
+                sender's public key. See GRP-1-standin.)"
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-002".to_string(),
@@ -82,6 +96,7 @@ pub fn load_findings() -> Vec<Finding> {
                 break (plaintext XOR recovery and GHASH-subkey-recovery-enabled forgery)."
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-003".to_string(),
@@ -94,6 +109,7 @@ pub fn load_findings() -> Vec<Finding> {
                 boundary."
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-004".to_string(),
@@ -105,6 +121,7 @@ pub fn load_findings() -> Vec<Finding> {
                 ratchet their captured chain key forward and decrypt every subsequent message."
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-005".to_string(),
@@ -123,6 +140,7 @@ pub fn load_findings() -> Vec<Finding> {
                 judged low-impact; revisit if a future refactor removes the test-oracle \
                 constraint."
                 .to_string(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-006".to_string(),
@@ -133,6 +151,7 @@ pub fn load_findings() -> Vec<Finding> {
                 members instead of raising a validation error."
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
         },
         Finding {
             id: "AUDIT-007".to_string(),
@@ -145,6 +164,26 @@ pub fn load_findings() -> Vec<Finding> {
                 review-gate infrastructure that could have let unreviewed changes reach main."
                 .to_string(),
             risk_acceptance: String::new(),
+            resolution: None,
+        },
+        Finding {
+            id: "GRP-1-standin".to_string(),
+            severity: Severity::Critical,
+            status: Status::Resolved,
+            description: "AUDIT-001's fix was incomplete. GroupSession::new seeded the chain key \
+                from the sender's PUBLIC identity key alone (HKDF::new(None, \
+                &sender_pub.to_bytes()).expand(b\"chain\")), and encrypt_as derived the \
+                per-message AES-256-GCM key and nonce from that chain while never using its \
+                `_sender: &IdentityKeyPair` argument. The payload key was therefore a \
+                deterministic function of public data, so any passive observer who knew the \
+                sender's public key — which is the recipient ID and is also carried in the \
+                ciphertext's own wrapper roster — could rederive the key and decrypt. Sealing \
+                the per-message key to each member's identity key did not close this, because \
+                the sealed value was itself publicly derivable. GRP-1 fixed the root cause by \
+                deriving the chain key from a secret rather than the sender's public key."
+                .to_string(),
+            risk_acceptance: String::new(),
+            resolution: Some("resolved-by-GRP-1".to_string()),
         },
     ]
 }
