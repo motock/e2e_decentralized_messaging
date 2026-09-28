@@ -236,3 +236,73 @@ fn persistence_constructor_is_registered_and_the_store_stays_blind() {
         );
     }
 }
+
+// ── hostile: valid magic, out-of-range expiry/count must fail closed ─────────
+
+/// Hand-build a persisted file with valid magic/version and a hostile body.
+fn hostile_file(tag: &str, count: u32, body: &[u8]) -> PathBuf {
+    let path = temp_path(tag);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RDST");
+    bytes.push(1); // STORE_FORMAT_VERSION
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.extend_from_slice(body);
+    std::fs::write(&path, bytes).expect("write hostile file");
+    path
+}
+
+#[test]
+fn valid_magic_with_hostile_expiry_fails_closed_without_panicking() {
+    // A file with valid magic/version but an expiry that cannot exist as a
+    // SystemTime must fail closed at open(), not panic during listener startup.
+    for (tag, secs, nanos) in [
+        ("secs-overflow", u64::MAX, 0u32),
+        ("nanos-overflow", 1, 2_000_000_000), // nanos >= 1s: Duration::new would panic
+        ("both", u64::MAX, u32::MAX),
+    ] {
+        let mut body = Vec::new();
+        body.extend_from_slice(&("recipient-id".len() as u32).to_be_bytes());
+        body.extend_from_slice(b"recipient-id");
+        body.extend_from_slice(&secs.to_be_bytes());
+        body.extend_from_slice(&nanos.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes()); // value_len
+        body.push(0x11);
+
+        let path = hostile_file(&format!("expiry-{tag}"), 1, &body);
+        if let Ok(store) = RelayStore::open(&path) {
+            assert_eq!(
+                store.count(),
+                0,
+                "{tag}: an out-of-range expiry must fail closed, not serve garbage"
+            );
+            assert_eq!(store.pickup("recipient-id"), Err(StoreError::NotFound));
+        }
+        if let Ok(mb) = Mailbox::open(&path, 8) {
+            assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
+        }
+    }
+}
+
+#[test]
+fn valid_magic_with_hostile_count_and_depth_fails_closed_without_aborting() {
+    // count = u32::MAX with no entries: trusting it for pre-allocation would
+    // attempt ~4 billion buckets and abort the process.
+    let path = hostile_file("count-u32-max", u32::MAX, &[]);
+    if let Ok(store) = RelayStore::open(&path) {
+        assert_eq!(store.count(), 0, "a hostile count must not serve garbage");
+        assert_eq!(store.pickup("recipient-id"), Err(StoreError::NotFound));
+    }
+    if let Ok(mb) = Mailbox::open(&path, 8) {
+        assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
+    }
+
+    // depth = u32::MAX with no entries: same allocation-abort vector for the FIFO.
+    let mut body = Vec::new();
+    body.extend_from_slice(&("recipient-id".len() as u32).to_be_bytes());
+    body.extend_from_slice(b"recipient-id");
+    body.extend_from_slice(&u32::MAX.to_be_bytes()); // depth
+    let path = hostile_file("depth-u32-max", 1, &body);
+    if let Ok(mb) = Mailbox::open(&path, 8) {
+        assert_eq!(mb.dequeue("recipient-id"), Err(MailboxError::NotFound));
+    }
+}

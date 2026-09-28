@@ -65,7 +65,10 @@ fn decode_map(bytes: &[u8]) -> Option<HashMap<String, (Vec<u8>, SystemTime)>> {
     }
     let mut rest = &bytes[5..];
     let count = read_u32(&mut rest)? as usize;
-    let mut map = HashMap::with_capacity(count);
+    // `count` is file-controlled: a hostile count (up to u32::MAX) must not
+    // drive a huge pre-allocation. Reserve nothing and let the map grow as
+    // entries are actually decoded; a truncated file fails closed below.
+    let mut map = HashMap::new();
     for _ in 0..count {
         let key_len = read_u32(&mut rest)? as usize;
         if rest.len() < key_len {
@@ -74,8 +77,8 @@ fn decode_map(bytes: &[u8]) -> Option<HashMap<String, (Vec<u8>, SystemTime)>> {
         let key = String::from_utf8(rest[..key_len].to_vec()).ok()?;
         rest = &rest[key_len..];
         let expiry_secs = read_u64(&mut rest)?;
-        let expiry_nanos = read_u32(&mut rest)? as u64;
-        let expiry = SystemTime::UNIX_EPOCH + Duration::new(expiry_secs, expiry_nanos as u32);
+        let expiry_nanos = read_u32(&mut rest)?;
+        let expiry = expiry_from_parts(expiry_secs, expiry_nanos)?;
         let value_len = read_u32(&mut rest)? as usize;
         if rest.len() < value_len {
             return None;
@@ -108,6 +111,21 @@ fn read_u64(bytes: &mut &[u8]) -> Option<u64> {
     buf.copy_from_slice(&bytes[..8]);
     *bytes = &bytes[8..];
     Some(u64::from_be_bytes(buf))
+}
+
+/// Build a `SystemTime` from raw persisted seconds/nanos, rejecting values that
+/// cannot exist.
+///
+/// A hostile file can carry any u64/u32 pair. `Duration::new` panics when the
+/// nanos exceed one second, and `SystemTime + Duration` panics on overflow, so
+/// both are checked here and a malformed expiry fails closed (`None`) instead of
+/// panicking at `open()` during listener startup.
+fn expiry_from_parts(secs: u64, nanos: u32) -> Option<SystemTime> {
+    if nanos >= 1_000_000_000 {
+        return None;
+    }
+    let duration = Duration::new(secs, nanos);
+    SystemTime::UNIX_EPOCH.checked_add(duration)
 }
 
 /// Encode a map into the persisted format (see [`decode_map`]).
@@ -328,11 +346,7 @@ impl Mailbox {
     /// corrupt or truncated file fails closed: the mailbox starts empty rather
     /// than serving garbage, and never panics.
     pub fn open(path: &Path, max_depth: usize) -> Result<Self, StoreError> {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(_) => Vec::new(),
-        };
-        let queues = decode_queues(&bytes).unwrap_or_default();
+        let queues = load_queues(path);
         Ok(Self {
             max_depth,
             queues: Arc::new(Mutex::new(queues)),
@@ -436,7 +450,8 @@ fn decode_queues(bytes: &[u8]) -> Option<HashMap<String, Queue>> {
     }
     let mut rest = &bytes[5..];
     let count = read_u32(&mut rest)? as usize;
-    let mut queues: HashMap<String, Queue> = HashMap::with_capacity(count);
+    // File-controlled count: never pre-allocate from it (see `decode_map`).
+    let mut queues: HashMap<String, Queue> = HashMap::new();
     for _ in 0..count {
         let key_len = read_u32(&mut rest)? as usize;
         if rest.len() < key_len {
@@ -445,7 +460,8 @@ fn decode_queues(bytes: &[u8]) -> Option<HashMap<String, Queue>> {
         let key = String::from_utf8(rest[..key_len].to_vec()).ok()?;
         rest = &rest[key_len..];
         let depth = read_u32(&mut rest)? as usize;
-        let mut queue = Queue::with_capacity(depth);
+        // File-controlled depth: never pre-allocate from it (see `decode_map`).
+        let mut queue = Queue::new();
         for _ in 0..depth {
             let value_len = read_u32(&mut rest)? as usize;
             if rest.len() < value_len {
@@ -454,8 +470,8 @@ fn decode_queues(bytes: &[u8]) -> Option<HashMap<String, Queue>> {
             let value = rest[..value_len].to_vec();
             rest = &rest[value_len..];
             let expiry_secs = read_u64(&mut rest)?;
-            let expiry_nanos = read_u32(&mut rest)? as u32;
-            let expiry = SystemTime::UNIX_EPOCH + Duration::new(expiry_secs, expiry_nanos);
+            let expiry_nanos = read_u32(&mut rest)?;
+            let expiry = expiry_from_parts(expiry_secs, expiry_nanos)?;
             queue.push_back((value, expiry));
         }
         queues.insert(key, queue);
