@@ -308,3 +308,8 @@ this story and `CLAUDE.md`'s mandatory security review for changes touching cryp
 identity, transport, or key storage design.
 
 - [ ] Security-engineer review completed
+
+| Reviewer | Date | Comments |
+|---|---|---|
+| | | |
+
