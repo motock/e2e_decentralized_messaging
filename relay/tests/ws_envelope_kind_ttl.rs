@@ -245,15 +245,91 @@ async fn kind_map_entries_are_pruned_after_expiry() {
 /// FIX 5: the re-queue site's store failure must return the GENERIC wire body
 /// `StoreError` — never the `MailboxError::Io` detail (rusqlite's error text
 /// embeds the store's absolute path). Mirrors RES-1's
-/// `mailbox_send_error_response` shape; the helper is unit-tested here
-/// because the fault is not reachable through the test listener (its store
-/// opens in memory).
-#[test]
-fn requeue_store_error_response_is_generic_and_leak_free() {
-    use relay::store::MailboxError;
-    let resp = ws::mailbox_requeue_error_response(MailboxError::Io(
-        "sqlite /tmp/relay-with-a-very-obvious-absolute-path.db: disk I/O error".to_string(),
+/// `mailbox_send_error_response` shape.
+///
+/// This drives the PRODUCTION call site, not the helper: a foreign-kind
+/// pickup re-queues through `handle_request`. The fault is injected with a
+/// SQLite trigger on the file-backed mailbox's `envelopes` table, created
+/// AFTER the initial enqueue so only the re-queue's insert is affected; the
+/// trigger aborts that insert with `RAISE(ABORT, 'injected re-queue
+/// failure')`, which surfaces as `MailboxError::Io` at the re-queue site.
+/// The wire body must stay generic while the fault is provably the injected
+/// one (the tag is gone and the row was not re-queued).
+#[tokio::test]
+async fn requeue_store_error_response_is_generic_and_leak_free() {
+    use relay::store::Mailbox;
+    use relay::ws::{WsRequest, WsState};
+    use std::sync::Arc;
+    // Production TTL: this test faults the re-queue enqueue, it does not
+    // exercise expiry.
+    const DEFAULT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+    // A file-backed mailbox whose `envelopes` table is dropped out from under
+    // the open handle after the envelope is queued: the dequeue arm then
+    // fails too, so instead the fault is an INSERT-only trigger that fires
+    // ONLY on the re-queue's `enqueue` — the dequeue still succeeds, the
+    // pickup takes the foreign-kind re-queue path, and THAT enqueue fails
+    // with the raw SQLite text that must never reach the wire.
+    let dir = std::env::temp_dir().join(format!(
+        "relay-grp6-requeue-io-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
     ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("relay-store.db");
+    let mailbox = Mailbox::open(&path, 8).expect("open a file-backed mailbox");
+    let recipient_id = "requeue-io-recipient";
+
+    // Queue a group envelope for the recipient while the store is healthy.
+    let envelope = vec![0xE1u8; 24];
+    mailbox
+        .enqueue(recipient_id, envelope.clone(), std::time::Duration::from_secs(60))
+        .expect("enqueue must succeed on a healthy store");
+    // And tag it, exactly as the send arm would, so the pickup takes the
+    // foreign-kind re-queue path rather than the untagged fall-through.
+    let state = Arc::new(WsState::new_with(mailbox, 60, DEFAULT_TTL));
+    {
+        let mut kinds = state.envelope_kinds.lock().await;
+        kinds.insert(
+            format!("{recipient_id}\u{0}{}", ws::envelope_kind_key(&envelope)),
+            ws::EnvelopeKind {
+                kind: "group".to_string(),
+                expiry: std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            },
+        );
+    }
+
+    // Fail ONLY the re-queue's enqueue. The trigger is created AFTER the
+    // initial enqueue (so that insert is untouched) and fires on any later
+    // insert into this recipient's queue — which, in this test, is exactly
+    // the re-queue's re-enqueue of the foreign-kind envelope. The message is
+    // distinctive so the assertion below matches the injected fault itself.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw sqlite open");
+        conn.execute_batch(
+            "CREATE TRIGGER requeue_fault BEFORE INSERT ON envelopes
+             WHEN NEW.recipient_id = 'requeue-io-recipient'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected re-queue failure');
+             END;",
+        )
+        .expect("create the fault trigger");
+    }
+
+    // The DIRECT loop polls: the group-tagged envelope is foreign, so the
+    // handler re-queues it — and that enqueue now fails.
+    let resp = ws::handle_request(
+        WsRequest::PickupEnvelope {
+            recipient_id: recipient_id.to_string(),
+            kind: Some("direct".to_string()),
+        },
+        &state,
+    )
+    .await;
+
     let body = match resp {
         ws::WsResponse::Err { error, .. } => error,
         other => panic!("expected an Err response, got {other:?}"),
@@ -263,7 +339,26 @@ fn requeue_store_error_response_is_generic_and_leak_free() {
         "the re-queue store failure must use the generic body"
     );
     assert!(
-        !body.contains("sqlite") && !body.contains("/tmp/"),
+        !body.contains("sqlite") && !body.contains("/tmp/") && !body.contains("requeue-io"),
         "the wire body must not carry Io detail: {body}"
     );
+    // The fault must actually have fired on the re-queue insert: the row was
+    // dequeued and the re-enqueue aborted, so a second direct poll finds
+    // nothing — the envelope was NOT silently re-queued (and, with the
+    // trigger commented out, this test fails with a delivered envelope
+    // instead).
+    let resp = ws::handle_request(
+        WsRequest::PickupEnvelope {
+            recipient_id: recipient_id.to_string(),
+            kind: Some("direct".to_string()),
+        },
+        &state,
+    )
+    .await;
+    match resp {
+        ws::WsResponse::Err { error, .. } => {
+            assert_eq!(error, "NotFound", "the aborted re-queue must not have re-queued the row");
+        }
+        other => panic!("the aborted re-queue must not deliver an envelope, got {other:?}"),
+    }
 }
