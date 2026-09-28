@@ -1056,4 +1056,185 @@ mod tests {
             other => panic!("expected an error response, got: {other:?}"),
         }
     }
+
+    // ── RES-1: a store error crossing the wire must not carry store detail ────
+    //
+    // `MailboxError::Io` is built from `rusqlite::Error::to_string()`, so it embeds
+    // an absolute database path and schema detail. That text is for the operator's
+    // log, never for a peer that has only solved the PoW gate.
+
+    /// The raw store text must not reach the peer: the Io class maps to the fixed
+    /// generic reason, and none of the sensitive substrings survive.
+    #[test]
+    fn io_error_response_does_not_leak_store_detail() {
+        let secret = "unable to open database file: /tmp/relay-secret/relay.db";
+        match mailbox_send_error_response(MailboxError::Io(secret.to_string())) {
+            WsResponse::Err { ok, error } => {
+                assert!(!ok, "an Io store error must be an error response");
+                assert_eq!(
+                    error, "StoreError",
+                    "the Io class must map to the fixed generic StoreError string"
+                );
+                for sentinel in [
+                    "/tmp/relay-secret",
+                    "relay.db",
+                    "unable to open database file",
+                    "Io(",
+                ] {
+                    assert!(
+                        !error.contains(sentinel),
+                        "the response body must not contain {sentinel:?}, got: {error}"
+                    );
+                }
+            }
+            other => panic!("expected an error response, got: {other:?}"),
+        }
+    }
+
+    /// Only the Io class changes: every other variant keeps its existing wire form,
+    /// so a "return one string for everything" refactor is caught.
+    #[test]
+    fn io_error_response_keeps_other_variants_distinct() {
+        for (variant, expected) in [
+            (MailboxError::NotFound, "StoreError: NotFound"),
+            (MailboxError::QueueFull, "QueueFull"),
+            (MailboxError::Expired, "StoreError: Expired"),
+        ] {
+            match mailbox_send_error_response(variant) {
+                WsResponse::Err { ok, error } => {
+                    assert!(!ok, "a store failure must be an error response");
+                    assert_eq!(
+                        error, expected,
+                        "non-Io variants must keep their existing wire form"
+                    );
+                }
+                other => panic!("expected an error response, got: {other:?}"),
+            }
+        }
+    }
+
+    /// A `MakeWriter` that appends everything written to a shared buffer, so a test
+    /// can assert on what the server-side log actually received.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The peer gets the generic reason, but the operator still gets the full detail
+    /// server-side — sanitizing the wire must not blind the log.
+    #[test]
+    fn io_error_response_logs_store_detail_server_side() {
+        let secret = "unable to open database file: /tmp/relay-secret/relay.db";
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = mailbox_send_error_response(MailboxError::Io(secret.to_string()));
+        });
+        let logged = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains(secret),
+            "the raw store error must be logged server-side, got: {logged:?}"
+        );
+    }
+
+    /// A unique, not-yet-existing store path under the system temp dir.
+    fn res1_temp_store_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "relay-res1-{}-{tag}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("relay-store.db")
+    }
+
+    /// The pickup arm must sanitize a store Io failure exactly like the send path:
+    /// the peer gets the generic reason, not the raw SQLite text.
+    ///
+    /// The WS listener builds its store in memory with no injection point, so the
+    /// fault is forced on a file-backed mailbox and driven through the real request
+    /// handler — the same code path a bridge pickup takes.
+    #[tokio::test]
+    async fn pickup_io_error_response_does_not_leak_store_detail() {
+        let path = res1_temp_store_path("pickup-io");
+        let mailbox = Mailbox::open(&path, 8).expect("open a file-backed mailbox");
+        // Break the schema out from under the open handle so the next dequeue fails
+        // with a store Io error instead of NotFound.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw sqlite open");
+            conn.execute_batch("DROP TABLE envelopes;")
+                .expect("drop the envelopes table");
+        }
+        let state = Arc::new(WsState {
+            store: mailbox,
+            ..WsState::new(60)
+        });
+
+        let recipient_id = "recipient-under-test";
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let sink = sink.clone();
+                move || sink.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let resp = handle_request(
+            WsRequest::PickupEnvelope {
+                recipient_id: recipient_id.to_string(),
+            },
+            &state,
+        )
+        .await;
+
+        match resp {
+            WsResponse::Err { ok, error } => {
+                assert!(!ok, "a store failure must be an error response");
+                assert_eq!(
+                    error, "StoreError",
+                    "the pickup Io arm must return the fixed generic StoreError string"
+                );
+                for sentinel in ["/tmp/", "relay-store.db", "no such table", "Io("] {
+                    assert!(
+                        !error.contains(sentinel),
+                        "the response body must not contain {sentinel:?}, got: {error}"
+                    );
+                }
+            }
+            other => panic!("expected an error response, got: {other:?}"),
+        }
+
+        // Sanitizing the wire must not blind the operator, and the log must stay
+        // data-minimized: the raw detail is logged, the full identifier is not.
+        let logged = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        assert!(
+            logged.contains("no such table"),
+            "the raw store error must still be logged server-side, got: {logged:?}"
+        );
+        assert!(
+            !logged.contains(recipient_id),
+            "the full recipient_id must never be logged, got: {logged:?}"
+        );
+    }
 }
