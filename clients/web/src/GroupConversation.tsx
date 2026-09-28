@@ -36,17 +36,20 @@ import './GroupConversation.css';
 //
 // The group's *sender-key ratchet state* is persisted too, via the real
 // serialize/restore bindings (group_to_bytes / group_from_bytes,
-// core/bindings/wasm/src/lib.rs). GroupSession::new seeds its chain key
-// deterministically from the sender's public key, so rebuilding the session
-// from scratch on every reload would rewind the chain to a state already
-// used and re-derive an identical (key, nonce) pair — the AES-GCM reuse class
-// tracked as AUDIT-002. The serialized blob is secret ratchet state (the
-// chain key, verbatim), so it is stored ONLY through the encrypted
-// StorageGate, never plaintext, and never logged. On reload the component
-// restores the session with group_from_bytes; only a record that predates
-// ratchet persistence (no blob) falls back to replaying group_create +
-// group_add_member, and a record whose blob is present but corrupt fails
-// closed (no group is restored, so nothing can send under a rewound chain).
+// core/bindings/wasm/src/lib.rs). The persisted blob is what lets a reload
+// resume the running session instead of starting a new one. Starting a new one
+// is not itself a key-reuse hazard: GroupSession::new seeds the chain key from
+// a fresh CSPRNG (core/protocol/src/group.rs), not from the sender's public
+// key, so a rebuilt session cannot re-derive a (key, nonce) pair the old one
+// already used. The reuse hazard is resuming a *stale* blob: a restored chain
+// that lags the last ciphertext emitted would encrypt from a position already
+// used. The save therefore happens before each send, and a failed save aborts
+// the send. The serialized blob is secret ratchet state (the chain key,
+// verbatim), so it is stored ONLY through the encrypted StorageGate, never
+// plaintext, and never logged. On reload the component restores the session
+// with group_from_bytes; only a record that predates ratchet persistence (no
+// blob) falls back to replaying group_create + group_add_member, and a record
+// whose blob is present but corrupt fails closed (no group is restored).
 
 export interface GroupMessageResult {
     ok: boolean;
@@ -262,47 +265,6 @@ interface PersistedGroupState {
 /** Largest serialized group state accepted on restore (1 MiB). */
 const MAX_GROUP_BLOB_LENGTH = 1048576;
 
-/**
- * Result of parsing the member roster out of a persisted group blob.
- *
- * - `not-v1`: the bytes are not a real `group_to_bytes` v1 serialization
- *   (first byte is not the version marker). The test suites' wasm mocks
- *   serialize the ROSTER ONLY in their own format, so their blobs land here
- *   and the roster cross-check is skipped for them — the real-wasm suite owns
- *   blob-format validation.
- * - `malformed`: the bytes claim v1 but do not parse. `group_from_bytes`
- *   would reject them on restore too, so they must not be stored.
- * - `roster`: the parsed member public-key bytes, in blob order.
- */
-type BlobRosterParse =
-    | { kind: 'not-v1' }
-    | { kind: 'malformed' }
-    | { kind: 'roster'; keys: Uint8Array[] };
-
-/**
- * Parse the member roster out of a `group_to_bytes` v1 blob WITHOUT touching
- * the chain key. Layout (core/protocol/src/group.rs, GroupSession::to_bytes):
- * version(1) | chain_key(32) | member_count(u16 BE) | then per member
- * len(u16 BE) | key bytes, with no trailing bytes.
- */
-function parseGroupBlobRoster(blob: number[]): BlobRosterParse {
-    if (blob.length === 0 || blob[0] !== 1) return { kind: 'not-v1' };
-    if (blob.length < 35) return { kind: 'malformed' };
-    const count = (blob[33] << 8) | blob[34];
-    const keys: Uint8Array[] = [];
-    let pos = 35;
-    for (let i = 0; i < count; i++) {
-        if (pos + 2 > blob.length) return { kind: 'malformed' };
-        const len = (blob[pos] << 8) | blob[pos + 1];
-        pos += 2;
-        if (len > blob.length - pos) return { kind: 'malformed' };
-        keys.push(new Uint8Array(blob.slice(pos, pos + len)));
-        pos += len;
-    }
-    if (pos !== blob.length) return { kind: 'malformed' };
-    return { kind: 'roster', keys };
-}
-
 /** True for a value that is a valid byte (integer in 0..255). */
 function isByte(entry: unknown): entry is number {
     return Number.isInteger(entry) && (entry as number) >= 0 && (entry as number) <= 255;
@@ -487,12 +449,10 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                         }));
                         // Restore the ratchet state from the persisted blob when
                         // the record has one. group_from_bytes fails closed on
-                        // empty/truncated/corrupt input — and we must NOT fall
-                        // back to rebuilding a fresh session then, because
-                        // GroupSession::new seeds the chain deterministically
-                        // from the sender's public key, so a rebuilt session
-                        // would rewind to chain-key positions already used and
-                        // re-derive identical (key, nonce) pairs (AUDIT-002).
+                        // empty/truncated/corrupt input, and we must NOT fall back
+                        // to building a fresh session then: a fresh session starts
+                        // a different chain, and silently dropping the persisted
+                        // state is the very failure this persistence prevents.
                         let restoredGroup: GroupHandle | null = null;
                         let blobError: unknown = null;
                         try {
@@ -516,17 +476,15 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                             console.error('Failed to restore persisted group ratchet state', blobError);
                             if (!cancelled) {
                                 setError(
-                                    'Stored group state is corrupt; the group session was not restored ' +
-                                    'to protect against key reuse. Clear this site\'s stored data to ' +
-                                    'start a new group.',
+                                    'Stored group state is corrupt; the group session was not restored. ' +
+                                    'Clear this site\'s stored data to start a new group.',
                                 );
                             }
                         } else {
                             // Legacy record (no blob — written before ratchet
                             // persistence): replay the old reconstruction path.
-                            // Chain rewind is unavoidable here, but this only
-                            // happens for records that never carried ratchet
-                            // state.
+                            // This only happens for records that never carried
+                            // ratchet state, so there is nothing to resume.
                             let replayed = group_create(self);
                             for (const m of persisted.members) {
                                 replayed = group_add_member(replayed, new Uint8Array(m.publicBytes));

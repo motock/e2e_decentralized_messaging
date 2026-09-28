@@ -140,46 +140,6 @@ function setupGroupRoundTrip() {
     const peerPublic = peerIdentity.public_bytes();
     const peerRecipientId = recipientIdFromPublicBytes(peerPublic);
 
-    // The peer's prekey bundle — in tests we return the public key bytes
-    // directly (bundle_identity_key_bytes is a passthrough in the real WASM
-    // for this test's purpose, but we use the real binding).
-    // For lookupPrekey we need to return something that bundle_identity_key_bytes
-    // can extract the identity key from. In the real WASM, this expects a
-    // prekey bundle. We'll generate a real prekey bundle for the peer.
-    // However, the GroupConversation component calls bundle_identity_key_bytes
-    // on the looked-up bytes. Let's check what the real binding expects...
-    // Actually, for the test we can use the peer's public bytes directly since
-    // bundle_identity_key_bytes in the real WASM expects a serialized prekey
-    // bundle. Let's generate a real bundle.
-    //
-    // But wait — the component's addPeer calls lookupPrekey then
-    // bundle_identity_key_bytes. For the test to work with real WASM, we need
-    // a real prekey bundle. Let's use generate_prekey_bundle.
-    //
-    // Actually, looking at the existing group_real_peer.test.tsx, it mocks the
-    // WASM and returns public key bytes directly from lookupPrekey. But our
-    // tests use REAL WASM. So we need a real prekey bundle.
-    //
-    // Let's check if generate_prekey_bundle is available...
-    // From lib.rs: generate_prekey_bundle(identity_handle) -> Vec<u8>
-    // And bundle_identity_key_bytes(bundle) extracts the identity key.
-    //
-    // We need to import generate_prekey_bundle. But the GroupConversation
-    // component imports bundle_identity_key_bytes from the WASM pkg. So we
-    // need to provide a real bundle via lookupPrekey.
-
-    // For now, let's just use the peer's public bytes. The real
-    // bundle_identity_key_bytes may or may not work with raw public bytes.
-    // We'll need to test this. If it doesn't work, we'll generate a real bundle.
-
-    // Actually, let's look at what bundle_identity_key_bytes does in the WASM:
-    // It takes a serialized PreKeyBundle and extracts the identity key.
-    // Raw public bytes (33 bytes) are NOT a valid PreKeyBundle.
-    // So we MUST provide a real prekey bundle.
-
-    // We'll import generate_prekey_bundle dynamically.
-    // But it's not imported above... Let's add it.
-
     return {
         selfIdentity,
         selfPublic,
@@ -648,13 +608,12 @@ describe('GroupConversation real send/receive with persistence', () => {
         expect(new TextDecoder().decode(decrypted)).toBe('outgoing group msg');
     });
 
-    // ── GRP-4: sender-key ratchet persistence (AUDIT-002 key-reuse class) ───
+    // ── GRP-4: sender-key ratchet persistence ───
     //
-    // GroupSession::new seeds its chain key from the OS CSPRNG, so rebuilding a
-    // session from scratch on reload starts a *different* chain — but the
-    // pre-GRP-4 code rebuilt the session and then poked the member roster in,
-    // which rewound the ratchet to a chain position already used and re-derived
-    // an identical (key, nonce) pair. The fix persists group_to_bytes(group)
+    // GroupSession::new seeds its chain key from the OS CSPRNG, so a session
+    // rebuilt from scratch cannot re-derive a (key, nonce) pair the previous
+    // one already used. The pre-GRP-4 code rebuilt the session on every reload
+    // instead of restoring the running one. The fix persists group_to_bytes(group)
     // through the encrypted StorageGate and restores with group_from_bytes.
     //
     // The wire ciphertext is `nonce(12) | payload_len(u32 LE) | AES-GCM payload
@@ -934,5 +893,20 @@ describe('GroupConversation real send/receive with persistence', () => {
         expect(hex(recoveredNonce)).toBe(hex(nonceOf(expectedRecovered)));
 
         recoveredMount.unmount();
+    });
+
+    test('a failed pre-send ratchet save aborts the group send — no envelope is delivered', async () => {
+        const { selfIdentity, selfRecipientId, peerRecipientId } = await makePeerFixture();
+        const transport = makeRelayMockTransport();
+        await mountCreateAndAddPeer(transport, selfIdentity, selfRecipientId, peerRecipientId);
+        const callsBefore = transport.sendEnvelope.mock.calls.length;
+        const putSpy = vi.spyOn(MockStorageGate.prototype, 'put').mockRejectedValue(new Error('quota exceeded'));
+        try {
+            await sendGroupMessage('must not be sent');
+            expect(screen.getByText('Could not save session state; message not sent')).toBeInTheDocument();
+            expect(transport.sendEnvelope.mock.calls.length).toBe(callsBefore);
+        } finally {
+            putSpy.mockRestore();
+        }
     });
 });
