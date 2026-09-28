@@ -91,6 +91,9 @@ struct WsState {
 
 impl WsState {
     fn new(rate_limit_per_minute: u32) -> Self {
+        // In-memory by default: a listener built from `RelayOptions` has no store
+        // path to open, and a restart losing state is the behaviour pinned today.
+        // Surfacing a configurable path is RD-3's job.
         Self {
             store: Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
             prekeys: RelayStore::new(),
@@ -421,6 +424,10 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 Ok(bundle_bytes) => WsResponse::ok_bundle(b64_encode(&bundle_bytes)),
                 Err(StoreError::NotFound) => WsResponse::err("NotFound"),
                 Err(StoreError::Expired) => WsResponse::err("Expired"),
+                Err(StoreError::Io(msg)) => {
+                    warn!("ws: prekey store io error: {msg}");
+                    WsResponse::err("StoreError: io failure reading the prekey store")
+                }
             }
         }
 
