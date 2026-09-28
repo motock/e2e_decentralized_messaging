@@ -421,6 +421,10 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 Ok(bundle_bytes) => WsResponse::ok_bundle(b64_encode(&bundle_bytes)),
                 Err(StoreError::NotFound) => WsResponse::err("NotFound"),
                 Err(StoreError::Expired) => WsResponse::err("Expired"),
+                Err(StoreError::Io(msg)) => {
+                    warn!("ws: prekey store io error: {msg}");
+                    WsResponse::err("StoreError: io failure reading the prekey store")
+                }
             }
         }
 
