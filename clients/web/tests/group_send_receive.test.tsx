@@ -903,7 +903,7 @@ describe('GroupConversation real send/receive with persistence', () => {
         const putSpy = vi.spyOn(MockStorageGate.prototype, 'put').mockRejectedValue(new Error('quota exceeded'));
         try {
             await sendGroupMessage('must not be sent');
-            expect(screen.getByText('Could not save session state; message not sent')).toBeInTheDocument();
+            expect(screen.getByRole('alert')).toHaveTextContent('Could not save session state; message not sent');
             expect(transport.sendEnvelope.mock.calls.length).toBe(callsBefore);
         } finally {
             putSpy.mockRestore();
