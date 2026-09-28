@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { generate_identity, derive_safety_number, group_create, group_add_member, group_remove_member, group_encrypt, group_decrypt, bundle_identity_key_bytes, IdentityHandle, GroupHandle } from '../../../core/bindings/wasm/pkg/index.js';
+import { generate_identity, derive_safety_number, group_create, group_add_member, group_remove_member, group_encrypt, group_decrypt, group_to_bytes, group_from_bytes, bundle_identity_key_bytes, IdentityHandle, GroupHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
 import { SealGlyph } from './design/SealGlyph';
 import { StorageGate } from './storage';
@@ -32,10 +32,24 @@ import './GroupConversation.css';
 // Group membership (the member list with recipient IDs and public keys) is
 // persisted via the existing StorageGate pattern (encrypted IndexedDB), so
 // it survives a page reload — matching how identity persistence already works
-// in identity.ts. The WASM GroupHandle itself is not serializable (it's an
-// opaque WASM-side handle), so on reload the component reconstructs the group
-// session from the persisted member list by re-calling group_create +
-// group_add_member for each persisted member.
+// in identity.ts.
+//
+// The group's *sender-key ratchet state* is persisted too, via the real
+// serialize/restore bindings (group_to_bytes / group_from_bytes,
+// core/bindings/wasm/src/lib.rs). The persisted blob is what lets a reload
+// resume the running session instead of starting a new one. Starting a new one
+// is not itself a key-reuse hazard: GroupSession::new seeds the chain key from
+// a fresh CSPRNG (core/protocol/src/group.rs), not from the sender's public
+// key, so a rebuilt session cannot re-derive a (key, nonce) pair the old one
+// already used. The reuse hazard is resuming a *stale* blob: a restored chain
+// that lags the last ciphertext emitted would encrypt from a position already
+// used. The save therefore happens before each send, and a failed save aborts
+// the send. The serialized blob is secret ratchet state (the chain key,
+// verbatim), so it is stored ONLY through the encrypted StorageGate, never
+// plaintext, and never logged. On reload the component restores the session
+// with group_from_bytes; only a record that predates ratchet persistence (no
+// blob) falls back to replaying group_create + group_add_member, and a record
+// whose blob is present but corrupt fails closed (no group is restored).
 
 export interface GroupMessageResult {
     ok: boolean;
@@ -232,13 +246,51 @@ interface RealMember {
 }
 
 /**
- * The persisted group state record. Stored via StorageGate so membership
- * survives a page reload. Public keys are stored as number arrays (JSON-
- * serializable); on reload the component reconstructs the GroupHandle by
- * re-calling group_create + group_add_member for each member.
+ * The persisted group state record. Stored via StorageGate (AES-256-GCM at
+ * rest) so membership AND the sender-key ratchet state survive a page reload.
+ * Public keys are stored as number arrays (JSON-serializable).
+ *
+ * `blob` is the group_to_bytes serialization of the group handle at the time
+ * of the last persist — secret ratchet state (chain key + position), stored
+ * encrypted, never logged. It is absent only in records written before
+ * ratchet persistence existed; such a legacy record is restored by replaying
+ * group_create + group_add_member (the pre-GRP-4 behavior).
  */
 interface PersistedGroupState {
     members: Array<{ recipientId: string; publicBytes: number[] }>;
+    /** group_to_bytes(group) as of the last persist; absent in legacy records. */
+    blob?: number[];
+}
+
+/** Largest serialized group state accepted on restore (1 MiB). */
+const MAX_GROUP_BLOB_LENGTH = 1048576;
+
+/** True for a value that is a valid byte (integer in 0..255). */
+function isByte(entry: unknown): entry is number {
+    return Number.isInteger(entry) && (entry as number) >= 0 && (entry as number) <= 255;
+}
+
+/**
+ * Validate a stored group blob before handing any bytes to WASM.
+ *
+ * Returns the bytes, or `null` when the record simply has no blob (a legacy
+ * record from before ratchet persistence). Throws on a blob that is present
+ * but structurally invalid — the caller must fail closed rather than build a
+ * fresh session: a fresh session starts a different chain, and silently
+ * dropping the persisted state is the very failure this persistence prevents.
+ */
+function validatedGroupBlob(blob: unknown): Uint8Array | null {
+    if (blob === undefined || blob === null) return null;
+    if (!Array.isArray(blob) || blob.length === 0) {
+        throw new Error('invalid persisted group state');
+    }
+    if (blob.length > MAX_GROUP_BLOB_LENGTH) {
+        throw new Error('invalid persisted group state');
+    }
+    if (!blob.every(isByte)) {
+        throw new Error('invalid persisted group state');
+    }
+    return new Uint8Array(blob);
 }
 
 const DEMO_MEMBER_NAMES = ['Alice', 'Bob', 'Eve'] as const;
@@ -372,26 +424,75 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                     });
                 }
                 const gate = gateRef.current;
+                let storeOpen = true;
                 try {
                     await gate.open();
-                    const persisted = (await gate.get(GROUP_STORE, GROUP_RECORD_ID)) as
-                        | PersistedGroupState
-                        | null;
+                } catch (e) {
+                    // The store could not be opened (e.g. IndexedDB is
+                    // unavailable). There is no store to read from or write to,
+                    // so drop the unusable gate: the persist path then treats
+                    // this as "no store" and does not block a send on a write
+                    // that could never succeed.
+                    console.error('Failed to open group state store', e);
+                    storeOpen = false;
+                    gateRef.current = undefined;
+                }
+                try {
+                    const persisted = storeOpen
+                        ? ((await gate.get(GROUP_STORE, GROUP_RECORD_ID)) as
+                              | PersistedGroupState
+                              | null)
+                        : null;
                     if (persisted?.members?.length) {
-                        const restoredGroup = group_create(self);
-                        const restored: RealMember[] = [];
-                        for (const m of persisted.members) {
-                            const pubBytes = new Uint8Array(m.publicBytes);
-                            const newGroup = group_add_member(restoredGroup, pubBytes);
-                            restored.push({ recipientId: m.recipientId, publicBytes: pubBytes });
-                            // Update the group handle for each member.
-                            // We can't call setGroup inside the loop (React
-                            // batches), so we build up the final handle.
-                            (restoredGroup as unknown as { members: Uint8Array[] }).members =
-                                (newGroup as unknown as { members: Uint8Array[] }).members;
+                        const restored: RealMember[] = persisted.members.map((m) => ({
+                            recipientId: m.recipientId,
+                            publicBytes: new Uint8Array(m.publicBytes),
+                        }));
+                        // Restore the ratchet state from the persisted blob when
+                        // the record has one. group_from_bytes fails closed on
+                        // empty/truncated/corrupt input, and we must NOT fall back
+                        // to building a fresh session then: a fresh session starts
+                        // a different chain, and silently dropping the persisted
+                        // state is the very failure this persistence prevents.
+                        let restoredGroup: GroupHandle | null = null;
+                        let blobError: unknown = null;
+                        try {
+                            const blob = validatedGroupBlob(persisted.blob);
+                            if (blob) {
+                                restoredGroup = group_from_bytes(blob);
+                            }
+                        } catch (e) {
+                            blobError = e;
+                            restoredGroup = null;
                         }
-                        setGroup(restoredGroup);
-                        setRealMembers(restored);
+                        if (restoredGroup) {
+                            // Real restore: the session continues from the
+                            // persisted chain-key position.
+                            setGroup(restoredGroup);
+                            setRealMembers(restored);
+                        } else if (blobError) {
+                            // Fail closed: corrupt/truncated blob. Surface the
+                            // failure and leave the group unset so nothing can
+                            // send under a rewound chain.
+                            console.error('Failed to restore persisted group ratchet state', blobError);
+                            if (!cancelled) {
+                                setError(
+                                    'Stored group state is corrupt; the group session was not restored. ' +
+                                    'Clear this site\'s stored data to start a new group.',
+                                );
+                            }
+                        } else {
+                            // Legacy record (no blob — written before ratchet
+                            // persistence): replay the old reconstruction path.
+                            // This only happens for records that never carried
+                            // ratchet state, so there is nothing to resume.
+                            let replayed = group_create(self);
+                            for (const m of persisted.members) {
+                                replayed = group_add_member(replayed, new Uint8Array(m.publicBytes));
+                            }
+                            setGroup(replayed);
+                            setRealMembers(restored);
+                        }
                     }
                 } catch (e) {
                     console.error('Failed to load persisted group state', e);
@@ -400,9 +501,11 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 // Load persisted group messages (if any) so history survives
                 // a page reload — matching Conversation.tsx's message persistence.
                 try {
-                    const persistedMsgs = (await gate.get(GROUP_MESSAGES_STORE, GROUP_MESSAGES_ID)) as
-                        | GroupMessage[]
-                        | null;
+                    const persistedMsgs = storeOpen
+                        ? ((await gate.get(GROUP_MESSAGES_STORE, GROUP_MESSAGES_ID)) as
+                              | GroupMessage[]
+                              | null)
+                        : null;
                     if (persistedMsgs && persistedMsgs.length) {
                         setMessages(persistedMsgs);
                     }
@@ -423,11 +526,25 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         };
     }, [identityProp, selfRecipientId]);
 
-    // Persist the current real-member list to StorageGate so it survives
-    // a page reload. Called after every membership change.
-    const persistGroupState = async (members: RealMember[]) => {
+    // Persist the current real-member list AND the group's sender-key ratchet
+    // state to StorageGate so both survive a page reload. Called after every
+    // membership change and after every send (the ratchet advances on each
+    // sent message, so the blob must be re-serialized then too).
+    //
+    // The blob is secret ratchet state: it goes through the encrypted
+    // StorageGate only, and is never logged. A serialization failure is
+    // logged without the blob and leaves the previously persisted state
+    // untouched.
+    const persistGroupState = async (
+        members: RealMember[],
+        groupHandle?: GroupHandle | null,
+    ): Promise<boolean> => {
         const gate = gateRef.current;
-        if (!gate || !loadedRef.current) return;
+        // No store to write to (or the initial load has not finished yet):
+        // there is nothing to persist and nothing was lost, so this is not a
+        // failure and must not block a send.
+        if (!gate || !loadedRef.current) return true;
+        const handle = groupHandle !== undefined ? groupHandle : groupRef.current;
         try {
             const state: PersistedGroupState = {
                 members: members.map((m) => ({
@@ -435,9 +552,14 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                     publicBytes: Array.from(m.publicBytes),
                 })),
             };
+            if (handle) {
+                state.blob = Array.from(group_to_bytes(handle));
+            }
             await gate.put(GROUP_STORE, GROUP_RECORD_ID, state);
+            return true;
         } catch (e) {
             console.error('Failed to persist group state', e);
+            return false;
         }
     };
 
@@ -578,11 +700,12 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
 
     const createGroup = () => {
         if (!selfIdentity) return;
-        setGroup(group_create(selfIdentity));
+        const newGroup = group_create(selfIdentity);
+        setGroup(newGroup);
         setMemberNames([]);
         setRealMembers([]);
         setMessages([]);
-        void persistGroupState([]);
+        void persistGroupState([], newGroup);
     };
 
     const addMember = (name: string) => {
@@ -607,12 +730,13 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         // (no new lookup needed) and clear them from the removed list.
         const previouslyRemoved = removedRealMembers.find((m) => m.recipientId === trimmedId);
         if (previouslyRemoved) {
-            setGroup(group_add_member(group, previouslyRemoved.publicBytes));
+            const newGroup = group_add_member(group, previouslyRemoved.publicBytes);
+            setGroup(newGroup);
             const updatedMembers = [...realMembers, previouslyRemoved];
             setRealMembers(updatedMembers);
             setRemovedRealMembers((prev) => prev.filter((m) => m.recipientId !== trimmedId));
             setPeerIdInput('');
-            void persistGroupState(updatedMembers);
+            void persistGroupState(updatedMembers, newGroup);
             return;
         }
 
@@ -643,7 +767,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
             setGroup(newGroup);
             setRealMembers(updatedMembers);
             setPeerIdInput('');
-            void persistGroupState(updatedMembers);
+            void persistGroupState(updatedMembers, newGroup);
         } catch (e) {
             setPeerError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -666,13 +790,14 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         if (!group) return;
         const member = realMembers.find((m) => m.recipientId === recipientId);
         if (!member) return; // already removed — no-op, not an error
-        setGroup(group_remove_member(group, member.publicBytes));
+        const updatedGroup = group_remove_member(group, member.publicBytes);
+        setGroup(updatedGroup);
         const updatedMembers = realMembers.filter((m) => m.recipientId !== recipientId);
         setRealMembers(updatedMembers);
         setRemovedRealMembers((prev) =>
             prev.some((m) => m.recipientId === recipientId) ? prev : [...prev, member],
         );
-        void persistGroupState(updatedMembers);
+        void persistGroupState(updatedMembers, updatedGroup);
     };
 
     // Re-add a previously-removed real peer. The public key is already known
@@ -681,11 +806,12 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         if (!group) return;
         const member = removedRealMembers.find((m) => m.recipientId === recipientId);
         if (!member) return;
-        setGroup(group_add_member(group, member.publicBytes));
+        const newGroup = group_add_member(group, member.publicBytes);
+        setGroup(newGroup);
         const updatedMembers = [...realMembers, member];
         setRealMembers(updatedMembers);
         setRemovedRealMembers((prev) => prev.filter((m) => m.recipientId !== recipientId));
-        void persistGroupState(updatedMembers);
+        void persistGroupState(updatedMembers, newGroup);
     };
 
     const send = async () => {
@@ -696,6 +822,14 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
             ciphertext = group_encrypt(group, selfIdentity, plaintextBytes);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
+            return;
+        }
+        // Persist the advanced ratchet BEFORE the envelope leaves the device. A
+        // skipped ratchet step is safe; a reused message key is not -- a failed
+        // save must abort the send rather than deliver a message whose key
+        // material was never recorded (mirrors Conversation.tsx).
+        if (!(await persistGroupState(realMembers, group))) {
+            setError('Could not save session state; message not sent');
             return;
         }
         // Deliver the ciphertext to every real group member via sendEnvelope

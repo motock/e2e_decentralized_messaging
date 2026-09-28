@@ -109,6 +109,62 @@ vi.mock('../../../core/bindings/wasm/pkg/index.js', () => {
     // bundle envelope), so this is an identity passthrough.
     function bundle_identity_key_bytes(bundle: Uint8Array) { return bundle; }
 
+    // GRP-4: group state persistence bindings, mirroring the real wasm
+    // exports. Serialization is a pure function of the handle's current
+    // member set (never cached, never mutating the handle), and
+    // group_from_bytes validates the blob and returns a live GroupHandle
+    // from this same factory, so the restored group is immediately usable.
+    const GROUP_BLOB_MAGIC = [0x47, 0x52, 0x50, 0x34]; // "GRP4"
+    const GROUP_BLOB_VERSION = 0x01;
+
+    function group_to_bytes(group: GroupHandle): Uint8Array {
+        const bytes: number[] = [...GROUP_BLOB_MAGIC, GROUP_BLOB_VERSION];
+        const pushU32 = (value: number) => {
+            bytes.push((value >>> 24) & 0xff, (value >>> 16) & 0xff, (value >>> 8) & 0xff, value & 0xff);
+        };
+        pushU32(group.members.length);
+        for (const member of group.members) {
+            pushU32(member.length);
+            bytes.push(...member);
+        }
+        return new Uint8Array(bytes);
+    }
+
+    function group_from_bytes(blob: Uint8Array): GroupHandle {
+        const readU32 = (offset: number) =>
+            ((blob[offset] << 24) | (blob[offset + 1] << 16) | (blob[offset + 2] << 8) | blob[offset + 3]) >>> 0;
+        if (!(blob instanceof Uint8Array) || blob.length < 9) {
+            throw new Error('group_from_bytes: malformed group blob');
+        }
+        for (let i = 0; i < GROUP_BLOB_MAGIC.length; i++) {
+            if (blob[i] !== GROUP_BLOB_MAGIC[i]) {
+                throw new Error('group_from_bytes: malformed group blob');
+            }
+        }
+        if (blob[4] !== GROUP_BLOB_VERSION) {
+            throw new Error('group_from_bytes: unsupported group blob version');
+        }
+        const memberCount = readU32(5);
+        const members: Uint8Array[] = [];
+        let offset = 9;
+        for (let i = 0; i < memberCount; i++) {
+            if (offset + 4 > blob.length) {
+                throw new Error('group_from_bytes: malformed group blob');
+            }
+            const memberLength = readU32(offset);
+            offset += 4;
+            if (offset + memberLength > blob.length) {
+                throw new Error('group_from_bytes: malformed group blob');
+            }
+            members.push(blob.slice(offset, offset + memberLength));
+            offset += memberLength;
+        }
+        if (offset !== blob.length) {
+            throw new Error('group_from_bytes: malformed group blob');
+        }
+        return new GroupHandle(members);
+    }
+
     return {
         generate_identity,
         group_create,
@@ -118,6 +174,8 @@ vi.mock('../../../core/bindings/wasm/pkg/index.js', () => {
         group_decrypt,
         derive_safety_number,
         bundle_identity_key_bytes,
+        group_to_bytes,
+        group_from_bytes,
         IdentityHandle,
         GroupHandle,
     };

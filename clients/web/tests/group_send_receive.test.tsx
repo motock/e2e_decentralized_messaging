@@ -101,6 +101,8 @@ import {
     group_add_member,
     group_encrypt,
     group_decrypt,
+    group_to_bytes,
+    group_from_bytes,
     bundle_identity_key_bytes,
     IdentityHandle,
     GroupHandle,
@@ -137,46 +139,6 @@ function setupGroupRoundTrip() {
     const peerIdentity = generate_identity();
     const peerPublic = peerIdentity.public_bytes();
     const peerRecipientId = recipientIdFromPublicBytes(peerPublic);
-
-    // The peer's prekey bundle — in tests we return the public key bytes
-    // directly (bundle_identity_key_bytes is a passthrough in the real WASM
-    // for this test's purpose, but we use the real binding).
-    // For lookupPrekey we need to return something that bundle_identity_key_bytes
-    // can extract the identity key from. In the real WASM, this expects a
-    // prekey bundle. We'll generate a real prekey bundle for the peer.
-    // However, the GroupConversation component calls bundle_identity_key_bytes
-    // on the looked-up bytes. Let's check what the real binding expects...
-    // Actually, for the test we can use the peer's public bytes directly since
-    // bundle_identity_key_bytes in the real WASM expects a serialized prekey
-    // bundle. Let's generate a real bundle.
-    //
-    // But wait — the component's addPeer calls lookupPrekey then
-    // bundle_identity_key_bytes. For the test to work with real WASM, we need
-    // a real prekey bundle. Let's use generate_prekey_bundle.
-    //
-    // Actually, looking at the existing group_real_peer.test.tsx, it mocks the
-    // WASM and returns public key bytes directly from lookupPrekey. But our
-    // tests use REAL WASM. So we need a real prekey bundle.
-    //
-    // Let's check if generate_prekey_bundle is available...
-    // From lib.rs: generate_prekey_bundle(identity_handle) -> Vec<u8>
-    // And bundle_identity_key_bytes(bundle) extracts the identity key.
-    //
-    // We need to import generate_prekey_bundle. But the GroupConversation
-    // component imports bundle_identity_key_bytes from the WASM pkg. So we
-    // need to provide a real bundle via lookupPrekey.
-
-    // For now, let's just use the peer's public bytes. The real
-    // bundle_identity_key_bytes may or may not work with raw public bytes.
-    // We'll need to test this. If it doesn't work, we'll generate a real bundle.
-
-    // Actually, let's look at what bundle_identity_key_bytes does in the WASM:
-    // It takes a serialized PreKeyBundle and extracts the identity key.
-    // Raw public bytes (33 bytes) are NOT a valid PreKeyBundle.
-    // So we MUST provide a real prekey bundle.
-
-    // We'll import generate_prekey_bundle dynamically.
-    // But it's not imported above... Let's add it.
 
     return {
         selfIdentity,
@@ -240,6 +202,99 @@ beforeEach(() => {
 afterEach(() => {
     vi.useRealTimers();
 });
+
+// ── GRP-4 ratchet-persistence helpers ──────────────────────────────────────
+//
+// The persisted group-state record lives in the mock StorageGate's in-memory
+// store, keyed by record id ('group-state'). These helpers read/seed it
+// directly so a test can simulate a reload carrying a specific persisted blob.
+
+/** Read the persisted group-state record from the mock StorageGate store. */
+function readPersistedGroupState(): { members?: unknown[]; blob?: number[] } | undefined {
+    const store = (MockStorageGate as unknown as { __store: Map<string, unknown> }).__store;
+    return store.get('group-state') as { members?: unknown[]; blob?: number[] } | undefined;
+}
+
+/** Seed the persisted group-state record that the next mount will load. */
+function seedPersistedGroupState(value: unknown): void {
+    const store = (MockStorageGate as unknown as { __store: Map<string, unknown> }).__store;
+    store.set('group-state', value);
+}
+
+/** The 12-byte AES-GCM nonce that prefixes a group wire ciphertext. */
+function nonceOf(ciphertext: Uint8Array): Uint8Array {
+    return ciphertext.slice(0, 12);
+}
+
+/** Lowercase hex, for readable nonce/ciphertext inequality assertions. */
+function hex(bytes: Uint8Array): string {
+    return Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+/**
+ * Generate a self identity plus a peer identity whose prekey bundle is
+ * registered with the relay mock, so `addPeer` can look the peer up.
+ */
+async function makePeerFixture() {
+    const selfIdentity = generate_identity();
+    const selfPublic = selfIdentity.public_bytes();
+    const selfRecipientId = recipientIdFromPublicBytes(selfPublic);
+
+    const peerIdentity = generate_identity();
+    const peerPublic = peerIdentity.public_bytes();
+    const peerRecipientId = recipientIdFromPublicBytes(peerPublic);
+
+    const { generate_prekey_bundle } = await import('../../../core/bindings/wasm/pkg/index.js');
+    prekeyBundles[peerRecipientId] = generate_prekey_bundle(peerIdentity);
+
+    return { selfIdentity, selfPublic, selfRecipientId, peerIdentity, peerPublic, peerRecipientId };
+}
+
+/** Mount GroupConversation, create the group, and add the real peer. */
+async function mountCreateAndAddPeer(
+    transport: ReturnType<typeof makeRelayMockTransport>,
+    selfIdentity: InstanceType<typeof IdentityHandle>,
+    selfRecipientId: string,
+    peerRecipientId: string,
+) {
+    const view = render(
+        <GroupConversation
+            transport={transport}
+            identity={selfIdentity}
+            selfRecipientId={selfRecipientId}
+        />,
+    );
+    await flush();
+    expect(screen.getByTestId('group-conversation')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('create-group-button'));
+    await flush();
+    expect(screen.getByTestId('member-list')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('group-peer-id-input'), { target: { value: peerRecipientId } });
+    fireEvent.click(screen.getByTestId('add-peer-button'));
+    await flush();
+    expect(screen.getByTestId(`member-${peerRecipientId}`)).toBeInTheDocument();
+    return view;
+}
+
+/** Type a message into the group composer and click send, then flush. */
+async function sendGroupMessage(text: string) {
+    fireEvent.change(screen.getByTestId('group-message-input'), { target: { value: text } });
+    fireEvent.click(screen.getByTestId('group-send-button'));
+    await flush();
+    await flush();
+}
+
+/** All ciphertexts delivered to a given recipient, in send order. */
+function sentCiphertextsTo(
+    transport: ReturnType<typeof makeRelayMockTransport>,
+    recipientId: string,
+): Uint8Array[] {
+    return transport.sendEnvelope.mock.calls
+        .filter((c: unknown[]) => c[0] === recipientId)
+        .map((c: unknown[]) => c[1] as Uint8Array);
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
@@ -551,5 +606,307 @@ describe('GroupConversation real send/receive with persistence', () => {
         const peerGroupWithSelf = group_add_member(peerGroup, selfPublic);
         const decrypted = group_decrypt(peerGroupWithSelf, peerIdentity, sentCiphertext);
         expect(new TextDecoder().decode(decrypted)).toBe('outgoing group msg');
+    });
+
+    // ── GRP-4: sender-key ratchet persistence ───
+    //
+    // GroupSession::new seeds its chain key from the OS CSPRNG, so a session
+    // rebuilt from scratch cannot re-derive a (key, nonce) pair the previous
+    // one already used. The pre-GRP-4 code rebuilt the session on every reload
+    // instead of restoring the running one. The fix persists group_to_bytes(group)
+    // through the encrypted StorageGate and restores with group_from_bytes.
+    //
+    // The wire ciphertext is `nonce(12) | payload_len(u32 LE) | AES-GCM payload
+    // | wrapper_count(u8) | wrappers`, and the nonce is HKDF-derived from the
+    // chain key (core/protocol/src/group.rs). It is therefore NOT a counter, so
+    // the invariant is "the nonce changed / matches the deterministic
+    // continuation of the persisted state", never "the nonce increased".
+
+    test('after a send, the group ratchet state is persisted as a group_to_bytes blob through the encrypted StorageGate', async () => {
+        const { selfIdentity, selfRecipientId, peerIdentity, peerRecipientId } = await makePeerFixture();
+        const transport = makeRelayMockTransport();
+
+        // Spy on the encrypted StorageGate's writer: the blob must go through
+        // it (never a direct poke at the group handle's members).
+        const putSpy = vi.spyOn(MockStorageGate.prototype, 'put');
+
+        await mountCreateAndAddPeer(transport, selfIdentity, selfRecipientId, peerRecipientId);
+        await sendGroupMessage('hello');
+
+        const persisted = readPersistedGroupState();
+        expect(persisted).toBeDefined();
+
+        // The record carries a non-empty group_to_bytes blob.
+        expect(Array.isArray(persisted!.blob)).toBe(true);
+        expect(persisted!.blob!.length).toBeGreaterThan(0);
+        expect(persisted!.blob!.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)).toBe(true);
+
+        // It is a real group_to_bytes serialization: group_from_bytes accepts it
+        // and re-serializing round-trips byte-for-byte.
+        const restored = group_from_bytes(new Uint8Array(persisted!.blob!));
+        expect(Array.from(group_to_bytes(restored))).toEqual(persisted!.blob);
+
+        // The blob carries the real member roster: the peer can decrypt a
+        // message encrypted under the restored session.
+        const probe = group_encrypt(restored, selfIdentity, new TextEncoder().encode('probe'));
+        expect(new TextDecoder().decode(group_decrypt(restored, peerIdentity, probe))).toBe('probe');
+
+        // A second send advances the ratchet again, so the persisted blob must
+        // change even though the member roster is unchanged — proving the blob
+        // is the live ratchet state, not a roster-only record.
+        await sendGroupMessage('world');
+        const persistedAfterSecondSend = readPersistedGroupState();
+        expect(persistedAfterSecondSend!.blob).not.toEqual(persisted!.blob);
+
+        // The write went through the encrypted StorageGate.
+        expect(putSpy).toHaveBeenCalledWith(
+            'session',
+            'group-state',
+            expect.objectContaining({ blob: expect.any(Array) }),
+        );
+        // The persisted roster matches the real members the component knows.
+        expect(persisted!.members).toEqual([
+            expect.objectContaining({ recipientId: peerRecipientId }),
+        ]);
+
+        putSpy.mockRestore();
+    });
+
+    test('a remount restores the group from the persisted blob, so the ratchet continues instead of rewinding', async () => {
+        const { selfIdentity, selfRecipientId, peerRecipientId } = await makePeerFixture();
+        const transport = makeRelayMockTransport();
+
+        const firstMount = await mountCreateAndAddPeer(
+            transport,
+            selfIdentity,
+            selfRecipientId,
+            peerRecipientId,
+        );
+
+        // Call 1: send "hello" -> ciphertext C1, nonce N1.
+        await sendGroupMessage('hello');
+        const call1 = sentCiphertextsTo(transport, peerRecipientId);
+        expect(call1.length).toBe(1);
+        const c1 = call1[0];
+        const n1 = nonceOf(c1);
+
+        // The blob persisted after call 1 is the post-send ratchet state.
+        const b1 = readPersistedGroupState()!.blob!;
+        expect(b1.length).toBeGreaterThan(0);
+
+        // Unmount and remount: the fresh component must restore from the blob.
+        firstMount.unmount();
+        const secondMount = render(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+        await flush();
+        await flush();
+        expect(screen.getByTestId('member-list')).toBeInTheDocument();
+        expect(screen.getByTestId(`member-${peerRecipientId}`)).toBeInTheDocument();
+
+        // Call 2: send "world" -> ciphertext C2, nonce N2.
+        await sendGroupMessage('world');
+        const call2 = sentCiphertextsTo(transport, peerRecipientId);
+        expect(call2.length).toBe(2);
+        const c2 = call2[1];
+        const n2 = nonceOf(c2);
+
+        // The restored session advanced its ratchet: a rewound session would
+        // have reused N1, and a freshly rebuilt one would have produced an
+        // unrelated (random) nonce.
+        expect(hex(n2)).not.toBe(hex(n1));
+        expect(hex(c2)).not.toBe(hex(c1));
+
+        // Restore really went through group_from_bytes(b1): the nonce is the
+        // deterministic continuation of b1's chain key, which an independently
+        // restored session reproduces exactly. A fresh group cannot match this.
+        const expectedFromB1 = group_encrypt(
+            group_from_bytes(new Uint8Array(b1)),
+            selfIdentity,
+            new TextEncoder().encode('world'),
+        );
+        expect(hex(n2)).toBe(hex(nonceOf(expectedFromB1)));
+
+        // Follow-up (state left behind): the blob written AFTER call 2 must
+        // itself be the correct post-call-2 state, not merely a value that made
+        // call 2 return the right ciphertext.
+        const b2 = readPersistedGroupState()!.blob!;
+        expect(b2).not.toEqual(b1);
+        const expectedB2Group = group_from_bytes(new Uint8Array(b1));
+        group_encrypt(expectedB2Group, selfIdentity, new TextEncoder().encode('world'));
+        expect(b2).toEqual(Array.from(group_to_bytes(expectedB2Group)));
+
+        // Third mount: restore from b2 and send "again" -> C3, N3.
+        secondMount.unmount();
+        render(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+        await flush();
+        await flush();
+        expect(screen.getByTestId('member-list')).toBeInTheDocument();
+        await sendGroupMessage('again');
+        const call3 = sentCiphertextsTo(transport, peerRecipientId);
+        expect(call3.length).toBe(3);
+        const c3 = call3[2];
+        const n3 = nonceOf(c3);
+
+        // N3 advanced past N2 (changed, and matches the deterministic
+        // continuation of b2) and C3 differs from C2.
+        expect(hex(n3)).not.toBe(hex(n2));
+        expect(hex(c3)).not.toBe(hex(c2));
+        const expectedFromB2 = group_encrypt(
+            group_from_bytes(new Uint8Array(b2)),
+            selfIdentity,
+            new TextEncoder().encode('again'),
+        );
+        expect(hex(n3)).toBe(hex(nonceOf(expectedFromB2)));
+    });
+
+    test('an empty, truncated, or corrupt persisted blob fails closed, while a legacy no-blob record still restores', async () => {
+        const { selfIdentity, selfRecipientId, peerPublic, peerRecipientId } = await makePeerFixture();
+        const transport = makeRelayMockTransport();
+
+        // Build a real, valid persisted record to derive the corrupt variants
+        // from. `seedGroup` is ratcheted once, so `validBlob` is the state AFTER
+        // one encrypt (i.e. past the initial chain position).
+        const seedGroup = group_add_member(group_create(selfIdentity), peerPublic);
+        group_encrypt(seedGroup, selfIdentity, new TextEncoder().encode('seed'));
+        const validBlob = Array.from(group_to_bytes(seedGroup));
+        const validMembers = [
+            { recipientId: peerRecipientId, publicBytes: Array.from(peerPublic) },
+        ];
+
+        const failClosedCases: Array<{ name: string; blob: number[] }> = [
+            { name: 'empty', blob: [] },
+            { name: 'truncated', blob: validBlob.slice(0, validBlob.length - 5) },
+            {
+                name: 'corrupt (flipped version byte)',
+                blob: (() => {
+                    const b = validBlob.slice();
+                    b[0] ^= 0xff;
+                    return b;
+                })(),
+            },
+            {
+                name: 'corrupt (flipped member count)',
+                blob: (() => {
+                    const b = validBlob.slice();
+                    b[34] ^= 0xff;
+                    return b;
+                })(),
+            },
+        ];
+
+        for (const { name, blob } of failClosedCases) {
+            seedPersistedGroupState({ members: validMembers, blob });
+            const view = render(
+                <GroupConversation
+                    transport={transport}
+                    identity={selfIdentity}
+                    selfRecipientId={selfRecipientId}
+                />,
+            );
+            await flush();
+            await flush();
+
+            // Fail closed: setError surfaced the failure (the component renders
+            // its error state as role='alert') and NO group was restored — no
+            // member list, no composer, no send button, so no send can succeed.
+            const alert = screen.getByRole('alert');
+            expect(alert.textContent).toContain('corrupt');
+            expect(screen.queryByTestId('member-list')).not.toBeInTheDocument();
+            expect(screen.queryByTestId('group-message-input')).not.toBeInTheDocument();
+            expect(screen.queryByTestId('group-send-button')).not.toBeInTheDocument();
+            expect(transport.sendEnvelope).not.toHaveBeenCalled();
+
+            view.unmount();
+            // Reset the store between sub-cases so a stale record cannot leak.
+            (MockStorageGate as unknown as { __store: Map<string, unknown> }).__store.clear();
+        }
+
+        // Legacy record (no blob field): the pre-ratchet-persistence path
+        // restores by replaying group_create + group_add_member, without error.
+        seedPersistedGroupState({ members: validMembers });
+        const legacyMount = render(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+        await flush();
+        await flush();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.getByTestId('member-list')).toBeInTheDocument();
+        expect(screen.getByTestId(`member-${peerRecipientId}`)).toBeInTheDocument();
+        await sendGroupMessage('legacy send');
+        expect(sentCiphertextsTo(transport, peerRecipientId).length).toBe(1);
+        legacyMount.unmount();
+        (MockStorageGate as unknown as { __store: Map<string, unknown> }).__store.clear();
+
+        // Follow-up: a fail-closed mount must not poison the next mount. Seed a
+        // valid blob and confirm the group restores and the ratchet continues
+        // from the persisted position rather than the initial one.
+        const initialGroup = group_add_member(group_create(selfIdentity), peerPublic);
+        const initialCiphertext = group_encrypt(
+            initialGroup,
+            selfIdentity,
+            new TextEncoder().encode('initial'),
+        );
+        const initialNonce = nonceOf(initialCiphertext);
+
+        seedPersistedGroupState({ members: validMembers, blob: validBlob });
+        const recoveredMount = render(
+            <GroupConversation
+                transport={transport}
+                identity={selfIdentity}
+                selfRecipientId={selfRecipientId}
+            />,
+        );
+        await flush();
+        await flush();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.getByTestId('member-list')).toBeInTheDocument();
+        const sendsBeforeRecovery = sentCiphertextsTo(transport, peerRecipientId).length;
+        await sendGroupMessage('after recovery');
+
+        const recovered = sentCiphertextsTo(transport, peerRecipientId);
+        expect(recovered.length).toBe(sendsBeforeRecovery + 1);
+        const recoveredNonce = nonceOf(recovered[recovered.length - 1]);
+
+        // The send used the restored (advanced) chain position, not the initial
+        // one, and matches the deterministic continuation of the seeded blob.
+        expect(hex(recoveredNonce)).not.toBe(hex(initialNonce));
+        const expectedRecovered = group_encrypt(
+            group_from_bytes(new Uint8Array(validBlob)),
+            selfIdentity,
+            new TextEncoder().encode('after recovery'),
+        );
+        expect(hex(recoveredNonce)).toBe(hex(nonceOf(expectedRecovered)));
+
+        recoveredMount.unmount();
+    });
+
+    test('a failed pre-send ratchet save aborts the group send — no envelope is delivered', async () => {
+        const { selfIdentity, selfRecipientId, peerRecipientId } = await makePeerFixture();
+        const transport = makeRelayMockTransport();
+        await mountCreateAndAddPeer(transport, selfIdentity, selfRecipientId, peerRecipientId);
+        const callsBefore = transport.sendEnvelope.mock.calls.length;
+        const putSpy = vi.spyOn(MockStorageGate.prototype, 'put').mockRejectedValue(new Error('quota exceeded'));
+        try {
+            await sendGroupMessage('must not be sent');
+            expect(screen.getByRole('alert')).toHaveTextContent('Could not save session state; message not sent');
+            expect(transport.sendEnvelope.mock.calls.length).toBe(callsBefore);
+        } finally {
+            putSpy.mockRestore();
+        }
     });
 });
