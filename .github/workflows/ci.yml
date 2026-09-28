@@ -99,6 +99,12 @@ jobs:
       - name: npm audit high/critical
         run: |
           npm audit --audit-level=high --production
+      # relay_integration.test.ts spawns `cargo run --bin relay_ws_test_harness`
+      # and lets it take 60s to print its ws:// URL. Compile that binary here so
+      # the budget measures startup rather than a cold build of the relay tree.
+      - name: Prebuild the relay test harness
+        working-directory: ${{ github.workspace }}
+        run: cargo build --bin relay_ws_test_harness
       - run: npm test
 
   web-artifact:
