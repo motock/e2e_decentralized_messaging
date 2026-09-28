@@ -385,4 +385,19 @@ describe('GroupConversation real-peer member distribution', () => {
         await waitFor(() => expect(screen.getByTestId('member-list')).toBeInTheDocument());
         expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
+    test('supplying only one of identity/selfRecipientId still fails closed', async () => {
+        // Pin the `||` boundary: either prop missing must deny, not fall back.
+        const { unmount } = render(<GroupConversation identity={selfIdentity} />);
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeInTheDocument();
+        });
+        expect(screen.queryByTestId('create-group-button')).not.toBeInTheDocument();
+        unmount();
+
+        render(<GroupConversation selfRecipientId={selfRecipientId} />);
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeInTheDocument();
+        });
+        expect(screen.queryByTestId('create-group-button')).not.toBeInTheDocument();
+    });
 });
