@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 /// Errors returned by the blind store-and-forward.
 #[derive(Debug, PartialEq)]
@@ -13,7 +13,7 @@ pub enum StoreError {
 
 /// A blind in-memory store that holds ciphertext envelopes with TTL.
 pub struct RelayStore {
-    inner: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
+    inner: Mutex<HashMap<String, (Vec<u8>, SystemTime)>>,
 }
 
 impl Default for RelayStore {
@@ -37,7 +37,7 @@ impl RelayStore {
         envelope: Vec<u8>,
         ttl: Duration,
     ) -> Result<(), StoreError> {
-        let expiry = Instant::now() + ttl;
+        let expiry = SystemTime::now() + ttl;
         let mut map = self.inner.lock().unwrap();
         map.insert(recipient_id.to_string(), (envelope, expiry));
         Ok(())
@@ -48,7 +48,7 @@ impl RelayStore {
         let mut map = self.inner.lock().unwrap();
         match map.get(recipient_id) {
             None => Err(StoreError::NotFound),
-            Some((_, expiry)) if Instant::now() > *expiry => {
+            Some((_, expiry)) if *expiry <= SystemTime::now() => {
                 // expired, remove
                 map.remove(recipient_id);
                 Err(StoreError::Expired)
@@ -95,7 +95,7 @@ pub enum MailboxError {
 }
 
 /// Opaque envelope with its expiry instant, queued FIFO per recipient.
-type Queue = VecDeque<(Vec<u8>, Instant)>;
+type Queue = VecDeque<(Vec<u8>, SystemTime)>;
 
 /// Per-recipient FIFO queue of opaque envelopes.
 ///
@@ -128,7 +128,7 @@ impl Mailbox {
         envelope: Vec<u8>,
         ttl: Duration,
     ) -> Result<(), MailboxError> {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut queues = self.queues.lock().unwrap();
         let queue = queues.entry(recipient_id.to_string()).or_default();
         queue.retain(|(_, expiry)| *expiry > now);
@@ -148,7 +148,7 @@ impl Mailbox {
     /// [`MailboxError::NotFound`] when the recipient has no queue, and
     /// [`MailboxError::Expired`] when the queue held only expired envelopes.
     pub fn dequeue(&self, recipient_id: &str) -> Result<Vec<u8>, MailboxError> {
-        let now = Instant::now();
+        let now = SystemTime::now();
         let mut queues = self.queues.lock().unwrap();
         let mut discarded_expired = false;
         let mut found: Option<Vec<u8>> = None;
