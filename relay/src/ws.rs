@@ -316,6 +316,10 @@ fn truncate_id(id: &str) -> String {
 fn mailbox_send_error_response(e: MailboxError) -> WsResponse {
     match e {
         MailboxError::QueueFull => WsResponse::err("QueueFull"),
+        MailboxError::Io(msg) => {
+            warn!("ws: store io error on envelope send: {msg}");
+            WsResponse::err("StoreError")
+        }
         // NotFound/Expired are unreachable from enqueue; kept for exhaustiveness.
         other => WsResponse::err(format!("StoreError: {other:?}")),
     }
@@ -495,6 +499,13 @@ async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse {
                 Ok(envelope_bytes) => WsResponse::ok_envelope(b64_encode(&envelope_bytes)),
                 Err(MailboxError::NotFound) => WsResponse::err("NotFound"),
                 Err(MailboxError::Expired) => WsResponse::err("Expired"),
+                Err(MailboxError::Io(msg)) => {
+                    warn!(
+                        recipient = %truncate_id(&recipient_id),
+                        "ws: store io error on pickup_envelope: {msg}"
+                    );
+                    WsResponse::err("StoreError")
+                }
                 Err(e) => WsResponse::err(format!("StoreError: {e:?}")),
             }
         }
