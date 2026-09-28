@@ -96,3 +96,26 @@ for e
 [step 41] done rejected — worktree dirty, asking agent to commit
 [step 42] bash: git status --short; echo "---"; git log --oneline -1; echo "--- is log ignored? ---"; git check-ignore -v test_author.lo
 [step 43] bash: git add -A && git commit -q -m "RD-2: record test-author run log" && git status --short && git log --oneline -2
+[step 44] DONE: Done. Working tree is clean; work is committed on branch agent/rd-2.
+
+**Commits:**
+- `e896be7` — RD-2: grade relay store persistence (envelopes + prekeys) across a restart (the test suite)
+- `8afccef` — RD-2: record test-author run log (harness log artifact)
+
+**Deliverable:** `relay/tests/store_persistence.rs` (238 lines, 8 tests). No implementation files were touched.
+
+**Contract pinned:** `RelayStore::open(path) -> Result<RelayStore, _>` and `Mailbox::open(path, max_depth) -> Result<Mailbox, _>`; a "restart" is a drop + reopen of the same path.
+
+**Requirements graded, each with its own assertion:**
+- Durability: an enqueued envelope and a published prekey are still delivered after a restart.
+- Security requirement: an entry whose TTL elapsed while the relay was down is NOT resurrected (live-TTL sleep case + zero-TTL boundary case).
+- Boundary: FIFO order and the per-recipient depth cap (`QueueFull`) hold across a restart; a fresh path with no file behaves exactly as today.
+- Negative: corrupt and empty store files fail closed — start empty or refuse to start, never panic, never serve garbage.
+- Negative: state is keyed by path, not process-global (two paths are isolated) — guards against the OnceLock-style global the brief warns about.
+- Blindness: `has_method("open")` is true (membership only, not an exact-set assertion) and `decrypt`/`read_plaintext`/`parse` stay false.
+
+**Deliberately not asserted:** the rate limiter and PoW challenges stay per-listener (pinned by the existing `ws_bridge.rs` test, which I did not modify); nothing here touches them, so a later story can change them freely.
+
+**RED confirmed:** `cargo test -p relay --test store_persistence` fails with `error[E0599]: no associated function or constant named 'open' found for struct 'RelayStore'/'Mailbox'` — an attribute error because the implementation does not exist yet, not a bug in the test logic.
+
+**Not mechanically testable:** the settled "plain SQLite via rusqlite, no SQLCipher" decision is a dependency/build choice, not observable through the store API, so it is not graded (a manifest-text assertion would freeze a build detail rather than behavior).
