@@ -215,13 +215,15 @@ warning is displayed instead — the client fails closed.
 
 The relay queues envelopes FIFO per recipient, so messages sent while the
 peer is offline are retained in send order rather than overwriting each
-other. Each `pickup_envelope` returns and removes the OLDEST queued
-envelope, one per call: it reports `NotFound` when the queue is empty and
-`Expired` once when only expired envelopes remained (those are discarded,
-so the next call reports `NotFound`). A client should therefore keep
-polling until it gets `NotFound` to drain a backlog. Each recipient's queue
-has a per-recipient cap; once it is reached, further sends are rejected with
-`QueueFull` and already-queued envelopes are never dropped to make room.
+other. Envelopes survive a relay restart and are retained only until their
+TTL expires, enforced by wall‑clock expiry. Each `pickup_envelope` returns and
+removes the OLDEST queued envelope, one per call: it reports `NotFound` when
+the queue is empty and `Expired` once when only expired envelopes remained
+(those are discarded, so the next call reports `NotFound`). A client should
+therefore keep polling until it gets `NotFound` to drain a backlog. Each
+recipient's queue has a per-recipient cap; once it is reached, further
+sends are rejected with `QueueFull` and already-queued envelopes are never
+removed to make room.
 
 > **First message timing:** the peer must have already loaded the app
 > (publishing their prekey bundle to the relay) before you can send them a
