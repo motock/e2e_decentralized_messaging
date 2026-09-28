@@ -90,6 +90,7 @@ vi.mock('../src/relay_transport', () => ({
             // error banner, no console spam) rather than crashing with
             // "pickupEnvelope is not a function".
             pickupEnvelope: () => Promise.reject(new Error('NotFound')),
+            close: () => {},
         };
     }),
 }));
