@@ -121,3 +121,12 @@ echo "=== crypto/
 [step 46] view_file: .agent_scratchpad.md
 [step 46] bash: ls core/protocol/tests/
 [step 47] replace_lines: .agent_scratchpad.md
+[step 48] replace_lines: .agent_scratchpad.md
+[step 49] bash: wc -l core/protocol/tests/device_revocation.rs; echo "--- error kinds (must be ONLY missing-symbol errors) ---"; cargo t
+[step 50] bash: git add core/protocol/tests/device_revocation.rs .agent_scratchpad.md && git status --short && git commit -q -m "test(pr
+[step 51] bash: git add core/protocol/tests/device_revocation.rs && git status --short && git commit -q -m "test(protocol): grade verifi
+[step 52] bash: git log --oneline -3; echo "--- status ---"; git status --short; echo "--- is file tracked? ---"; git ls-files core/prot
+[step 53] bash: git show --stat --oneline 64985b3 | head -20; echo "=== does HEAD's copy match my file? ==="; git diff HEAD --stat -- co
+[step 54] bash: echo "=== introducing commit ==="; git log --oneline -- core/protocol/tests/device_revocation.rs; echo "=== 069a300 stat
+   [read-heavy nudge: 6 reads in a row]
+[step 55] checkpoint: 
