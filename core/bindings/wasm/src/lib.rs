@@ -48,6 +48,7 @@ use crypto::device_qr;
 use crypto::identity::{IdentityKeyPair, PublicIdentityKey};
 use crypto::ratchet_session::{DoubleRatchetSession, SessionError};
 use crypto::session;
+use protocol::fanout::{DeviceId, FanoutError, FanoutSession};
 use protocol::group::{GroupMember, GroupSession};
 
 /// A structured, JS-visible error — the WASM analogue of desktop's `ShellError`. Every core
@@ -138,6 +139,22 @@ impl From<SessionError> for WasmError {
             "PreKey"
         } else {
             "Session"
+        };
+        WasmError::new(kind, &err.to_string())
+    }
+}
+
+impl From<FanoutError> for WasmError {
+    fn from(err: FanoutError) -> Self {
+        // `IdentityMismatch` is the security-relevant case — the bundle's identity key is not
+        // the one the caller vouched for, so the device is not who it claims to be — and
+        // `NoDevices` is a caller-input error; both get their own kind so JS can switch on
+        // them. Everything else (establishment/encrypt failure for a named device) stays
+        // kind = "Fanout".
+        let kind = match err {
+            FanoutError::NoDevices => "NoDevices",
+            FanoutError::IdentityMismatch { .. } => "IdentityMismatch",
+            _ => "Fanout",
         };
         WasmError::new(kind, &err.to_string())
     }
@@ -743,4 +760,246 @@ pub fn group_from_bytes(bytes: &[u8]) -> Result<GroupHandle, WasmError> {
     let session = GroupSession::from_bytes(bytes).map_err(WasmError::from)?;
 
     Ok(GroupHandle { inner: session })
+}
+
+// ---------------------------------------------------------------------------
+// Sender-side fan-out (DR-5)
+// ---------------------------------------------------------------------------
+
+/// One recipient device's public material, as supplied by the caller.
+///
+/// `expected_identity_key_bytes` is the device's identity key as vouched for by an
+/// authenticated source — the primary-signed device list (spec/v0.md §8.3) — and NOT the
+/// identity key carried inside `bundle_bytes`. [`fanout_establish`] compares the two and
+/// rejects the device on a mismatch, so an attacker-substituted bundle (own identity key,
+/// valid self-signatures) cannot silently redirect ciphertext.
+///
+/// This is a struct rather than a `(u32, Vec<u8>, Vec<u8>)` tuple because wasm-bindgen has
+/// no ABI representation for tuples: `Vec<T>` requires `T: VectorIntoWasmAbi`/
+/// `VectorFromWasmAbi`, implemented for primitives, `String`, `JsValue`, and
+/// `#[wasm_bindgen]` structs — not tuples. JS passes an array of these objects.
+#[wasm_bindgen]
+pub struct FanoutDeviceInput {
+    device_id: u32,
+    expected_identity_key_bytes: Vec<u8>,
+    bundle_bytes: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl FanoutDeviceInput {
+    /// Build one recipient entry: the device id, the identity key bytes the caller vouches
+    /// for from the authenticated device list, and the device's serialized prekey bundle.
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        device_id: u32,
+        expected_identity_key_bytes: Vec<u8>,
+        bundle_bytes: Vec<u8>,
+    ) -> FanoutDeviceInput {
+        FanoutDeviceInput {
+            device_id,
+            expected_identity_key_bytes,
+            bundle_bytes,
+        }
+    }
+
+    /// The device id this entry establishes a session for.
+    #[wasm_bindgen(getter)]
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    /// The identity key bytes the caller vouches for (from the authenticated device list).
+    #[wasm_bindgen(getter)]
+    pub fn expected_identity_key_bytes(&self) -> Vec<u8> {
+        self.expected_identity_key_bytes.clone()
+    }
+
+    /// The device's serialized prekey bundle bytes.
+    #[wasm_bindgen(getter)]
+    pub fn bundle_bytes(&self) -> Vec<u8> {
+        self.bundle_bytes.clone()
+    }
+}
+
+impl std::fmt::Debug for FanoutDeviceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately omits the identity/bundle bytes: they are public key material, but
+        // this project keeps key bytes out of logs regardless of their sensitivity.
+        f.debug_struct("FanoutDeviceInput")
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One recipient's encrypted envelope, as returned by [`fanout_encrypt`].
+#[wasm_bindgen]
+pub struct FanoutEnvelope {
+    device_id: u32,
+    envelope: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl FanoutEnvelope {
+    /// The device this envelope is destined for.
+    #[wasm_bindgen(getter)]
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    /// The self-describing wire envelope to relay to that device.
+    #[wasm_bindgen(getter)]
+    pub fn envelope(&self) -> Vec<u8> {
+        self.envelope.clone()
+    }
+}
+
+impl std::fmt::Debug for FanoutEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FanoutEnvelope")
+            .field("device_id", &self.device_id)
+            .field("envelope_len", &self.envelope.len())
+            .finish()
+    }
+}
+
+/// An opaque handle to a sender-side fan-out session. Wraps the real Rust `FanoutSession`
+/// state — wasm-bindgen passes struct instances by reference, no serialization step. JS code
+/// creates one via [`fanout_establish`], reads the recipient set via [`fanout_devices`],
+/// removes a device via [`fanout_remove_device`], and encrypts via [`fanout_encrypt`].
+///
+/// The handle is stateful: [`fanout_remove_device`] mutates the session it holds, so a
+/// subsequent [`fanout_devices`]/[`fanout_encrypt`] on the same handle reflects the removal.
+#[wasm_bindgen]
+pub struct FanoutHandle {
+    inner: FanoutSession,
+}
+
+impl std::fmt::Debug for FanoutHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FanoutHandle").finish_non_exhaustive()
+    }
+}
+
+/// Build a sender-side fan-out session from public device material — bytes in, so the caller
+/// needs no private keys.
+///
+/// Each entry carries `(device_id, expected_identity_key_bytes, bundle_bytes)`. The expected
+/// identity key is an EXPLICIT input and is never read from the bundle being verified: PQXDH
+/// only checks a bundle against the identity key carried inside it (self-consistency, not
+/// authenticity), so deriving the expectation from the bundle would make the check a no-op
+/// and let an attacker-substituted bundle establish cleanly. The caller supplies the
+/// expectation from the primary-signed verified device set (spec/v0.md §8.3).
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "NoDevices"` for an empty device list, `kind =
+/// "MalformedBundle"` for unparseable bundle bytes, `kind = "IdentityMismatch"` when a
+/// bundle's identity key is not the expected one (checked before any session is built; a
+/// malformed expected key also lands here, since it can never equal a well-formed bundle
+/// identity), and `kind = "Fanout"` for any other establishment failure. Never panics.
+#[wasm_bindgen]
+pub fn fanout_establish(
+    identity_handle: &IdentityHandle,
+    devices: Vec<FanoutDeviceInput>,
+) -> Result<FanoutHandle, WasmError> {
+    if devices.is_empty() {
+        return Err(WasmError::new(
+            "NoDevices",
+            "fan-out requires at least one recipient device",
+        ));
+    }
+
+    let mut parsed = Vec::with_capacity(devices.len());
+    for device in devices {
+        let bundle = session::bundle_from_bytes(&device.bundle_bytes).map_err(|_| {
+            WasmError::new(
+                "MalformedBundle",
+                "malformed or truncated prekey bundle bytes",
+            )
+        })?;
+
+        // The caller's explicit expected-identity bytes are authoritative: they come from the
+        // primary-signed verified device set (spec/v0.md §8.3), NOT from the bundle. Compare
+        // them against the identity key the bundle carries BEFORE any session is built, so an
+        // attacker-substituted bundle (own identity key, valid self-signatures) is rejected
+        // here rather than silently accepted.
+        //
+        // The comparison is on the serialized key bytes because this crate deliberately does
+        // not depend on `libsignal-protocol` directly (it is not in this story's file scope);
+        // it is equivalent to decoding the caller's bytes and comparing the keys, and it fails
+        // closed on malformed input — a malformed expected key can never equal a well-formed
+        // bundle identity, so it is rejected too.
+        let bundle_identity = bundle.identity_key().map_err(|_| {
+            WasmError::new("MalformedBundle", "prekey bundle carries no identity key")
+        })?;
+        if bundle_identity.serialize().as_ref() != device.expected_identity_key_bytes.as_slice() {
+            return Err(WasmError::new(
+                "IdentityMismatch",
+                "prekey bundle identity key is not the expected identity for this device",
+            ));
+        }
+
+        // `bundle_identity` is now *proven* equal to the caller's expected bytes, so what is
+        // handed to `establish_from_bundles` is the caller's expectation — the guard there
+        // cannot degrade to a no-op.
+        parsed.push((DeviceId(device.device_id), *bundle_identity, bundle));
+    }
+
+    let session =
+        FanoutSession::establish_from_bundles(identity_handle.inner.as_libsignal(), &parsed)
+            .map_err(WasmError::from)?;
+
+    Ok(FanoutHandle { inner: session })
+}
+
+/// The device ids currently tracked by this fan-out, ascending.
+///
+/// This is the observable recipient set: after [`fanout_remove_device`] the removed device is
+/// absent and the survivors are still present.
+#[wasm_bindgen]
+pub fn fanout_devices(handle: &FanoutHandle) -> Vec<u32> {
+    handle.inner.devices().map(|device| device.0).collect()
+}
+
+/// Remove a device from this fan-out, mutating the session the handle holds.
+///
+/// Removing a device that is not tracked is a no-op that still returns `Ok(())` — the
+/// post-condition ("this device is not a recipient") holds either way. The next
+/// [`fanout_encrypt`] emits nothing for the removed device.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Fanout"` if the removal fails. Never panics.
+#[wasm_bindgen]
+pub fn fanout_remove_device(handle: &mut FanoutHandle, device_id: u32) -> Result<(), WasmError> {
+    handle
+        .inner
+        .remove_device(DeviceId(device_id))
+        .map_err(WasmError::from)
+}
+
+/// Encrypt `plaintext` once per currently-tracked device, returning one [`FanoutEnvelope`] per
+/// surviving recipient — nothing for a device that has been removed.
+///
+/// # Errors
+///
+/// Returns `WasmError` with `kind = "Fanout"` if the Double Ratchet encrypt step fails for a
+/// device. Never panics.
+#[wasm_bindgen]
+pub fn fanout_encrypt(
+    handle: &mut FanoutHandle,
+    plaintext: &[u8],
+) -> Result<Vec<FanoutEnvelope>, WasmError> {
+    let ciphertexts = handle
+        .inner
+        .encrypt_to_all(plaintext)
+        .map_err(WasmError::from)?;
+
+    Ok(ciphertexts
+        .into_iter()
+        .map(|ciphertext| FanoutEnvelope {
+            device_id: ciphertext.device.0,
+            envelope: ciphertext.envelope,
+        })
+        .collect())
 }

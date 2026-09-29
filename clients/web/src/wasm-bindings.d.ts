@@ -21,6 +21,33 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
   // comment. Encrypt/decrypt are free functions that take a SessionHandle.
   export class SessionHandle {}
 
+  // One recipient device's public material for a fan-out. `expected_identity_key_bytes`
+  // is the identity key the caller vouches for from the primary-signed device list
+  // (spec/v0.md §8.3) — NOT the identity key carried inside `bundle_bytes`. The
+  // binding compares the two and rejects the device on a mismatch, so an
+  // attacker-substituted bundle cannot silently redirect ciphertext.
+  export class FanoutDeviceInput {
+    constructor(
+      device_id: number,
+      expected_identity_key_bytes: Uint8Array,
+      bundle_bytes: Uint8Array,
+    );
+    readonly device_id: number;
+    readonly expected_identity_key_bytes: Uint8Array;
+    readonly bundle_bytes: Uint8Array;
+  }
+
+  // One recipient's encrypted envelope, as returned by `fanout_encrypt`.
+  export class FanoutEnvelope {
+    readonly device_id: number;
+    readonly envelope: Uint8Array;
+  }
+
+  // Opaque, stateful handle to a sender-side fan-out session. `fanout_remove_device`
+  // mutates the session the handle holds, so a later `fanout_devices`/`fanout_encrypt`
+  // on the same handle reflects the removal.
+  export class FanoutHandle {}
+
   // The WASM-boundary structured error — kind is a variant tag ("MalformedBundle",
   // "PreKey", "Session", "NotMember", "Group", "SafetyNumber", ...), message is
   // human-readable detail. Thrown (not returned) across the JS boundary by
@@ -61,6 +88,17 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
  
  export function group_to_bytes(group: GroupHandle): Uint8Array;
  export function group_from_bytes(bytes: Uint8Array): GroupHandle;
+
+  export function fanout_establish(
+    identity_handle: IdentityHandle,
+    devices: FanoutDeviceInput[],
+  ): FanoutHandle;
+  export function fanout_devices(handle: FanoutHandle): Uint32Array;
+  export function fanout_remove_device(handle: FanoutHandle, device_id: number): void;
+  export function fanout_encrypt(
+    handle: FanoutHandle,
+    plaintext: Uint8Array,
+  ): FanoutEnvelope[];
  
  export function derive_safety_number(
    localIdentityKey: Uint8Array,
