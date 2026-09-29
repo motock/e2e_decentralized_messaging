@@ -34,6 +34,113 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets --locked
+      # TEMPORARY DIAGNOSTIC -- REMOVE BEFORE MERGE.
+      # `cargo test --workspace` dies on Windows with 0xc0000139
+      # STATUS_ENTRYPOINT_NOT_FOUND on clients_desktop_tauri-*.exe once
+      # core_storage's SQLCipher/OpenSSL is linked into it. A first pass proved
+      # /DEPENDENTS lists only system DLLs, and a GetProcAddress sweep over a
+      # `-p clients-desktop-tauri` build resolved 455/455 real imports. But that
+      # is a DIFFERENT binary from the one that fails (7098... vs 9bd2...):
+      # `--workspace` feature-unifies, so the failing exe is not the one tested.
+      # This pass builds BOTH ways, RUNS every desktop lib-test exe to see which
+      # actually fail, and diffs the two import tables -- the imports present
+      # only in the failing binary are the suspect set.
+      - name: Diff desktop lib test binary imports (windows)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo test --workspace --locked --no-run 2>&1 | Select-Object -Last 2
+          cargo test -p clients-desktop-tauri --lib --locked --no-run 2>&1 | Select-Object -Last 2
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $vs "VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dumpbin) { Write-Host "DIAG: dumpbin not found"; exit 0 }
+
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Ldr {
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr LoadLibraryA(string name);
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Ansi)]
+            public static extern IntPtr GetProcAddress(IntPtr h, string name);
+          }
+          "@
+
+          function Get-ImportMap([string]$path) {
+            $raw = & $dumpbin.FullName /IMPORTS $path 2>&1
+            $cur = $null; $map = @{}
+            foreach ($line in $raw) {
+              if ($line -match '^\s+(\S+\.dll)\s*$') {
+                $cur = $Matches[1]
+                if (-not $map.ContainsKey($cur)) { $map[$cur] = New-Object System.Collections.Generic.List[string] }
+                continue
+              }
+              if (-not $cur) { continue }
+              if ($line -match '^\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
+                $fn = $Matches[1]
+                if ($fn.StartsWith('.')) { continue }   # .text/.data/... section pseudo-imports
+                $map[$cur].Add($fn)
+              }
+            }
+            return $map
+          }
+
+          $exes = @(Get-ChildItem target/debug/deps/clients_desktop_tauri-*.exe -ErrorAction SilentlyContinue)
+          Write-Host "DIAG: $($exes.Count) desktop lib-test exe(s) present"
+
+          $sets = @{}
+          foreach ($e in $exes) {
+            $null = & $e.FullName --list 2>&1 | Select-Object -First 1
+            $code = $LASTEXITCODE
+            $hex = if ($code -lt 0) { '0x{0:X8}' -f [uint32]$code } else { "$code" }
+            $fails = $code -ne 0
+            Write-Host "DIAG RUN: $($e.Name) exit=$code ($hex) fails=$fails"
+
+            $map = Get-ImportMap $e.FullName
+            $flat = New-Object System.Collections.Generic.List[string]
+            foreach ($dll in $map.Keys) { foreach ($fn in $map[$dll]) { $flat.Add("$dll!$fn") } }
+            $sorted = ($flat | Sort-Object) -join "`n"
+            $sha = [System.BitConverter]::ToString(
+              [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes($sorted))).Replace('-','').Substring(0,12)
+            Write-Host "DIAG IMPORTS: $($e.Name) count=$($flat.Count) sha=$sha"
+            $sets[$e.Name] = @{ Flat = $flat; Fails = $fails; Map = $map }
+          }
+
+          $names = @($sets.Keys)
+          if ($names.Count -ge 2) {
+            $a = $sets[$names[0]].Flat; $b = $sets[$names[1]].Flat
+            $onlyA = @($a | Where-Object { $b -notcontains $_ })
+            $onlyB = @($b | Where-Object { $a -notcontains $_ })
+            Write-Host "DIAG DIFF: only in $($names[0]) ($($onlyA.Count)):"
+            $onlyA | ForEach-Object { Write-Host "DIAG ONLY-FIRST: $_" }
+            Write-Host "DIAG DIFF: only in $($names[1]) ($($onlyB.Count)):"
+            $onlyB | ForEach-Object { Write-Host "DIAG ONLY-SECOND: $_" }
+          }
+
+          foreach ($n in $names) {
+            if (-not $sets[$n].Fails) { continue }
+            Write-Host "===== DIAG probing the FAILING exe $n ====="
+            $missing = @()
+            foreach ($dll in $sets[$n].Map.Keys) {
+              $h = [Ldr]::LoadLibraryA($dll)
+              if ($h -eq [IntPtr]::Zero) { Write-Host "DIAG: LoadLibraryA failed for $dll"; continue }
+              foreach ($fn in $sets[$n].Map[$dll]) {
+                if ([Ldr]::GetProcAddress($h, $fn) -eq [IntPtr]::Zero) { $missing += "$dll!$fn" }
+              }
+            }
+            if ($missing.Count -eq 0) { Write-Host "DIAG: every real import of the failing exe resolves" }
+            else { $missing | ForEach-Object { Write-Host "DIAG MISSING: $_" } }
+          }
+
+          $sys = Join-Path $env:SystemRoot 'System32'
+          $c = Join-Path $sys 'comctl32.dll'
+          $exp = & $dumpbin.FullName /EXPORTS $c 2>&1 | Select-String 'TaskDialogIndirect'
+          Write-Host "DIAG: System32/comctl32.dll version=$((Get-Item $c).VersionInfo.FileVersion) exportsTaskDialogIndirect=$([bool]$exp)"
       - run: cargo test --workspace --locked
 
   lint:
