@@ -232,19 +232,56 @@ impl WsState {
     /// `envelope_ttl` field afterwards.
     #[doc(hidden)]
     pub fn new_with(store: Mailbox, rate_limit_per_minute: u32, _envelope_ttl: Duration) -> Self {
-        Self {
-            store,
-            ..Self::new(rate_limit_per_minute)
-        }
+        Self::from_stores(rate_limit_per_minute, store, RelayStore::new())
     }
 
+    /// Build the default shared state: in-memory stores, production TTLs.
+    ///
+    /// A listener built without a configured store path keeps the historical
+    /// behaviour — a restart loses state. See [`WsState::open_stores`] for the
+    /// durable variant.
     fn new(rate_limit_per_minute: u32) -> Self {
-        // In-memory by default: a listener built from `RelayOptions` has no store
-        // path to open, and a restart losing state is the behaviour pinned today.
-        // Surfacing a configurable path is RD-3's job.
+        Self::from_stores(
+            rate_limit_per_minute,
+            Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
+            RelayStore::new(),
+        )
+    }
+
+    /// Build the shared state, opening the stores once for the whole listener.
+    ///
+    /// `store_path: None` keeps the historical in-memory behaviour (a restart
+    /// loses state). `Some(path)` opts in to on-disk durability: the path is
+    /// resolved once, against the process working directory at startup, and
+    /// both the envelope mailbox and the prekey store are opened (or created)
+    /// from that single location. An unopenable path is an error — the relay
+    /// must fail closed rather than silently fall back to memory.
+    fn open_stores(
+        rate_limit_per_minute: u32,
+        store_path: Option<&std::path::Path>,
+    ) -> Result<Self, StoreError> {
+        let (store, prekeys) = match store_path {
+            None => (
+                Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
+                RelayStore::new(),
+            ),
+            Some(path) => {
+                let resolved = crate::resolve_store_path(path)?;
+                (
+                    Mailbox::open(&resolved, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)?,
+                    RelayStore::open(&resolved)?,
+                )
+            }
+        };
+        Ok(Self::from_stores(rate_limit_per_minute, store, prekeys))
+    }
+
+    /// Build the shared state from already-opened store handles (see
+    /// [`serve_listener_with_stores`]).
+    fn from_stores(rate_limit_per_minute: u32, store: Mailbox, prekeys: RelayStore) -> Self {
         Self {
-            store: Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
-            prekeys: RelayStore::new(),
+            store,
+            prekeys,
             rate_limiter: Mutex::new(RateLimiter::per_identity(rate_limit_per_minute)),
             challenges: Mutex::new(std::collections::HashMap::new()),
             envelope_kinds: Mutex::new(std::collections::HashMap::new()),
@@ -947,7 +984,7 @@ pub async fn run_ws_listener(
     rate_limit_per_minute: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
-    serve_listener(listener, rate_limit_per_minute).await
+    serve_listener(listener, rate_limit_per_minute, None).await
 }
 
 /// Run the WS accept loop on an already-bound [`TcpListener`].
@@ -958,9 +995,36 @@ pub async fn run_ws_listener(
 pub async fn serve_listener(
     listener: TcpListener,
     rate_limit_per_minute: u32,
+    store_path: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = Arc::new(WsState::new(rate_limit_per_minute));
+    // The store is opened once, here, before any connection is accepted: every
+    // accepted connection shares this state. An
+    // unopenable configured path fails closed before the listener serves.
+    let state = Arc::new(WsState::open_stores(rate_limit_per_minute, store_path)?);
+    serve_listener_with_state(listener, rate_limit_per_minute, state).await
+}
 
+/// Run the WS accept loop on an already-bound listener with pre-opened stores.
+///
+/// Used by the binary entry point, which opens the durable store synchronously
+/// (fail-closed) before spawning the listener task. The handles are moved into
+/// the shared [`WsState`]; every accepted connection clones them.
+pub async fn serve_listener_with_stores(
+    listener: TcpListener,
+    rate_limit_per_minute: u32,
+    store: Mailbox,
+    prekeys: RelayStore,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = Arc::new(WsState::from_stores(rate_limit_per_minute, store, prekeys));
+    serve_listener_with_state(listener, rate_limit_per_minute, state).await
+}
+
+/// Shared accept loop: the store(s) are already built; just accept and spawn.
+async fn serve_listener_with_state(
+    listener: TcpListener,
+    _rate_limit_per_minute: u32,
+    state: Arc<WsState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
         let state = state.clone();

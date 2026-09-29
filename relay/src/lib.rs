@@ -9,11 +9,13 @@
 //! streams between peers without being able to read or modify the Signal Protocol
 //! E2E content.
 
+use crate::store::{Mailbox, RelayStore, StoreError, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT};
 use libp2p::{
     futures::StreamExt, identity::Keypair, noise, ping, relay, swarm::SwarmEvent, tcp, yamux,
     Multiaddr, Swarm, SwarmBuilder,
 };
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 pub mod pow;
@@ -53,6 +55,31 @@ pub fn build_relay_swarm(
     Ok(swarm)
 }
 
+/// Resolve a configured store path ONCE, at startup.
+///
+/// A relative path is anchored to the process working directory so a later
+/// working-directory change cannot silently split the store across two
+/// locations. An existing path is canonicalized; a not-yet-existing store file
+/// (first run) is anchored to the current directory instead.
+fn resolve_store_path(path: &Path) -> Result<PathBuf, StoreError> {
+    match std::fs::canonicalize(path) {
+        Ok(resolved) => Ok(resolved),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if path.is_absolute() {
+                Ok(path.to_path_buf())
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(path))
+                    .map_err(|e| StoreError::Io(e.to_string()))
+            }
+        }
+        Err(e) => Err(StoreError::Io(format!(
+            "cannot resolve store path {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Options for [`run_relay`].
 pub struct RelayOptions {
     /// Multiaddr for the libp2p (Circuit Relay v2) listener.
@@ -82,6 +109,65 @@ pub struct RelayOptions {
 pub async fn run_relay(
     options: RelayOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_relay_with_store(options, None).await
+}
+
+/// Run the relay node with an explicit durable-store location for the WS bridge.
+///
+/// This is RD-3's operator-facing entry point: `store_path: Some(path)` opts in
+/// to on-disk durability (the store is opened — or created — at `path` before
+/// the listener serves, and an unopenable path fails the process closed rather
+/// than silently falling back to memory); `None` keeps the historical in-memory
+/// behaviour. A relative path is resolved against the process working directory
+/// at startup.
+///
+/// The store is opened synchronously here (not inside the spawned listener
+/// task) so a bad path is a hard startup failure with a non-zero exit, never a
+/// silent in-memory fallback.
+pub async fn run_relay_with_store(
+    options: RelayOptions,
+    store_path: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Open the store eagerly, before anything is spawned, so a bad path fails
+    // closed with a clear error. The opened handles are then handed to the
+    // listener, which shares them across every accepted connection.
+    // Ordering matters: the store is opened BEFORE the WS port is bound, so an
+    // unopenable path never exposes a listening socket and the store file
+    // always exists by the time any client can connect to the bridge.
+    let ws = match options.ws_listen {
+        Some(ws_addr) => {
+            let (mailbox, prekeys) = match store_path.as_deref() {
+                None => (
+                    Mailbox::new(DEFAULT_MAX_ENVELOPES_PER_RECIPIENT),
+                    RelayStore::new(),
+                ),
+                Some(path) => {
+                    let resolved = resolve_store_path(path)?;
+                    info!("ws: opening durable store at the configured --store-path");
+                    (
+                        Mailbox::open(&resolved, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT)?,
+                        RelayStore::open(&resolved)?,
+                    )
+                }
+            };
+            let listener = tokio::net::TcpListener::bind(ws_addr).await?;
+            let bound_addr = listener.local_addr()?;
+            Some((listener, bound_addr, mailbox, prekeys))
+        }
+        None => None,
+    };
+
+    run_relay_with_stores(options, ws).await
+}
+
+/// Like [`run_relay_with_store`], but with the WS-bridge stores already opened.
+///
+/// `ws` is `Some((listener, bound_addr, mailbox, prekeys))` when the WS bridge
+/// is enabled; the listener task is spawned with those shared handles.
+async fn run_relay_with_stores(
+    options: RelayOptions,
+    ws: Option<(tokio::net::TcpListener, SocketAddr, Mailbox, RelayStore)>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let keypair = Keypair::generate_ed25519();
     let local_peer_id = keypair.public().to_peer_id();
 
@@ -91,17 +177,17 @@ pub async fn run_relay(
     info!(peer_id = %local_peer_id, listen = %options.listen, "relay node started");
 
     // Start the WS bridge on a concurrent task if an address was provided.
-    // Binding happens synchronously inside `run_ws_listener` before the first
-    // `accept` await, so a port-in-use error is returned here (not swallowed).
-    if let Some(ws_addr) = options.ws_listen {
+    // Binding (and, with a configured store path, the store open) happened
+    // synchronously in the entry point above, before the first `accept` await,
+    // so a port-in-use or unopenable-store error is returned here (not
+    // swallowed).
+    if let Some((listener, bound_addr, mailbox, prekeys)) = ws {
         let rate_limit = options.ws_rate_limit_per_minute;
-        // Bind eagerly so a bind failure surfaces as a startup error before we
-        // enter the swarm loop. We create the listener here and hand it off.
-        let listener = tokio::net::TcpListener::bind(ws_addr).await?;
-        let bound_addr = listener.local_addr()?;
         info!(addr = %bound_addr, "ws relay listener started");
         tokio::spawn(async move {
-            if let Err(e) = ws::serve_listener(listener, rate_limit).await {
+            if let Err(e) =
+                ws::serve_listener_with_stores(listener, rate_limit, mailbox, prekeys).await
+            {
                 warn!("ws relay listener ended with error: {e}");
             }
         });
