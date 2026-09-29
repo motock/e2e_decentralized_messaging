@@ -5,6 +5,13 @@ import { SafetyNumberVerification } from './SafetyNumberVerification';
 import { BackupPanel } from './BackupPanel';
 import { GroupConversation } from './GroupConversation';
 import { DeviceLinking } from './DeviceLinking';
+import {
+    establishFanoutSession,
+    revokeDeviceOnSession,
+    removeDeviceFromList,
+    isListedDevice,
+    type FanoutSessionHandle,
+} from './device_revocation';
 import { ensureWasmInit } from './wasm_init';
 import { SealGlyph } from './design/SealGlyph';
 import { StorageGate } from './storage';
@@ -85,6 +92,43 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         if (deviceListProp === undefined) return;
         setDeviceList((held) => applyDeviceListUpdate(held, deviceListProp));
     }, [deviceListProp]);
+
+    // DR-6b: the LIVE sender-side fan-out session over the linked devices,
+    // kept in lockstep with the held list so a revoke can call
+    // `fanout_remove_device` on the session the handle holds — the removal
+    // sticks in the session rather than only in the UI. Re-established
+    // whenever the list changes; a list whose devices fail fan-out
+    // establishment leaves NO live session (fail closed) rather than a
+    // partial one.
+    const [fanoutSession, setFanoutSession] = React.useState<FanoutSessionHandle | null>(null);
+    React.useEffect(() => {
+        if (!deviceList || deviceList.devices.length === 0 || !identity) {
+            setFanoutSession(null);
+            return;
+        }
+        try {
+            setFanoutSession(establishFanoutSession(identity.handle, deviceList.devices));
+        } catch {
+            // Fail closed: no session at all beats a session missing the
+            // devices that failed. Conversation's own send path applies the
+            // same rule (its fan-out send throws rather than silently
+            // dropping a device).
+            setFanoutSession(null);
+        }
+    }, [deviceList, identity]);
+
+    // DR-6b: revoke a linked device — drop it from the held list AND call
+    // `fanout_remove_device` on the live handle. An id that is not in the
+    // list is a no-op: nothing is removed and the live session is left
+    // untouched, so the surviving session is never disturbed.
+    const handleRevokeDevice = React.useCallback(
+        (deviceId: number) => {
+            if (!isListedDevice(deviceList, deviceId)) return;
+            setDeviceList((held) => (held ? removeDeviceFromList(held, deviceId) : held));
+            if (fanoutSession) revokeDeviceOnSession(fanoutSession, deviceId);
+        },
+        [deviceList, fanoutSession],
+    );
 
     const handleRemoteIdentityKeyChange = React.useCallback(
         (peerId: string, key: Uint8Array | null) => {
@@ -261,7 +305,11 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                 {view === 'link' && (
                                     <SafetyNumberErrorBoundary>
                                         {identity && (
-                                            <DeviceLinking localIdentityKey={identity.publicBytes} />
+                                            <DeviceLinking
+                                                localIdentityKey={identity.publicBytes}
+                                                deviceList={deviceList}
+                                                onRevokeDevice={handleRevokeDevice}
+                                            />
                                         )}
                                     </SafetyNumberErrorBoundary>
                                 )}
