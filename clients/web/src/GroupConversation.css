@@ -22,6 +22,12 @@
   border-bottom: 1px solid var(--ink-700);
 }
 
+.group-members-empty {
+  color: var(--text-tertiary);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
 .member-chip {
   display: flex;
   align-items: center;
@@ -85,32 +91,6 @@
 .group-msg-text {
   margin: 0 0 var(--space-2);
   font-size: var(--text-sm);
-}
-
-.group-msg-receipts {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-1);
-}
-
-.receipt {
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  border-radius: var(--radius-sm);
-  padding: 1px var(--space-2);
-}
-
-.receipt-ok {
-  color: var(--verified-strong);
-  background: var(--verified-tint);
-}
-
-.receipt-fail {
-  color: var(--alert-strong);
-  background: var(--alert-tint);
 }
 
 .group-composer {

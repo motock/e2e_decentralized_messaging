@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { generate_identity, derive_safety_number, group_create, group_add_member, group_remove_member, group_encrypt, group_decrypt, group_to_bytes, group_from_bytes, bundle_identity_key_bytes, IdentityHandle, GroupHandle } from '../../../core/bindings/wasm/pkg/index.js';
+import { group_create, group_add_member, group_remove_member, group_encrypt, group_decrypt, group_to_bytes, group_from_bytes, bundle_identity_key_bytes, IdentityHandle, GroupHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
 import { SealGlyph } from './design/SealGlyph';
 import { StorageGate } from './storage';
@@ -11,23 +11,12 @@ import './GroupConversation.css';
 // (group_create/group_add_member/group_remove_member/group_encrypt/
 // group_decrypt - core/bindings/wasm/src/lib.rs).
 //
-// Two member sources coexist:
-//
-//   1. **Demo members** (Alice, Bob, Eve) — each is a full locally generated
-//      identity (private + public key), exactly like
-//      core/bindings/wasm/tests/wasm_group_encrypt.rs's own test pattern.
-//      These let the component prove the real negative-path contract in the
-//      browser UI: after removing a member, decrypting a subsequent message AS
-//      that member's own identity genuinely fails (a real WasmError from the
-//      actual crypto), not a faked/mocked failure.
-//
-//   2. **Real peers** — added by recipient ID. The component looks up the
-//      peer's published prekey bundle via `lookupPrekey` (RelayTransport,
-//      same as direct messaging in Conversation.tsx), extracts the identity
-//      key with `bundle_identity_key_bytes`, and passes that real looked-up
-//      public key to `group_add_member` — the crypto layer is unchanged, only
-//      the source of the member's public key changes from a local demo
-//      identity to a real looked-up remote identity.
+// Members are real peers, added by recipient ID. The component looks up the
+// peer's published prekey bundle via `lookupPrekey` (RelayTransport, same as
+// direct messaging in Conversation.tsx), extracts the identity key with
+// `bundle_identity_key_bytes`, and passes that real looked-up public key to
+// `group_add_member`. There is no demo/local-identity member path: every chip
+// in the member list is a relay-reachable peer.
 //
 // Group membership (the member list with recipient IDs and public keys) is
 // persisted via the existing StorageGate pattern (encrypted IndexedDB), so
@@ -60,9 +49,13 @@ export interface GroupMessage {
     id: string;
     plaintext: string;
     timestamp: number;
-    // Per-member decrypt outcome at send time, keyed by member name - lets
-    // the UI (and tests) show/assert who could and could not decrypt each
-    // message, including members who were removed before it was sent.
+    // Retained-but-unpopulated legacy slot: nothing writes a real value any
+    // more. The demo-member decrypt loop that was its only producer was
+    // removed, and it cannot be repopulated for real peers - the app holds
+    // only their public bundles, so it cannot decrypt as a member. It is kept
+    // (rather than deleted) because it is part of the persisted GroupMessage
+    // shape, so dropping the key would silently change a stored schema; both
+    // writers now set `{}`.
     decryptResults: Record<string, GroupMessageResult>;
     // True for messages sent by the local user; false for received messages
     // decrypted from the relay. Omitted/undefined for backward compat with
@@ -238,18 +231,11 @@ export interface GroupConversationProps {
     selfRecipientId?: string;
 }
 
-interface DemoMember {
-    name: string;
-    identity: InstanceType<typeof IdentityHandle>;
-    publicBytes: Uint8Array;
-}
-
 /**
- * A real peer added by recipient ID. Unlike a DemoMember, there is no local
- * private key — only the public identity key looked up from the relay. The
- * `recipientId` is the address the user typed; `publicBytes` is the identity
- * key extracted from the looked-up prekey bundle via
- * `bundle_identity_key_bytes`.
+ * A real peer added by recipient ID. There is no local private key — only the
+ * public identity key looked up from the relay. The `recipientId` is the
+ * address the user typed; `publicBytes` is the identity key extracted from the
+ * looked-up prekey bundle via `bundle_identity_key_bytes`.
  */
 interface RealMember {
     recipientId: string;
@@ -304,7 +290,6 @@ function validatedGroupBlob(blob: unknown): Uint8Array | null {
     return new Uint8Array(blob);
 }
 
-const DEMO_MEMBER_NAMES = ['Alice', 'Bob', 'Eve'] as const;
 const GROUP_STORE = 'session' as const;
 const GROUP_RECORD_ID = 'group-state';
 const GROUP_MESSAGES_STORE = 'messages' as const;
@@ -319,12 +304,10 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     const [ready, setReady] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selfIdentity, setSelfIdentity] = useState<InstanceType<typeof IdentityHandle> | null>(null);
-    const [allMembers, setAllMembers] = useState<DemoMember[]>([]);
     const [group, setGroup] = useState<InstanceType<typeof GroupHandle> | null>(null);
-    const [memberNames, setMemberNames] = useState<string[]>([]);
     const [realMembers, setRealMembers] = useState<RealMember[]>([]);
     // Real peers that were removed from the group but kept visible so the
-    // user can re-add them (mirrors the demo-member Add/Remove toggle).
+    // user can re-add them.
     const [removedRealMembers, setRemovedRealMembers] = useState<RealMember[]>([]);
     const [messages, setMessages] = useState<GroupMessage[]>([]);
     const [input, setInput] = useState('');
@@ -389,9 +372,9 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     useEffect(() => { selfIdentityRef.current = selfIdentity; }, [selfIdentity]);
     // GRP-7: the real (on-the-wire) members, mirrored into a ref so the
     // receive-loop effect can attribute a picked-up envelope without
-    // re-subscribing the poll interval on every membership change. Demo
-    // members are local-only identities with no relay address, so they are
-    // never on the wire and are not attribution candidates.
+    // re-subscribing the poll interval on every membership change. Every
+    // member is a relay-addressed peer, so all of them are attribution
+    // candidates.
     const knownMembersRef = useRef<RealMember[]>([]);
     useEffect(() => { knownMembersRef.current = realMembers; }, [realMembers]);
 
@@ -409,7 +392,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     useEffect(() => {
         let cancelled = false;
         // Criterion 3 — fail closed. With no identity/selfRecipientId the group
-        // view must not silently pretend to be connected: no throwaway demo
+        // view must not silently pretend to be connected: no throwaway
         // identity, no receive loop, and crucially no persisted-config ref
         // (gateRef) written from a permissive default. Leaving gateRef untouched
         // is what keeps a LATER render that does supply real props correct.
@@ -426,12 +409,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
             .then(async () => {
                 if (cancelled) return;
                 const self = identityProp;
-                const demoMembers: DemoMember[] = DEMO_MEMBER_NAMES.map((name) => {
-                    const identity = generate_identity();
-                    return { name, identity, publicBytes: identity.public_bytes() };
-                });
                 setSelfIdentity(self);
-                setAllMembers(demoMembers);
 
                 // Load persisted group state (if any) so membership survives
                 // a page reload. The GroupHandle is not serializable, so we
@@ -537,7 +515,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                 setReady(true);
             })
             .catch((e: unknown) => {
-                console.error('Failed to initialize group demo identities', e);
+                console.error('Failed to initialize group session', e);
                 if (!cancelled) setError(e instanceof Error ? e.message : String(e));
             });
         return () => {
@@ -743,24 +721,13 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         if (!selfIdentity) return;
         const newGroup = group_create(selfIdentity);
         setGroup(newGroup);
-        setMemberNames([]);
         setRealMembers([]);
         setMessages([]);
         void persistGroupState([], newGroup);
     };
 
-    const addMember = (name: string) => {
-        if (!group || memberNames.includes(name)) return;
-        const member = allMembers.find((m) => m.name === name);
-        if (!member) return;
-        setGroup(group_add_member(group, member.publicBytes));
-        setMemberNames((prev) => [...prev, name]);
-    };
-
     // Add a real peer by recipient ID: look up their prekey bundle via the
     // relay transport, extract the identity key, and pass it to group_add_member.
-    // The crypto layer is unchanged — only the source of the public key changes
-    // from a local demo identity to a real looked-up remote identity.
     const addPeer = async () => {
         const trimmedId = peerIdInput.trim();
         if (!group || !trimmedId || addingPeer) return;
@@ -816,14 +783,6 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         }
     };
 
-    const removeMember = (name: string) => {
-        if (!group) return;
-        const member = allMembers.find((m) => m.name === name);
-        if (!member) return;
-        setGroup(group_remove_member(group, member.publicBytes));
-        setMemberNames((prev) => prev.filter((n) => n !== name));
-    };
-
     // Remove a real peer by recipient ID. Removing a member who was already
     // removed is a no-op (group_remove_member's core contract is infallible —
     // it simply doesn't match), not an error.
@@ -875,8 +834,7 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         }
         // Deliver the ciphertext to every real group member via sendEnvelope
         // over the relay, addressed by each member's recipient ID — mirroring
-        // Conversation.tsx's send path. Demo members are local-only (no relay
-        // address) so they are not sent over the wire.
+        // Conversation.tsx's send path.
         //
         // GRP-7: this fan-out is AWAITED and its per-member outcome is recorded
         // rather than swallowed by a fire-and-forget `.catch(console.warn)`.
@@ -916,29 +874,13 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                   ? `Sent to ${sendTotal - sendFailures} of ${sendTotal} members.`
                   : `Failed to send: ${failureMessage ?? 'relay unavailable'}`,
         );
-        // Every known demo member (whether currently in the group or removed)
-        // attempts to decrypt, surfacing the real per-member outcome from the
-        // actual crypto - including a removed member's decrypt genuinely
-        // failing, not a simulated/faked result.
-        const decryptResults: Record<string, GroupMessageResult> = {};
-        for (const member of allMembers) {
-            try {
-                group_decrypt(group, member.identity, ciphertext);
-                decryptResults[member.name] = { ok: true };
-            } catch (e) {
-                decryptResults[member.name] = {
-                    ok: false,
-                    error: e instanceof Error ? e.message : String(e),
-                };
-            }
-        }
         setMessages((prev) => [
             ...prev,
             {
                 id: Math.random().toString(36).slice(2),
                 plaintext: input,
                 timestamp: Date.now(),
-                decryptResults,
+                decryptResults: {},
                 sentByMe: true,
                 groupId: groupFingerprint(realMembers),
                 sendStatus,
@@ -967,21 +909,11 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
             ) : (
                 <>
                     <div data-testid="member-list" className="group-members">
-                        {allMembers.map((m) => (
-                            <div key={m.name} className={`member-chip${memberNames.includes(m.name) ? ' in-group' : ''}`}>
-                                <SealGlyph value={m.name} size={20} tone={memberNames.includes(m.name) ? 'verified' : 'neutral'} title={`${m.name}'s seal`} />
-                                <span className="member-chip-name">{m.name}</span>
-                                {memberNames.includes(m.name) ? (
-                                    <button onClick={() => removeMember(m.name)} data-testid={`remove-${m.name}`}>
-                                        Remove
-                                    </button>
-                                ) : (
-                                    <button onClick={() => addMember(m.name)} data-testid={`add-${m.name}`}>
-                                        Add
-                                    </button>
-                                )}
-                            </div>
-                        ))}
+                        {realMembers.length === 0 && removedRealMembers.length === 0 && (
+                            <p data-testid="member-list-empty" className="group-members-empty">
+                                No members yet. Add a peer by recipient ID.
+                            </p>
+                        )}
                         {realMembers.map((m) => (
                             <div key={m.recipientId} data-testid={`member-${m.recipientId}`} className="member-chip in-group">
                                 <SealGlyph value={m.recipientId} size={20} tone="verified" title={`${m.recipientId}'s seal`} />
@@ -1050,17 +982,6 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
                                                   : 'failed'}
                                         </span>
                                     )}
-                                    <ul className="group-msg-receipts">
-                                        {Object.entries(msg.decryptResults).map(([name, result]) => (
-                                            <li
-                                                key={name}
-                                                data-testid={`decrypt-${msg.id}-${name}`}
-                                                className={`receipt ${result.ok ? 'receipt-ok' : 'receipt-fail'}`}
-                                            >
-                                                {name}: {result.ok ? 'decrypted' : `failed (${result.error})`}
-                                            </li>
-                                        ))}
-                                    </ul>
                                 </div>
                             ))
                         )}
