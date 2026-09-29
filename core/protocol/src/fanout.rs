@@ -42,7 +42,7 @@
 
 use std::collections::BTreeMap;
 
-use libsignal_protocol::IdentityKeyPair;
+use libsignal_protocol::{IdentityKey, IdentityKeyPair, PreKeyBundle};
 use rand::TryRngCore;
 use thiserror::Error;
 
@@ -151,6 +151,16 @@ pub enum FanoutError {
     /// identities participate.
     #[error("no device in this fan-out matches the given identity key")]
     UnknownIdentity,
+    /// A prekey bundle offered to
+    /// [`establish_from_bundles`](Self::establish_from_bundles) carries an identity
+    /// key different from the one the caller vouched for from an authenticated source
+    /// (the primary-signed device list, spec/v0.md §8.3). PQXDH alone cannot catch
+    /// this — it only checks a bundle against the identity key inside it — so this
+    /// check is what stops an attacker-substituted bundle from silently redirecting
+    /// every later ciphertext. Checked before any session is built; nothing is
+    /// partially established.
+    #[error("prekey bundle for device {device} carries a different identity key than the authenticated device list vouches for")]
+    IdentityMismatch { device: DeviceId },
     /// `decrypt_as` was called with a `Ciphertext` whose `device` field does not match
     /// the device the given identity is linked to. `Ciphertext::device` is a routing
     /// hint for the transport layer; this catches a caller (or forged input) presenting
@@ -538,6 +548,136 @@ impl FanoutSession {
             revoked_devices: BTreeMap::new(),
             revocation_version: 0,
         })
+    }
+
+    /// Establish a *sender-only* fan-out from public device material alone.
+    ///
+    /// This is the constructor a production caller needs: a web client holds only the
+    /// public prekey bundle of each linked device — never that device's private
+    /// identity key — so [`establish`](Self::establish), which builds the receiver
+    /// side internally from full `IdentityKeyPair`s, is unreachable outside a test.
+    /// Here each entry runs only the sender (Alice) half of PQXDH against the
+    /// device-supplied bundle, exactly as `DoubleRatchetSession::new_alice` intends.
+    ///
+    /// Each entry is `(device_id, expected_identity, bundle)`. `expected_identity` is
+    /// the device's public identity key **as an authenticated source vouches for it**
+    /// — the primary-signed device list (spec/v0.md §8.3) — not as the bundle itself
+    /// carries it.
+    ///
+    /// # Bundle authentication
+    ///
+    /// This constructor does not trust a bundle's self-consistency as authenticity.
+    /// PQXDH's signature checks (`process_prekey_bundle`) only prove that a bundle's
+    /// signed prekey and Kyber prekey were signed by the identity key *carried inside
+    /// the bundle* — an attacker who controls bundle delivery (malicious relay / DHT
+    /// peer; docs/threat-model.md §4.6, §5.1) can substitute a well-formed bundle
+    /// holding their own identity key and valid self-signatures, and PQXDH would
+    /// accept it: establishment succeeds and every subsequent
+    /// [`encrypt_to_all`](Self::encrypt_to_all) ciphertext is addressed to the
+    /// attacker — silent impersonation with no error surfaced. To close that path,
+    /// each bundle's `identity_key()` is compared against `expected_identity`
+    /// *before* any session is built, and a mismatch is rejected with
+    /// [`FanoutError::IdentityMismatch`]. A caller that cannot obtain an
+    /// authenticated expected identity per device has no defense against substitution
+    /// and must not use this constructor.
+    ///
+    /// The bundle type is `libsignal_protocol`'s `PreKeyBundle` — the type
+    /// `DoubleRatchetSession::publish_bundle` emits and `crypto::session::bundle_from_bytes`
+    /// parses from wire bytes, so a caller with a device's serialized bundle can build
+    /// one without ever touching private key material.
+    ///
+    /// # Sender-only semantics
+    ///
+    /// The session holds **no inbound ratchet state**: `receiver_sessions` and
+    /// `identity_to_device` are deliberately left empty. [`decrypt_as`](Self::decrypt_as)
+    /// therefore returns [`FanoutError::UnknownIdentity`] on any input — a sender-only
+    /// session cannot decrypt, which is correct, because it never held the recipient
+    /// side of the ratchet. This is also why the reverse map stays empty: populating it
+    /// without a matching receiver session would make `decrypt_as` panic on the
+    /// `receiver_sessions` lookup instead of erroring, and the map cannot be keyed from
+    /// a bundle anyway (the public-key identity hasher is private to `crypto`).
+    ///
+    /// # The `DeviceId` label vs. the bundle's device id
+    ///
+    /// The libsignal device id inside a bundle is a `DoubleRatchetSession` facade
+    /// constant shared by every bundle this workspace publishes (`publish_bundle`
+    /// stamps the same value for all devices), deliberately distinct from the
+    /// application-level [`DeviceId`](DeviceId) — see the module docs. It only
+    /// matters as half of the peer's `ProtocolAddress`, alongside the identity-key
+    /// hash, and the identity half is what this constructor pins to the caller's
+    /// vouching. The caller's `DeviceId` therefore stays a pure routing label on
+    /// [`Ciphertext::device`], exactly as in [`establish`](Self::establish); a
+    /// difference between the label and the bundle's device id is expected, not an
+    /// error, and rejecting it would reject every bundle this codebase emits.
+    ///
+    /// # Errors
+    ///
+    /// An empty `devices` returns [`FanoutError::NoDevices`], a repeated `DeviceId`
+    /// returns [`FanoutError::DuplicateDevice`], a bundle whose identity key does not
+    /// match `expected_identity` returns [`FanoutError::IdentityMismatch`] — checked
+    /// before any ratchet state exists, so a rejected entry leaves no partial state —
+    /// and a bundle that fails PQXDH (malformed, tampered, or stale) returns
+    /// [`FanoutError::Establishment`] naming the device. Unlike `establish`, a
+    /// repeated *identity* across two device ids cannot be detected here — the
+    /// public-key identity hasher is private — so two devices sharing one identity
+    /// key would establish two independent sessions rather than surfacing
+    /// [`FanoutError::DuplicateIdentity`].
+    pub fn establish_from_bundles(
+        sender: &IdentityKeyPair,
+        devices: &[(DeviceId, IdentityKey, PreKeyBundle)],
+    ) -> Result<Self, FanoutError> {
+        if devices.is_empty() {
+            return Err(FanoutError::NoDevices);
+        }
+
+        let mut sender_sessions: BTreeMap<DeviceId, DoubleRatchetSession> = BTreeMap::new();
+
+        for (device_id, expected_identity, bundle) in devices {
+            if sender_sessions.contains_key(device_id) {
+                return Err(FanoutError::DuplicateDevice(*device_id));
+            }
+
+            // Bind the bundle to the device it is claimed to be BEFORE any session
+            // exists. PQXDH verifies a bundle only against the identity key carried
+            // inside it, so without this check an attacker-substituted bundle (own
+            // identity key, valid self-signatures) would establish cleanly and
+            // silently redirect every later ciphertext to the attacker
+            // (docs/threat-model.md §4.6, §5.1).
+            let bundle_identity = *bundle.identity_key().map_err(|e| {
+                FanoutError::Establishment(*device_id, crypto::SessionError::Establishment(e))
+            })?;
+            if bundle_identity != *expected_identity {
+                return Err(FanoutError::IdentityMismatch { device: *device_id });
+            }
+
+            let outbound = block_on(DoubleRatchetSession::new_alice(sender, bundle))
+                .map_err(|e| FanoutError::Establishment(*device_id, e))?;
+            sender_sessions.insert(*device_id, outbound);
+        }
+
+        // Sender-only: no receiver sessions and no identity→device reverse map. See the
+        // doc comment for why leaving both empty is the safe choice.
+        Ok(Self {
+            sender_sessions,
+            identity_to_device: BTreeMap::new(),
+            receiver_sessions: BTreeMap::new(),
+            revoked_devices: BTreeMap::new(),
+            revocation_version: 0,
+        })
+    }
+
+    /// The device ids this fan-out currently delivers to, in ascending order.
+    ///
+    /// This is the observable half of device revocation: after
+    /// [`remove_device`](Self::remove_device) or [`apply_revocation`](Self::apply_revocation),
+    /// the removed device is absent from this list and the next
+    /// [`encrypt_to_all`](Self::encrypt_to_all) emits no ciphertext for it. Without
+    /// this accessor a caller could only infer removal from ciphertext counts.
+    ///
+    /// Returns an iterator rather than a `Vec` so callers can `any`/`position` over
+    /// it without an allocation; `.collect()` when a `Vec` is wanted.
+    pub fn devices(&self) -> impl Iterator<Item = DeviceId> + '_ {
+        self.sender_sessions.keys().copied()
     }
 
     /// Encrypt `plaintext` once per currently-tracked device and return the resulting
