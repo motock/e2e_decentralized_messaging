@@ -12,7 +12,7 @@ import { getStorageKey, getStoragePassword } from './storage_key';
 import { loadOrGenerateIdentity, type PersistedIdentity } from './identity';
 import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import { useRelayConnection, RelayConnectionPanel } from './useRelayConnection';
-import { applyDeviceListUpdate, type DeviceList } from './deviceList';
+import { applyDeviceListUpdate, type DeviceList } from './Conversation';
 import './design/AppShell.css';
 
 // SafetyNumberVerification's deriveSafetyNumber calls the real
