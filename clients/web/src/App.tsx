@@ -12,6 +12,7 @@ import { getStorageKey, getStoragePassword } from './storage_key';
 import { loadOrGenerateIdentity, type PersistedIdentity } from './identity';
 import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import { useRelayConnection, RelayConnectionPanel } from './useRelayConnection';
+import { applyDeviceListUpdate, type DeviceList } from './Conversation';
 import './design/AppShell.css';
 
 // SafetyNumberVerification's deriveSafetyNumber calls the real
@@ -54,7 +55,7 @@ const NAV_ITEMS: { id: ViewId; label: string; title: string; subtitle: string }[
     { id: 'backup', label: 'Backup', title: 'Encrypted backup', subtitle: 'Passphrase-protected export / import' },
 ];
 
-export default function App() {
+export default function App({ deviceList: deviceListProp }: { deviceList?: DeviceList } = {}) {
     const [identity, setIdentity] = React.useState<PersistedIdentity | null>(null);
     // The encrypted store opened for identity loading, held so the relay
     // connection can persist/restore the receiver session through it. It is
@@ -73,6 +74,17 @@ export default function App() {
     // real key instead of a demo/self placeholder.
     const [activePeerId, setActivePeerId] = React.useState<string>('');
     const [remoteIdentityKey, setRemoteIdentityKey] = React.useState<Uint8Array | null>(null);
+
+    // DR-6: the recipient's verified device list (spec/v0.md §8.3), owned by App
+    // as app-level state. The prop injects it (tests / a future DiscoveryRecord
+    // transport); updates are applied MONOTONICALLY (§8.4) — an update whose
+    // version is not newer than the one already held is ignored, so a stale or
+    // replayed list can never replace a newer one.
+    const [deviceList, setDeviceList] = React.useState<DeviceList | undefined>(undefined);
+    React.useEffect(() => {
+        if (deviceListProp === undefined) return;
+        setDeviceList((held) => applyDeviceListUpdate(held, deviceListProp));
+    }, [deviceListProp]);
 
     const handleRemoteIdentityKeyChange = React.useCallback(
         (peerId: string, key: Uint8Array | null) => {
@@ -235,6 +247,7 @@ export default function App() {
                                         identity={identity ?? undefined}
                                         receiverSession={conn.receiverSession ?? undefined}
                                         onRemoteIdentityKeyChange={handleRemoteIdentityKeyChange}
+                                        deviceList={deviceList}
                                     />
                                 )}
                                 {view === 'group' && (

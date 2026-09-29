@@ -4,6 +4,9 @@ import {
     encrypt_message,
     decrypt_message,
     bundle_identity_key_bytes,
+    fanout_establish,
+    fanout_encrypt,
+    FanoutDeviceInput,
     SessionHandle,
 } from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
@@ -18,6 +21,54 @@ import {
 import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import type { PersistedIdentity } from './identity';
 import './Conversation.css';
+
+/**
+ * DR-6: the recipient's verified device list, as injected into `App` (spec/v0.md §8.3).
+ *
+ * `identityKey` is the identity key the PRIMARY vouched for when it learned the
+ * device — it is what reaches `fanout_establish` as `expected_identity_key_bytes`
+ * and is deliberately independent of the key carried inside `bundleBytes` (the
+ * device's published prekey bundle). The binding compares the two and rejects a
+ * device whose bundle does not match the vouched-for key, so an
+ * attacker-substituted bundle cannot silently redirect ciphertext.
+ *
+ * Device-list updates are MONOTONIC (spec/v0.md §8.4): an update whose version is
+ * not newer than the one already held is ignored. `applyDeviceListUpdate` is pure —
+ * it never mutates either argument.
+ */
+
+export interface DeviceListEntry {
+    /** The recipient device's id, as scoped in the primary's signed device list. */
+    deviceId: number;
+    /** The identity key the primary vouched for — NOT the bundle's own key. */
+    identityKey: Uint8Array;
+    /** That device's published prekey bundle bytes. */
+    bundleBytes: Uint8Array;
+}
+
+export interface DeviceList {
+    /** Monotonic version of this list; only a strictly newer version replaces the held one. */
+    version: number;
+    devices: DeviceListEntry[];
+}
+
+/**
+ * Monotonic device-list update (spec/v0.md §8.4).
+ *
+ * Returns `incoming` when no list is held yet, `current` when `incoming`'s
+ * version is not newer than the held one, and `incoming` otherwise. The held
+ * version only ever moves forward: a rejected update must not advance (or
+ * rewind) the stored version, otherwise a later, still-stale update could
+ * slip past the guard.
+ */
+export function applyDeviceListUpdate(
+    current: DeviceList | null | undefined,
+    incoming: DeviceList,
+): DeviceList {
+    if (current === null || current === undefined) return incoming;
+    if (incoming.version <= current.version) return current;
+    return incoming;
+}
 
 export interface Message {
     id: string;
@@ -79,6 +130,14 @@ export interface ConversationProps {
      * publish and receive paths share key material.
      */
     receiverSession?: InstanceType<typeof SessionHandle>;
+    /**
+     * DR-6: the recipient's verified device list (spec/v0.md §8.3), injected by
+     * App. When supplied and non-empty, a 1:1 send fans out — one envelope per
+     * device, each addressed to `${peerId}:${deviceId}`. When absent or empty,
+     * the send path is exactly the legacy single-recipient behaviour: one
+     * envelope addressed to the bare peer id.
+     */
+    deviceList?: DeviceList;
 }
 
 // StoreName is a type, not a runtime object - 'messages' is a plain string
@@ -117,6 +176,7 @@ export const Conversation: React.FC<ConversationProps> = ({
     transport,
     onRemoteIdentityKeyChange,
     receiverSession,
+    deviceList,
 }) => {
     const [messages, setMessages] = useState<Message[]>([]);
     const [peerId, setPeerId] = useState('');
@@ -359,7 +419,76 @@ export const Conversation: React.FC<ConversationProps> = ({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [peerId]);
 
-    const send = async () => {
+    const send = async (): Promise<void> => {
+        const trimmedPeerId = peerId.trim();
+        const trimmedInput = input.trim();
+        if (!identity || !trimmedPeerId || !trimmedInput || sending) return;
+
+        // DR-6: with a verified device list present, one plaintext fans out to
+        // one envelope per device (spec/v0.md §8.3). With no list (or an empty
+        // one) the send is exactly the legacy single-recipient behaviour —
+        // one envelope to the bare peer id — which is what keeps the
+        // single-recipient session semantics (and the tests that pin them)
+        // unchanged.
+        const devices: DeviceListEntry[] | undefined =
+            deviceList && deviceList.devices.length > 0 ? deviceList.devices : undefined;
+        if (devices) {
+            setSending(true);
+            setStatus('');
+            try {
+                const plaintextBytes = new TextEncoder().encode(trimmedInput);
+                const inputs = devices.map(
+                    (entry) =>
+                        // expected_identity_key_bytes is the key the PRIMARY
+                        // vouched for (entry.identityKey), never the bundle's
+                        // own key — the binding compares the two and rejects a
+                        // device whose bundle does not match the vouched-for
+                        // key, so a substituted bundle cannot redirect
+                        // ciphertext. An entry with no vouched-for key is
+                        // rejected outright rather than trusted from its bundle.
+                        new FanoutDeviceInput(
+                            entry.deviceId,
+                            entry.identityKey,
+                            entry.bundleBytes,
+                        ),
+                );
+                const handle = fanout_establish(
+                    identity.handle as unknown as Parameters<typeof fanout_establish>[0],
+                    inputs,
+                );
+                const envelopes = fanout_encrypt(handle, plaintextBytes);
+                for (const env of envelopes) {
+                    await transportRef.current.sendEnvelope(
+                        `${trimmedPeerId}:${env.device_id}`,
+                        env.envelope,
+                    );
+                }
+
+                const msg: Message = {
+                    id: Math.random().toString(36).substr(2, 9),
+                    body: trimmedInput,
+                    timestamp: Date.now(),
+                    sentByMe: true,
+                };
+                setMessages(prev => [...prev, msg]);
+                setInput('');
+                setStatus('Sent');
+            } catch (e) {
+                // Fail closed: a rejected device (identity-key mismatch,
+                // malformed bundle) aborts the whole send — nothing is
+                // delivered and the composer keeps its text. Error detail is
+                // a structured kind/message, never key or plaintext material.
+                setStatus(`Send failed: ${describeError(e)}`);
+            } finally {
+                setSending(false);
+            }
+            return;
+        }
+
+        await sendSingle();
+    };
+
+    const sendSingle = async () => {
         const trimmedPeerId = peerId.trim();
         const trimmedInput = input.trim();
         if (!identity || !trimmedPeerId || !trimmedInput || sending) return;
