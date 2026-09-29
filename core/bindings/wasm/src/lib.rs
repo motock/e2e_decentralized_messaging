@@ -942,7 +942,7 @@ pub fn fanout_establish(
         // `bundle_identity` is now *proven* equal to the caller's expected bytes, so what is
         // handed to `establish_from_bundles` is the caller's expectation — the guard there
         // cannot degrade to a no-op.
-        parsed.push((DeviceId(device.device_id), bundle_identity.clone(), bundle));
+        parsed.push((DeviceId(device.device_id), *bundle_identity, bundle));
     }
 
     let session =
