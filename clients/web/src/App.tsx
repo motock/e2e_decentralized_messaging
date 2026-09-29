@@ -118,10 +118,19 @@ export default function App() {
     // Conversation's receive loop.
     const conn = useRelayConnection(identity, relayUrl, sessionGate);
 
-    // The group view reaches the relay through the same transport surface as the
-    // direct path. Memoized on relayUrl so a runtime URL change is picked up;
-    // without this GroupConversation would build its own RelayTransport.
-    const groupTransport = React.useMemo(() => new RelayTransport(relayUrl), [relayUrl]);
+    // The group view reaches the relay through the same transport surface as
+    // the direct path, tagged with this loop's out-of-band envelope kind
+    // ("group"). The kind is injected HERE (rather than left to
+    // GroupConversation's own `transport ?? new RelayTransport(getRelayWsUrl(),
+    // 'group')` default) because App always injects a transport, so the
+    // default never fires: without the tag the shipped app's group loop sent
+    // untagged and picked up unfiltered, and the relay's destructive dequeue
+    // handed it the direct loop's mail, which the group loop then dropped.
+    // Memoized on relayUrl so a runtime URL change is picked up.
+    const groupTransport = React.useMemo(
+        () => new RelayTransport(relayUrl, 'group'),
+        [relayUrl],
+    );
 
     // Close the superseded transport when relayUrl changes so its socket does
     // not leak. Deliberately ref-based rather than a plain unmount cleanup:
