@@ -44,6 +44,7 @@ import {
     type LinkingState,
 } from './device_linking';
 import { SealGlyph } from './design/SealGlyph';
+import type { DeviceList } from './Conversation';
 import './DeviceLinking.css';
 
 // ---------------------------------------------------------------------------
@@ -338,9 +339,27 @@ function QrCodeSvg({ payload }: { payload: string }): React.ReactElement {
 
 export interface DeviceLinkingProps {
     localIdentityKey: Uint8Array;
+    /**
+     * DR-6b: the account's linked devices, injected by App from its own
+     * device-list state. OPTIONAL — the linked-devices section (and its
+     * revoke controls) render only when a list is actually supplied, so
+     * existing render sites that pass only `localIdentityKey` are unchanged.
+     */
+    deviceList?: DeviceList;
+    /**
+     * DR-6b: called with the id of the device whose revoke control the user
+     * activated. App performs the revocation (list + live fan-out session);
+     * this component only reports the intent. OPTIONAL — without it the
+     * revoke controls do not render.
+     */
+    onRevokeDevice?: (deviceId: number) => void;
 }
 
-export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }) => {
+export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
+    localIdentityKey,
+    deviceList,
+    onRevokeDevice,
+}) => {
     const [state, setState] = useState<LinkingState>(initialLinkingState());
     const [mode, setMode] = useState<'display' | 'scan' | null>(null);
     const [scanInput, setScanInput] = useState('');
@@ -392,6 +411,32 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({ localIdentityKey }
                 <div role="alert" className="link-error">
                     {state.error}
                 </div>
+            )}
+
+            {deviceList && (
+                <section className="link-devices" aria-label="Linked devices">
+                    <h2 className="link-devices-title">Linked devices</h2>
+                    {deviceList.devices.length === 0 ? (
+                        <p className="link-devices-empty">No linked devices.</p>
+                    ) : (
+                        <ul className="link-devices-list">
+                            {deviceList.devices.map((device) => (
+                                <li key={device.deviceId} className="link-devices-item">
+                                    <span className="link-devices-id">Device {device.deviceId}</span>
+                                    {onRevokeDevice && (
+                                        <button
+                                            type="button"
+                                            className="link-devices-revoke"
+                                            onClick={() => onRevokeDevice(device.deviceId)}
+                                        >
+                                            Revoke device {device.deviceId}
+                                        </button>
+                                    )}
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </section>
             )}
 
             {mode === null && state.phase === 'idle' && (
