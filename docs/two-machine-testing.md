@@ -96,6 +96,35 @@ relay node started …
 ws relay listener started addr=0.0.0.0:8000
 ```
 
+### Durable state: `--store-path` (opt-in)
+
+By default the relay's store (undelivered envelopes and published prekey
+bundles) lives **in memory**: nothing is written to disk, and a restart loses
+all state. This is the secure, non-surprising default — an operator opts in to
+on-disk durability by passing `--store-path <PATH>`:
+
+```sh
+cargo run -p relay -- --listen /ip4/0.0.0.0/tcp/4001 --ws-listen 0.0.0.0:8000 \
+  --store-path /var/lib/relay/relay-state.sqlite
+```
+
+- `<PATH>` is a **file** path (a SQLite database). The relay creates it on
+  first run and reuses it on later runs, so envelopes that were queued but not
+  yet picked up survive a restart.
+- A **relative** path is resolved against the relay process's working
+  directory **at startup** (e.g. `--store-path relay-state/state.sqlite` run
+  from `/home/op` opens `/home/op/relay-state/state.sqlite`).
+- An unopenable path (a missing parent directory, or a file that is not a
+  store) is a **hard startup failure**: the relay exits non-zero with an error
+  naming the path. It never silently falls back to in-memory operation — a
+  silent fallback would be a durability lie.
+- The relay never logs the store path's contents (the store only ever holds
+  ciphertext; the relay is blind by design).
+- The flag only takes effect when `--ws-listen` is supplied (the store belongs
+  to the WS bridge).
+- `relay-state/` and `*.sqlite*` are gitignored so operator state is never
+  committed.
+
 ### Point the web client at your relay
 
 The web client resolves the relay WebSocket URL at runtime via

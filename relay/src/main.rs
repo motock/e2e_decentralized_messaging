@@ -27,8 +27,9 @@
 
 use clap::Parser;
 use libp2p::Multiaddr;
-use relay::{run_relay, RelayOptions};
+use relay::{run_relay_with_store, RelayOptions};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 /// Default per-identity WS rate limit (requests/minute). Matches the test default
@@ -53,6 +54,18 @@ struct Cli {
     /// Only takes effect when `--ws-listen` is supplied. Default: 60.
     #[arg(long, default_value_t = DEFAULT_WS_RATE_LIMIT)]
     ws_rate_limit: u32,
+
+    /// On-disk location for the WS bridge's durable store (a SQLite file).
+    ///
+    /// Omit this flag to keep the store in memory (secure-by-default: a restart
+    /// loses state, and no on-disk state is written). Passing a path opts in to
+    /// durability: the store is opened (or created) at that path before the WS
+    /// bridge serves, and an unopenable path is a hard startup failure — the
+    /// relay never silently falls back to memory. A relative path is resolved
+    /// against the process working directory at startup. Only takes effect
+    /// when `--ws-listen` is supplied.
+    #[arg(long)]
+    store_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -71,5 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ws_rate_limit_per_minute: cli.ws_rate_limit,
     };
 
-    run_relay(options).await
+    // The store path is threaded through the dedicated entry point (route (a)):
+    // RelayOptions keeps its original three fields, so existing struct literals
+    // elsewhere keep compiling unchanged.
+    run_relay_with_store(options, cli.store_path).await
 }
