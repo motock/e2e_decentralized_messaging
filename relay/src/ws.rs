@@ -1237,10 +1237,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "relay-res1-{}-{tag}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("relay-res1-{}-{tag}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("relay-store.db")
     }
