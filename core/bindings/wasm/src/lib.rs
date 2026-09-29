@@ -48,7 +48,6 @@ use crypto::device_qr;
 use crypto::identity::{IdentityKeyPair, PublicIdentityKey};
 use crypto::ratchet_session::{DoubleRatchetSession, SessionError};
 use crypto::session;
-use libsignal_protocol::IdentityKey;
 use protocol::fanout::{DeviceId, FanoutError, FanoutSession};
 use protocol::group::{GroupMember, GroupSession};
 
@@ -894,10 +893,10 @@ impl std::fmt::Debug for FanoutHandle {
 /// # Errors
 ///
 /// Returns `WasmError` with `kind = "NoDevices"` for an empty device list, `kind =
-/// "MalformedIdentityKey"` for unparseable expected-identity bytes, `kind = "MalformedBundle"`
-/// for unparseable bundle bytes, `kind = "IdentityMismatch"` when a bundle's identity key is
-/// not the expected one (checked before any session is built), and `kind = "Fanout"` for any
-/// other establishment failure. Never panics.
+/// "MalformedBundle"` for unparseable bundle bytes, `kind = "IdentityMismatch"` when a
+/// bundle's identity key is not the expected one (checked before any session is built; a
+/// malformed expected key also lands here, since it can never equal a well-formed bundle
+/// identity), and `kind = "Fanout"` for any other establishment failure. Never panics.
 #[wasm_bindgen]
 pub fn fanout_establish(
     identity_handle: &IdentityHandle,
@@ -912,22 +911,38 @@ pub fn fanout_establish(
 
     let mut parsed = Vec::with_capacity(devices.len());
     for device in devices {
-        // The expected identity comes from the caller's authenticated device list — never
-        // from `bundle.identity_key()`. `establish_from_bundles` compares it against the
-        // bundle's own identity key before building any session.
-        let expected = IdentityKey::decode(&device.expected_identity_key_bytes).map_err(|_| {
-            WasmError::new(
-                "MalformedIdentityKey",
-                "malformed expected identity key bytes",
-            )
-        })?;
         let bundle = session::bundle_from_bytes(&device.bundle_bytes).map_err(|_| {
             WasmError::new(
                 "MalformedBundle",
                 "malformed or truncated prekey bundle bytes",
             )
         })?;
-        parsed.push((DeviceId(device.device_id), expected, bundle));
+
+        // The caller's explicit expected-identity bytes are authoritative: they come from the
+        // primary-signed verified device set (spec/v0.md §8.3), NOT from the bundle. Compare
+        // them against the identity key the bundle carries BEFORE any session is built, so an
+        // attacker-substituted bundle (own identity key, valid self-signatures) is rejected
+        // here rather than silently accepted.
+        //
+        // The comparison is on the serialized key bytes because this crate deliberately does
+        // not depend on `libsignal-protocol` directly (it is not in this story's file scope);
+        // it is equivalent to decoding the caller's bytes and comparing the keys, and it fails
+        // closed on malformed input — a malformed expected key can never equal a well-formed
+        // bundle identity, so it is rejected too.
+        let bundle_identity = bundle.identity_key().map_err(|_| {
+            WasmError::new("MalformedBundle", "prekey bundle carries no identity key")
+        })?;
+        if bundle_identity.serialize().as_ref() != device.expected_identity_key_bytes.as_slice() {
+            return Err(WasmError::new(
+                "IdentityMismatch",
+                "prekey bundle identity key is not the expected identity for this device",
+            ));
+        }
+
+        // `bundle_identity` is now *proven* equal to the caller's expected bytes, so what is
+        // handed to `establish_from_bundles` is the caller's expectation — the guard there
+        // cannot degrade to a no-op.
+        parsed.push((DeviceId(device.device_id), bundle_identity.clone(), bundle));
     }
 
     let session =
