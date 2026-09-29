@@ -13,6 +13,11 @@ path = "src/lib.rs"
 crypto = { path = "../../crypto" }
 protocol = { path = "../../protocol" }
 wasm-bindgen = "0.2"
+# Needed to name `IdentityKey`/`PreKeyBundle` directly: `crypto` re-exports only
+# `IdentityKeyPair`, but the fan-out bindings must parse a caller-supplied *expected*
+# identity key (never the one carried inside the bundle being verified) and hand it to
+# `FanoutSession::establish_from_bundles`.
+libsignal-protocol.workspace = true
 
 # The dependency graph carries two incompatible major versions of getrandom, each
 # needing its wasm backend enabled explicitly or it fails to compile on
