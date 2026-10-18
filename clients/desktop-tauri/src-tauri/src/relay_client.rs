@@ -34,10 +34,10 @@ use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
-use tokio::net::TcpStream;
 
 /// Bound on a single request/response round trip. A relay that accepts the
 /// request but never answers must surface as an error, not a hang.
@@ -303,7 +303,9 @@ impl RelayClient {
         })?;
         let challenge_id = resp["challenge_id"]
             .as_str()
-            .ok_or_else(|| RelayError::Protocol("ok challenge response missing challenge_id".into()))?
+            .ok_or_else(|| {
+                RelayError::Protocol("ok challenge response missing challenge_id".into())
+            })?
             .to_string();
         let wire = B64
             .decode(challenge_b64)
