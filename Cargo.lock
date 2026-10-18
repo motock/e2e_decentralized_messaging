@@ -761,13 +761,16 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crypto",
+ "futures",
  "protocol",
+ "relay",
  "serde",
  "serde_json",
  "storage",
  "tauri",
  "tauri-build",
  "tokio",
+ "tokio-tungstenite",
  "transport",
 ]
 

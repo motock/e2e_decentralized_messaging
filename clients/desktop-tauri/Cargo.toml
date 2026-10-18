@@ -33,4 +33,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net"] }
+# Real in-process relay + a scripted fake relay for tests/relay_client.rs.
+relay = { path = "../../relay" }
+tokio-tungstenite = "0.29"
+futures = "0.3"
