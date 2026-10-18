@@ -7,6 +7,7 @@
 pub mod backup;
 mod commands;
 mod error;
+mod identity_store;
 pub mod ui;
 pub mod verify;
 
