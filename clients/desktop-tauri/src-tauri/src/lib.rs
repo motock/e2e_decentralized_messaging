@@ -7,6 +7,7 @@
 pub mod backup;
 mod commands;
 mod error;
+mod identity_store;
 pub mod ui;
 pub mod verify;
 
@@ -20,6 +21,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::generate_identity,
+            commands::load_or_create_identity,
             commands::establish_malformed_session,
         ])
         .run(tauri::generate_context!())
