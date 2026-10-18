@@ -8,6 +8,7 @@ pub mod backup;
 mod commands;
 mod error;
 mod identity_store;
+pub mod relay_client;
 pub mod ui;
 pub mod verify;
 

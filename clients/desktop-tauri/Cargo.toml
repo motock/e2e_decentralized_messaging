@@ -24,6 +24,17 @@ core_protocol = { package = "protocol", path = "../../core/protocol" }
 core_transport = { package = "transport", path = "../../core/transport" }
 core_storage = { package = "storage", path = "../../core/storage" }
 
+# DT-2: native WebSocket client for the relay's WS wire protocol (mirrors
+# clients/web/src/relay_transport.ts). Versions match the entries already locked in
+# Cargo.lock (tokio-tungstenite 0.29.0, base64 0.22.1, sha2 0.10.9, futures-util
+# 0.3.32) so no second copy is pulled in. sha2 is needed to solve the relay's PoW
+# challenge locally (relay/src/pow); tokio(time) bounds each response read.
+tokio-tungstenite = "0.29"
+base64 = "0.22"
+sha2 = "0.10"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
+
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
