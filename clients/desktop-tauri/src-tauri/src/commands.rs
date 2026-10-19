@@ -29,7 +29,7 @@
 //! never as an empty message.
 
 use crate::conversation::ConversationStore;
-use crate::error::{CommandError, ShellError};
+use crate::error::ShellError;
 use crate::identity_store::{
     identity_error_message, load_or_create_identity_at, load_or_create_identity_keypair_at,
     load_or_create_store_key_at, next_correlation_id,
@@ -43,6 +43,57 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
+
+/// A defined, serializable error for the conversation and verification commands.
+///
+/// Kept separate from [`ShellError`] so the identity commands' error contract (a single
+/// `Session` kind) is unchanged, while the new commands can report *which* subsystem failed.
+/// Every variant carries a generic message: no store path, no safety number, and no message body
+/// ever crosses the IPC boundary inside an error.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "message")]
+pub enum CommandError {
+    /// A `core_crypto` session/prekey operation failed.
+    Session(String),
+    /// A conversation-store operation failed (including an oversized message).
+    Conversation(String),
+    /// A safety-number verification operation failed.
+    Verification(String),
+    /// The relay could not be reached or rejected the request.
+    Relay(String),
+}
+
+impl From<ShellError> for CommandError {
+    fn from(err: ShellError) -> Self {
+        match err {
+            ShellError::Session(message) => CommandError::Session(message),
+        }
+    }
+}
+
+impl From<core_crypto::session::SessionError> for CommandError {
+    fn from(err: core_crypto::session::SessionError) -> Self {
+        CommandError::Session(err.to_string())
+    }
+}
+
+impl From<crate::conversation::ConversationError> for CommandError {
+    fn from(err: crate::conversation::ConversationError) -> Self {
+        CommandError::Conversation(err.to_string())
+    }
+}
+
+impl From<crate::verify::VerificationError> for CommandError {
+    fn from(err: crate::verify::VerificationError) -> Self {
+        CommandError::Verification(err.to_string())
+    }
+}
+
+impl From<crate::relay_client::RelayError> for CommandError {
+    fn from(err: crate::relay_client::RelayError) -> Self {
+        CommandError::Relay(err.to_string())
+    }
+}
 
 /// Prefix for a persisted ratchet session inside the encrypted store.
 const SESSION_KEY_PREFIX: &str = "session:";
