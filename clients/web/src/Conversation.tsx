@@ -133,9 +133,11 @@ export interface ConversationProps {
     /**
      * DR-6: the recipient's verified device list (spec/v0.md §8.3), injected by
      * App. When supplied and non-empty, a 1:1 send fans out — one envelope per
-     * device, each addressed to `${peerId}:${deviceId}`. When absent or empty,
-     * the send path is exactly the legacy single-recipient behaviour: one
-     * envelope addressed to the bare peer id.
+     * device. MD-17a: device 0 is the PRIMARY device and is addressed by the
+     * bare peer id (the receive loop polls `identity.recipientId`), while every
+     * nonzero device is addressed to `${peerId}:${deviceId}`. When absent or
+     * empty, the send path is exactly the legacy single-recipient behaviour:
+     * one envelope addressed to the bare peer id.
      */
     deviceList?: DeviceList;
 }
