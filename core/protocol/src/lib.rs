@@ -4,5 +4,6 @@
 //! crypto primitive is delegated to the `crypto` crate's `DoubleRatchetSession` facade, which
 //! in turn wraps `libsignal` directly.
 
+pub mod device_list;
 pub mod fanout;
 pub mod group;
