@@ -34,6 +34,15 @@ use url::{Host, Url};
 /// Environment variable consulted when no CLI value is supplied.
 pub const RELAY_URL_ENV: &str = "E2E_RELAY_WS_URL";
 
+/// CLI flag carrying the relay address (highest precedence).
+const RELAY_URL_FLAG: &str = "--relay-url";
+
+/// CLI flag carrying the path to a JSON config file.
+const RELAY_CONFIG_FLAG: &str = "--relay-config";
+
+/// CLI flag opting in to a plain `ws://` relay on a non-loopback host.
+const ALLOW_INSECURE_WS_FLAG: &str = "--allow-insecure-ws";
+
 /// The sources a relay address may come from, in precedence order.
 ///
 /// `Default` means "nothing configured, insecure ws NOT allowed" — the
@@ -67,6 +76,105 @@ impl RelayConfig {
     /// allow to reach this relay.
     pub fn origin(&self) -> String {
         self.origin.clone()
+    }
+}
+
+/// Read the relay sources from process arguments and the environment.
+///
+/// `args` are the arguments *after* the program name. Both `--flag value` and
+/// `--flag=value` spellings are accepted. Unknown arguments are ignored: the
+/// desktop binary may receive platform-injected arguments it does not own.
+///
+/// A flag with no value leaves its source unset rather than failing here, so
+/// resolution still reports the accurate "nothing configured" error and the
+/// documented precedence (CLI > env > file) still applies to whatever was
+/// supplied.
+pub fn sources_from_args_and_env<I, S>(
+    args: I,
+    env: impl Fn(&str) -> Option<String>,
+) -> RelaySources
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut sources = RelaySources::default();
+    let mut args = args.into_iter().map(|arg| arg.as_ref().to_string());
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            ALLOW_INSECURE_WS_FLAG => sources.allow_insecure_ws = true,
+            RELAY_URL_FLAG => sources.cli = args.next(),
+            RELAY_CONFIG_FLAG => sources.config_file = args.next().map(PathBuf::from),
+            _ => {
+                if let Some(value) = arg.strip_prefix(&format!("{RELAY_URL_FLAG}=")) {
+                    sources.cli = Some(value.to_string());
+                } else if let Some(value) = arg.strip_prefix(&format!("{RELAY_CONFIG_FLAG}=")) {
+                    sources.config_file = Some(PathBuf::from(value));
+                }
+            }
+        }
+    }
+
+    sources.env = env(RELAY_URL_ENV);
+    sources
+}
+
+/// The relay configuration resolved once at startup, held in Tauri's managed
+/// state so the commands that dial the relay read the same validated address.
+///
+/// Stores the error instead of panicking: a shell with no relay configured is
+/// a valid (secure-default) state that must surface as a clear message when
+/// something asks for the relay, not as a failed launch.
+#[derive(Debug, Clone)]
+pub struct RelayConfigState {
+    config: Option<RelayConfig>,
+    error: Option<RelayConfigError>,
+}
+
+impl RelayConfigState {
+    /// Resolve `sources` into either a usable config or the reason there is none.
+    pub fn resolve(sources: RelaySources) -> Self {
+        match resolve_relay_config(&sources) {
+            Ok(config) => Self {
+                config: Some(config),
+                error: None,
+            },
+            Err(error) => Self {
+                config: None,
+                error: Some(error),
+            },
+        }
+    }
+
+    /// Resolve from the real process: CLI arguments (after the program name)
+    /// then [`RELAY_URL_ENV`].
+    pub fn from_process() -> Self {
+        let args = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned());
+        Self::resolve(sources_from_args_and_env(args, |name| {
+            std::env::var(name).ok()
+        }))
+    }
+
+    /// The validated relay address, when one is configured.
+    pub fn config(&self) -> Option<&RelayConfig> {
+        self.config.as_ref()
+    }
+
+    /// Why no address is usable, when there is none.
+    pub fn error(&self) -> Option<&RelayConfigError> {
+        self.error.as_ref()
+    }
+
+    /// The validated address, or the stored failure — the fail-closed accessor
+    /// for callers that cannot proceed without a relay.
+    pub fn require(&self) -> Result<&RelayConfig, RelayConfigError> {
+        match (&self.config, &self.error) {
+            (Some(config), _) => Ok(config),
+            (None, Some(error)) => Err(error.clone()),
+            (None, None) => Err(RelayConfigError::NotConfigured),
+        }
     }
 }
 
@@ -137,8 +245,12 @@ pub fn resolve_relay_config(sources: &RelaySources) -> Result<RelayConfig, Relay
 /// (`127.0.0.0/8`, `localhost`, `[::1]`) unless `allow_insecure_ws` is set.
 /// Every other scheme, an unparsable URL, or a URL without a host is
 /// [`RelayConfigError::InvalidUrl`] regardless of the opt-in.
-pub fn validate_relay_url(url: &str, allow_insecure_ws: bool) -> Result<RelayConfig, RelayConfigError> {
-    let parsed = Url::parse(url).map_err(|e| RelayConfigError::InvalidUrl(format!("{url:?}: {e}")))?;
+pub fn validate_relay_url(
+    url: &str,
+    allow_insecure_ws: bool,
+) -> Result<RelayConfig, RelayConfigError> {
+    let parsed =
+        Url::parse(url).map_err(|e| RelayConfigError::InvalidUrl(format!("{url:?}: {e}")))?;
 
     let scheme = parsed.scheme();
     if scheme != "ws" && scheme != "wss" {
@@ -202,9 +314,8 @@ fn is_loopback(host: &Host<&str>) -> bool {
 }
 
 fn read_config_file(path: &Path) -> Result<String, RelayConfigError> {
-    let body = std::fs::read_to_string(path).map_err(|e| {
-        RelayConfigError::InvalidConfigFile(format!("{}: {e}", path.display()))
-    })?;
+    let body = std::fs::read_to_string(path)
+        .map_err(|e| RelayConfigError::InvalidConfigFile(format!("{}: {e}", path.display())))?;
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
         RelayConfigError::InvalidConfigFile(format!("{}: not valid JSON: {e}", path.display()))
     })?;

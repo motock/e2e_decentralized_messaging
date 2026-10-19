@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use clients_desktop_tauri::relay_client::RelayClient;
 use clients_desktop_tauri::relay_config::{
-    content_security_policy, resolve_relay_config, validate_relay_url, RelayConfigError,
-    RelaySources,
+    content_security_policy, resolve_relay_config, sources_from_args_and_env, validate_relay_url,
+    RelayConfigError, RelayConfigState, RelaySources, RELAY_URL_ENV,
 };
 
 fn config_file(name: &str, body: &str) -> PathBuf {
@@ -52,14 +52,20 @@ fn should_fail_closed_when_nothing_is_configured() {
 #[test]
 fn should_prefer_cli_over_env_and_file() {
     let file = config_file("prec1", r#"{"relay_url":"wss://file.example.com"}"#);
-    let cfg = resolve_relay_config(&sources(Some("wss://cli.example.com"), Some("wss://env.example.com"), Some(file))).unwrap();
+    let cfg = resolve_relay_config(&sources(
+        Some("wss://cli.example.com"),
+        Some("wss://env.example.com"),
+        Some(file),
+    ))
+    .unwrap();
     assert_eq!(cfg.url(), "wss://cli.example.com");
 }
 
 #[test]
 fn should_prefer_env_over_file() {
     let file = config_file("prec2", r#"{"relay_url":"wss://file.example.com"}"#);
-    let cfg = resolve_relay_config(&sources(None, Some("wss://env.example.com"), Some(file))).unwrap();
+    let cfg =
+        resolve_relay_config(&sources(None, Some("wss://env.example.com"), Some(file))).unwrap();
     assert_eq!(cfg.url(), "wss://env.example.com");
 }
 
@@ -72,7 +78,12 @@ fn should_read_the_config_file_when_it_is_the_only_source() {
 
 #[test]
 fn should_not_fall_through_to_a_lower_source_when_the_higher_one_is_invalid() {
-    let err = resolve_relay_config(&sources(Some("http://cli.example.com"), Some("wss://env.example.com"), None)).unwrap_err();
+    let err = resolve_relay_config(&sources(
+        Some("http://cli.example.com"),
+        Some("wss://env.example.com"),
+        None,
+    ))
+    .unwrap_err();
     assert!(matches!(err, RelayConfigError::InvalidUrl(_)));
 }
 
@@ -168,7 +179,11 @@ fn should_report_the_origin_without_path() {
 fn should_allow_only_the_configured_relay_origin_in_connect_src() {
     let cfg = validate_relay_url("wss://relay.example.com:8443/ws", false).unwrap();
     let csp = content_security_policy(Some(&cfg));
-    let connect = csp.split(';').map(str::trim).find(|d| d.starts_with("connect-src")).unwrap();
+    let connect = csp
+        .split(';')
+        .map(str::trim)
+        .find(|d| d.starts_with("connect-src"))
+        .unwrap();
     let sources: Vec<&str> = connect.split_whitespace().skip(1).collect();
     assert!(sources.contains(&"wss://relay.example.com:8443"));
     assert!(sources.contains(&"'self'"));
@@ -178,10 +193,17 @@ fn should_allow_only_the_configured_relay_origin_in_connect_src() {
 fn should_not_open_general_outbound_origins_when_a_relay_is_configured() {
     let cfg = validate_relay_url("wss://relay.example.com", false).unwrap();
     let csp = content_security_policy(Some(&cfg));
-    let connect = csp.split(';').map(str::trim).find(|d| d.starts_with("connect-src")).unwrap();
+    let connect = csp
+        .split(';')
+        .map(str::trim)
+        .find(|d| d.starts_with("connect-src"))
+        .unwrap();
     let sources: Vec<&str> = connect.split_whitespace().skip(1).collect();
     for banned in ["*", "ws:", "wss:", "http:", "https:", "data:"] {
-        assert!(!sources.contains(&banned), "connect-src must not contain {banned}");
+        assert!(
+            !sources.contains(&banned),
+            "connect-src must not contain {banned}"
+        );
     }
 }
 
@@ -199,7 +221,8 @@ fn should_keep_default_src_locked_down_with_a_relay_configured() {
 
 #[test]
 fn should_ship_a_tauri_conf_csp_with_no_hardcoded_relay_or_wildcard() {
-    let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
+    let conf =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&conf).unwrap();
     let csp = json["app"]["security"]["csp"].as_str().unwrap();
     assert!(!csp.contains("ws:") && !csp.contains("wss:") && !csp.contains('*'));
@@ -207,17 +230,30 @@ fn should_ship_a_tauri_conf_csp_with_no_hardcoded_relay_or_wildcard() {
 
 #[test]
 fn should_grant_no_wildcard_capability_permissions() {
-    let caps = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/capabilities/default.json")).unwrap();
+    let caps = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/capabilities/default.json"
+    ))
+    .unwrap();
     let json: serde_json::Value = serde_json::from_str(&caps).unwrap();
-    let wildcard = json["permissions"].as_array().unwrap().iter().filter_map(|p| p.as_str()).any(|p| p == "*" || p.ends_with(":allow-all"));
+    let wildcard = json["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p.as_str())
+        .any(|p| p == "*" || p.ends_with(":allow-all"));
     assert!(!wildcard);
 }
 
 #[test]
 fn should_enable_a_rustls_tls_feature_on_tokio_tungstenite_and_not_native_tls() {
-    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
     let deps = manifest.split("[dev-dependencies]").next().unwrap();
-    let line = deps.lines().find(|l| l.trim_start().starts_with("tokio-tungstenite")).unwrap();
+    let line = deps
+        .lines()
+        .find(|l| l.trim_start().starts_with("tokio-tungstenite"))
+        .unwrap();
     assert!(line.contains("rustls-tls-webpki-roots"), "got: {line}");
     assert!(!line.contains("native-tls"));
 }
@@ -225,6 +261,132 @@ fn should_enable_a_rustls_tls_feature_on_tokio_tungstenite_and_not_native_tls() 
 #[tokio::test]
 async fn should_refuse_to_dial_a_plain_ws_remote_host() {
     // 192.0.2.1 is TEST-NET-1 (blackhole): an unvalidated dial would hang past the bound.
-    let attempt = tokio::time::timeout(Duration::from_secs(3), RelayClient::connect("ws://192.0.2.1:9")).await;
-    assert!(attempt.expect("connect must reject up front, not dial").is_err());
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(3),
+        RelayClient::connect("ws://192.0.2.1:9"),
+    )
+    .await;
+    assert!(attempt
+        .expect("connect must reject up front, not dial")
+        .is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Process-level wiring: the shell must actually read the documented sources.
+// ---------------------------------------------------------------------------
+
+fn no_env(_: &str) -> Option<String> {
+    None
+}
+
+fn env_with(url: &'static str) -> impl Fn(&str) -> Option<String> {
+    move |name| (name == RELAY_URL_ENV).then(|| url.to_string())
+}
+
+#[test]
+fn should_read_the_relay_url_from_a_space_separated_argument() {
+    let sources = sources_from_args_and_env(["--relay-url", "wss://cli.example.com"], no_env);
+    assert_eq!(sources.cli.as_deref(), Some("wss://cli.example.com"));
+}
+
+#[test]
+fn should_read_the_relay_url_from_an_equals_form_argument() {
+    let sources = sources_from_args_and_env(["--relay-url=wss://cli.example.com"], no_env);
+    assert_eq!(sources.cli.as_deref(), Some("wss://cli.example.com"));
+}
+
+#[test]
+fn should_read_the_relay_url_from_the_environment_when_no_flag_is_present() {
+    let sources = sources_from_args_and_env(
+        std::iter::empty::<&str>(),
+        env_with("wss://env.example.com"),
+    );
+    assert_eq!(sources.env.as_deref(), Some("wss://env.example.com"));
+}
+
+#[test]
+fn should_prefer_the_cli_url_over_the_environment_in_the_resolved_config() {
+    let sources = sources_from_args_and_env(
+        ["--relay-url", "wss://cli.example.com"],
+        env_with("wss://env.example.com"),
+    );
+    assert_eq!(
+        resolve_relay_config(&sources).unwrap().url(),
+        "wss://cli.example.com"
+    );
+}
+
+#[test]
+fn should_read_the_config_file_path_from_its_flag() {
+    let sources = sources_from_args_and_env(["--relay-config", "/etc/e2e/relay.json"], no_env);
+    assert_eq!(
+        sources.config_file,
+        Some(PathBuf::from("/etc/e2e/relay.json"))
+    );
+}
+
+#[test]
+fn should_enable_insecure_ws_only_when_the_flag_is_present() {
+    let without = sources_from_args_and_env(std::iter::empty::<&str>(), no_env);
+    let with = sources_from_args_and_env(["--allow-insecure-ws"], no_env);
+    assert!(!without.allow_insecure_ws);
+    assert!(with.allow_insecure_ws);
+}
+
+#[test]
+fn should_ignore_unknown_arguments() {
+    let sources = sources_from_args_and_env(
+        [
+            "--unrelated",
+            "value",
+            "--relay-url",
+            "wss://cli.example.com",
+        ],
+        no_env,
+    );
+    assert_eq!(sources.cli.as_deref(), Some("wss://cli.example.com"));
+}
+
+#[test]
+fn should_treat_an_empty_cli_value_as_unset_and_fall_through_to_the_environment() {
+    let sources = sources_from_args_and_env(["--relay-url", ""], env_with("wss://env.example.com"));
+    assert_eq!(
+        resolve_relay_config(&sources).unwrap().url(),
+        "wss://env.example.com"
+    );
+}
+
+#[test]
+fn should_hold_the_resolved_address_in_startup_state() {
+    let state = RelayConfigState::resolve(sources_from_args_and_env(
+        ["--relay-url", "wss://relay.example.com:8443"],
+        no_env,
+    ));
+    assert_eq!(
+        state.require().unwrap().origin(),
+        "wss://relay.example.com:8443"
+    );
+    assert!(state.error().is_none());
+}
+
+#[test]
+fn should_fail_closed_through_startup_state_when_nothing_is_configured() {
+    let state = RelayConfigState::resolve(RelaySources::default());
+    assert!(state.config().is_none());
+    let error = state.require().unwrap_err();
+    assert!(matches!(error, RelayConfigError::NotConfigured));
+    assert!(error.to_string().to_lowercase().contains("relay"));
+}
+
+#[test]
+fn should_keep_a_resolution_failure_in_startup_state() {
+    let state = RelayConfigState::resolve(sources_from_args_and_env(
+        ["--relay-url", "http://not-a-websocket.example.com"],
+        no_env,
+    ));
+    assert!(state.config().is_none());
+    assert!(matches!(
+        state.require(),
+        Err(RelayConfigError::InvalidUrl(_))
+    ));
 }
