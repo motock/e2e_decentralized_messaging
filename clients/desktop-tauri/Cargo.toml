@@ -30,7 +30,12 @@ core_storage = { package = "storage", path = "../../core/storage" }
 # 0.3.32) so no second copy is pulled in. sha2 is needed to solve the relay's PoW
 # challenge locally (relay/src/pow); tokio(time) bounds each response read and
 # tokio(rt) runs the PoW solve off the async executor via spawn_blocking.
-tokio-tungstenite = "0.29"
+# DT-3: rustls (webpki roots) so a wss:// relay can connect without a
+# platform TLS/linker dependency (native-tls would reintroduce the kind of
+# platform-specific link problem this crate already hit on Windows). The
+# `ring` provider is used (not aws-lc-sys) so no cmake/NASM C toolchain is
+# needed on windows-latest.
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
 sha2 = "0.10"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -39,6 +44,9 @@ tokio = { version = "1", default-features = false, features = ["time", "rt"] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# DT-3: parse relay URLs with the `url` crate so host checks compare the
+# parsed Host (never string prefixes) — see src-tauri/src/relay_config.rs.
+url = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 [build-dependencies]
