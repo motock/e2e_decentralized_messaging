@@ -458,10 +458,13 @@ export const Conversation: React.FC<ConversationProps> = ({
                 );
                 const envelopes = fanout_encrypt(handle, plaintextBytes);
                 for (const env of envelopes) {
-                    await transportRef.current.sendEnvelope(
-                        `${trimmedPeerId}:${env.device_id}`,
-                        env.envelope,
-                    );
+                    // MD-17a: device 0 is the PRIMARY device. It is reachable
+                    // only through the bare-id receive loop (which polls
+                    // `identity.recipientId`), so it is addressed by the bare
+                    // peer id; every other device keeps `peer:deviceId`.
+                    const address =
+                        env.device_id === 0 ? trimmedPeerId : `${trimmedPeerId}:${env.device_id}`;
+                    await transportRef.current.sendEnvelope(address, env.envelope);
                 }
 
                 const msg: Message = {
