@@ -6,6 +6,7 @@
 
 pub mod backup;
 mod commands;
+pub mod conversation;
 mod error;
 mod identity_store;
 pub mod relay_client;
@@ -13,8 +14,8 @@ pub mod ui;
 pub mod verify;
 
 pub use verify::{
-    describe_verification_flow_for_user, verify_safety_number, VerificationFlowDoc,
-    VerificationState,
+    describe_verification_flow_for_user, VerificationError, VerificationFlowDoc, VerificationState,
+    VerificationStore,
 };
 
 /// Build and run the Tauri application.
@@ -24,6 +25,12 @@ pub fn run() {
             commands::generate_identity,
             commands::load_or_create_identity,
             commands::establish_malformed_session,
+            commands::get_conversation_state,
+            commands::send_message,
+            commands::receive_and_decrypt,
+            commands::begin_verification,
+            commands::verify_safety_number,
+            commands::get_verification_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the desktop shell");

@@ -334,6 +334,50 @@ fn audit_identity_event(event: &str, correlation_id: u64, detail: &str) {
 /// Monotonic per-process id correlating the generic message returned over IPC with the detailed
 /// local log line that explains it (CLAUDE.md: generic error to the caller, full detail logged
 /// locally).
+/// Load (or mint) the encrypted-store key for `dir`.
+///
+/// Shared by the conversation and verification stores so every piece of shell
+/// state is encrypted with the same key as the identity.
+pub(crate) fn load_or_create_store_key_at(dir: &Path) -> Result<[u8; STORE_KEY_LEN], ShellError> {
+    let correlation_id = next_correlation_id();
+    std::fs::create_dir_all(dir).map_err(|err| {
+        eprintln!("identity: correlation {correlation_id}: cannot create app data dir: {err}");
+        ShellError::Session(identity_error_message(correlation_id))
+    })?;
+    load_or_create_store_key(dir, correlation_id)
+}
+
+/// Load (or mint) the identity keypair persisted in `dir`.
+///
+/// The conversation and verification stores need the keypair to restore a
+/// ratchet session; it is read back from the same encrypted store the identity
+/// command writes, so there is exactly one identity per install.
+pub(crate) fn load_or_create_identity_keypair_at(
+    dir: &Path,
+) -> Result<core_crypto::identity::IdentityKeyPair, ShellError> {
+    // Ensures an identity exists (minting one on a genuine first run).
+    load_or_create_identity_at(dir)?;
+
+    let correlation_id = next_correlation_id();
+    let key = load_or_create_store_key_at(dir)?;
+    let store = EncryptedStore::open(dir, &key).map_err(|err| {
+        eprintln!("identity: correlation {correlation_id}: cannot open encrypted store: {err}");
+        ShellError::Session(identity_error_message(correlation_id))
+    })?;
+    let serialized = store
+        .get_identity()
+        .map_err(|err| {
+            eprintln!("identity: correlation {correlation_id}: cannot read identity: {err}");
+            ShellError::Session(identity_error_message(correlation_id))
+        })?
+        .ok_or_else(|| ShellError::Session(identity_error_message(correlation_id)))?;
+
+    core_crypto::identity::IdentityKeyPair::from_bytes(&serialized).map_err(|err| {
+        eprintln!("identity: correlation {correlation_id}: stored identity is unusable: {err}");
+        ShellError::Session(identity_error_message(correlation_id))
+    })
+}
+
 pub(crate) fn next_correlation_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)

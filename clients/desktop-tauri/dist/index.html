@@ -6,9 +6,41 @@
   </head>
   <body>
     <h1>E2E Decentralized Messaging</h1>
-    <button id="generate">Generate identity</button>
-    <button id="malformed">Trigger malformed prekey (negative test)</button>
-    <pre id="output">idle</pre>
+
+    <section id="identity">
+      <button id="generate">Generate identity</button>
+      <button id="malformed">Trigger malformed prekey (negative test)</button>
+      <pre id="output">idle</pre>
+    </section>
+
+    <section id="conversation">
+      <h2>Conversation</h2>
+      <label for="peer">Peer</label>
+      <input id="peer" type="text" value="bob" autocomplete="off" />
+
+      <ul id="messages" aria-live="polite"></ul>
+
+      <form id="compose">
+        <label for="body">Message</label>
+        <textarea id="body" rows="3" cols="40"></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+
+      <p id="compose-error" role="alert" hidden></p>
+      <p id="delivery-status" hidden></p>
+
+      <button id="receive" type="button">Receive and decrypt</button>
+    </section>
+
+    <section id="verification">
+      <h2>Safety number</h2>
+      <p id="verification-state">unverified</p>
+      <label for="safety-number">Safety number</label>
+      <input id="safety-number" type="text" autocomplete="off" />
+      <button id="verify" type="button">Mark verified</button>
+      <p id="verification-error" role="alert" hidden></p>
+    </section>
+
     <script type="module" src="./main.js"></script>
   </body>
 </html>
