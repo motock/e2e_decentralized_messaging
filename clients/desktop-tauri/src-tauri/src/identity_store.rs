@@ -347,7 +347,6 @@ pub(crate) fn load_or_create_store_key_at(dir: &Path) -> Result<[u8; STORE_KEY_L
     load_or_create_store_key(dir, correlation_id)
 }
 
-
 pub(crate) fn next_correlation_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)

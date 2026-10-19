@@ -390,7 +390,9 @@ fn open_store(dir: &Path, key: &[u8; 32]) -> Result<EncryptedStore, CommandError
 /// The conversation and verification paths need the keypair to restore a ratchet session. It is
 /// read back from the same encrypted store `generate_identity` writes, so there is exactly one
 /// identity per install; `load_or_create_identity_at` mints one on a genuine first run.
-fn load_identity_keypair(dir: &Path) -> Result<core_crypto::identity::IdentityKeyPair, CommandError> {
+fn load_identity_keypair(
+    dir: &Path,
+) -> Result<core_crypto::identity::IdentityKeyPair, CommandError> {
     let serialized = load_or_create_identity_at(dir)?;
     core_crypto::identity::IdentityKeyPair::from_bytes(&serialized).map_err(|err| {
         let correlation_id = next_correlation_id();
