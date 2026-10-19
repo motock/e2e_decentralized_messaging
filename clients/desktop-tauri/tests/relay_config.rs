@@ -379,6 +379,66 @@ fn should_fail_closed_through_startup_state_when_nothing_is_configured() {
 }
 
 #[test]
+fn should_not_consume_the_following_flag_as_a_value() {
+    let sources = sources_from_args_and_env(["--relay-url", "--allow-insecure-ws"], no_env);
+    assert_eq!(sources.cli, None);
+    assert!(sources.allow_insecure_ws);
+}
+
+#[test]
+fn should_treat_a_trailing_dot_localhost_as_loopback() {
+    let config = validate_relay_url("ws://localhost.:9000", false).unwrap();
+    assert_eq!(config.origin(), "ws://localhost.:9000");
+}
+
+/// A non-loopback address of this machine, found without sending a packet:
+/// connecting a UDP socket only selects a source address.
+fn non_loopback_local_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?; // TEST-NET-1, unroutable on purpose.
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback()).then_some(ip)
+}
+
+#[tokio::test]
+async fn should_dial_a_plain_ws_remote_host_that_the_user_opted_in_to() {
+    let ip = non_loopback_local_ip()
+        .expect("this test needs a non-loopback local address to exercise the remote-ws policy");
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .expect("bind a probe listener");
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // Accept one connection and drop it: the WS handshake fails, but the
+        // dial reaching this listener proves the policy let it through.
+        let _ = listener.accept().await;
+    });
+    let url = format!("ws://{ip}:{port}");
+
+    let refused = match RelayClient::connect(&url).await {
+        Ok(_) => panic!("plain ws:// to a remote host must be refused by default"),
+        Err(error) => error,
+    };
+    assert!(
+        refused.to_string().contains("refusing insecure"),
+        "default policy must refuse up front, got: {refused}"
+    );
+
+    let state = RelayConfigState::resolve(sources_from_args_and_env(
+        ["--allow-insecure-ws", "--relay-url", url.as_str()],
+        no_env,
+    ));
+    let attempt =
+        RelayClient::connect_config(state.require().expect("opt-in config must resolve")).await;
+    if let Err(error) = attempt {
+        assert!(
+            !error.to_string().contains("refusing insecure"),
+            "the opt-in must reach the dial path, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn should_keep_a_resolution_failure_in_startup_state() {
     let state = RelayConfigState::resolve(sources_from_args_and_env(
         ["--relay-url", "http://not-a-websocket.example.com"],

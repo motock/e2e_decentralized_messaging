@@ -98,13 +98,23 @@ where
     S: AsRef<str>,
 {
     let mut sources = RelaySources::default();
-    let mut args = args.into_iter().map(|arg| arg.as_ref().to_string());
+    let mut args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string())
+        .peekable();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             ALLOW_INSECURE_WS_FLAG => sources.allow_insecure_ws = true,
-            RELAY_URL_FLAG => sources.cli = args.next(),
-            RELAY_CONFIG_FLAG => sources.config_file = args.next().map(PathBuf::from),
+            // Only consume a following token that is a value: `--relay-url
+            // --allow-insecure-ws` must leave the URL unset (and still honour
+            // the opt-in) rather than taking the next flag as its value.
+            RELAY_URL_FLAG => sources.cli = args.next_if(|value| !value.starts_with("--")),
+            RELAY_CONFIG_FLAG => {
+                sources.config_file = args
+                    .next_if(|value| !value.starts_with("--"))
+                    .map(PathBuf::from)
+            }
             _ => {
                 if let Some(value) = arg.strip_prefix(&format!("{RELAY_URL_FLAG}=")) {
                     sources.cli = Some(value.to_string());
@@ -281,14 +291,16 @@ pub fn validate_relay_url(
     })
 }
 
-/// The Content-Security-Policy the shell should apply.
+/// Derive the Content-Security-Policy for a shell that may dial `relay`.
 ///
-/// The DT-2 relay client dials the WebSocket from Rust (`tokio-tungstenite`),
-/// so the CSP does not govern that connection and the shipped policy stays
-/// locked down. When a relay is configured its exact origin is added to
-/// `connect-src` (never a bare `ws:`/`wss:` scheme, a wildcard, or a general
-/// `http(s):` source) so a future frontend-initiated socket to that one relay
-/// would be permitted and nothing else.
+/// **Not applied today.** The relay client dials the WebSocket from Rust
+/// (`tokio-tungstenite`), where the webview CSP does not govern the
+/// connection, so the shipped static policy in `tauri.conf.json` stays
+/// locked down and needs no per-relay change. This helper exists for the
+/// frontend-initiated case: when a relay is configured its exact origin goes
+/// into `connect-src` (never a bare `ws:`/`wss:` scheme, a wildcard, or a
+/// general `http(s):` source) and nothing else is opened. Wire it into the
+/// webview policy before any frontend code opens a socket directly.
 pub fn content_security_policy(relay: Option<&RelayConfig>) -> String {
     let mut connect = String::from("'self' ipc: http://ipc.localhost");
     if let Some(cfg) = relay {
@@ -307,7 +319,12 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 
 fn is_loopback(host: &Host<&str>) -> bool {
     match host {
-        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        // `localhost.` is the same name with an explicit root label and
+        // resolves to loopback; treating it as remote would reject a valid
+        // local relay.
+        Host::Domain(domain) => domain
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("localhost"),
         Host::Ipv4(ip) => ip.is_loopback(),
         Host::Ipv6(ip) => ip.is_loopback(),
     }

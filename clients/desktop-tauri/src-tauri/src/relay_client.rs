@@ -198,10 +198,36 @@ impl RelayClient {
     ) -> Result<Self, RelayError> {
         // DT-3: refuse a plain ws:// relay on a non-loopback host up front,
         // before any dial. Plain ws:// exposes recipient IDs and timing to the
-        // network; a remote relay must use wss:// (the caller opts in to an
-        // insecure remote relay through `relay_config` instead of here).
+        // network; a remote relay must use wss:// unless the user opted in with
+        // `--allow-insecure-ws`, which is resolved into a `RelayConfig` and
+        // dialed through [`RelayClient::connect_config`] instead.
         crate::relay_config::validate_relay_url(url, false)
             .map_err(|e| RelayError::Unreachable(e.to_string()))?;
+        Self::dial(url, response_timeout).await
+    }
+
+    /// Connect using an address that has already been validated, typically the
+    /// one held in [`crate::relay_config::RelayConfigState`].
+    ///
+    /// The policy decision — including an explicit `--allow-insecure-ws` opt-in
+    /// — was made when the config was resolved, and a `RelayConfig` can only be
+    /// produced by that validation, so re-applying the default-deny rule here
+    /// would make the opt-in unreachable.
+    pub async fn connect_config(
+        config: &crate::relay_config::RelayConfig,
+    ) -> Result<Self, RelayError> {
+        Self::connect_config_with_timeout(config, RESPONSE_TIMEOUT).await
+    }
+
+    /// [`RelayClient::connect_config`] with an explicit round-trip bound.
+    pub async fn connect_config_with_timeout(
+        config: &crate::relay_config::RelayConfig,
+        response_timeout: Duration,
+    ) -> Result<Self, RelayError> {
+        Self::dial(config.url(), response_timeout).await
+    }
+
+    async fn dial(url: &str, response_timeout: Duration) -> Result<Self, RelayError> {
         match connect_async(url).await {
             Ok((ws, _response)) => Ok(Self {
                 ws,

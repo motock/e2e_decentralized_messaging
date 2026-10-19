@@ -22,7 +22,7 @@ pub use verify::{
 ///
 /// The relay address is resolved once here, from the process arguments and
 /// environment (see [`relay_config::sources_from_args_and_env`]), and held in
-/// managed state so every command that dials the relay reads the same
+/// managed state so every command that dials the relay can read the same
 /// validated address. An unconfigured shell still launches — no relay is a
 /// valid secure default — and the failure is reported when the relay is used.
 pub fn run() {
