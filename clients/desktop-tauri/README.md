@@ -10,7 +10,8 @@
 * **Linux system dependencies** (only needed when building on Ubuntu):
   ```sh
   sudo apt-get update
-  sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+  sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+    libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
   ```
   (Windows and macOS do not require these packages.)
 
@@ -31,7 +32,9 @@ cd clients/desktop-tauri
 cargo tauri build
 ```
 
-The bundled binaries are placed under `src-tauri/target/release/bundle`.
+The bundled binaries are placed under `target/release/bundle/` in the
+workspace root (e.g. `target/release/bundle/macos/desktop-tauri.app` on macOS,
+`target/release/bundle/deb/` on Linux, `target/release/bundle/nsis/` on Windows).
 
 ## Relay Configuration
 
