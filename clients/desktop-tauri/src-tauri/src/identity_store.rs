@@ -331,6 +331,19 @@ fn audit_identity_event(event: &str, correlation_id: u64, detail: &str) {
     eprintln!("audit: {event} correlation={correlation_id} {detail}");
 }
 
+/// Load (or mint) the encrypted-store key for `dir`.
+///
+/// Shared by the conversation and verification stores so every piece of shell
+/// state is encrypted with the same key as the identity.
+pub(crate) fn load_or_create_store_key_at(dir: &Path) -> Result<[u8; STORE_KEY_LEN], ShellError> {
+    let correlation_id = next_correlation_id();
+    std::fs::create_dir_all(dir).map_err(|err| {
+        eprintln!("identity: correlation {correlation_id}: cannot create app data dir: {err}");
+        ShellError::Session(identity_error_message(correlation_id))
+    })?;
+    load_or_create_store_key(dir, correlation_id)
+}
+
 /// Monotonic per-process id correlating the generic message returned over IPC with the detailed
 /// local log line that explains it (CLAUDE.md: generic error to the caller, full detail logged
 /// locally).
