@@ -13,6 +13,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+
+  desktop-build:
+    name: desktop build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Build desktop app
+        run: cargo tauri build
+      - name: Test desktop app
+        run: cargo test -p clients-desktop-tauri --locked
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
