@@ -60,3 +60,5 @@ tokio-tungstenite = "0.29"
 futures = "0.3"
 # tests/relay_client_rework.rs builds challenge wire frames directly.
 base64 = "0.22"
+# DT-4: tests/conversation_store.rs and tests/safety_number_ui.rs persist into a temp dir.
+tempfile = "3.14.0"

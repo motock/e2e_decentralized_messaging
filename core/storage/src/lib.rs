@@ -192,6 +192,25 @@ impl EncryptedStore {
         Ok(())
     }
 
+    /// Persists `value` under the caller-namespaced `key`, in the same
+    /// length-prefixed envelope as [`Self::put_identity`].
+    ///
+    /// This is the general-purpose accessor for shell state that is not the
+    /// identity keypair (conversation history, safety-number verification
+    /// records). Values are integrity-checked on load, so a truncated or
+    /// hand-written row fails closed instead of being read as data.
+    pub fn put_state(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        self.put_typed(key, value)
+    }
+
+    /// Loads the value persisted under `key`, or `Ok(None)` if none exists.
+    ///
+    /// Fails closed with [`StoreError::Corrupted`] if a row exists but is not a
+    /// valid envelope.
+    pub fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_typed(key)
+    }
+
     fn put_typed(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
         let mut envelope = Vec::with_capacity(4 + value.len());
         envelope.extend_from_slice(&(value.len() as u32).to_be_bytes());
