@@ -46,6 +46,7 @@
 //! `from_bytes` never panics: every read is bounds-checked and every length is
 //! validated before it is used, so hostile input yields an error rather than a crash.
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Domain-separation prefix for the canonical device-list encoding.
@@ -398,6 +399,36 @@ impl SignedDeviceList {
     pub fn is_newer_than(&self, held_version: Option<u64>) -> bool {
         held_version.is_none_or(|held| self.version > held)
     }
+}
+
+/// Derive the human-shareable link key for an account from its primary identity key.
+///
+/// The link key is what a user reads out (or scans) to bind a new device to an existing
+/// account. It is a pure, deterministic function of the account's serialized public
+/// identity key: `"link:"` followed by the lowercase hex SHA-256 digest of the 33-byte
+/// key. Deriving it rather than storing it means the key can be recomputed from the
+/// identity key alone, and the `link:` prefix keeps it visually distinct from a raw
+/// fingerprint.
+///
+/// # Errors
+///
+/// Returns [`DeviceListError::BadIdentityKeyLength`] unless `identity_key` is exactly
+/// [`IDENTITY_KEY_LEN`] bytes — a serialized libsignal `IdentityKey` (one `0x05` type
+/// byte plus 32 key bytes). A shorter or longer slice is not an identity key, so it is
+/// rejected rather than hashed.
+pub fn derive_link_key(identity_key: &[u8]) -> Result<String, DeviceListError> {
+    if identity_key.len() != IDENTITY_KEY_LEN {
+        return Err(DeviceListError::BadIdentityKeyLength);
+    }
+    let digest = Sha256::digest(identity_key);
+    let mut out = String::with_capacity("link:".len() + digest.len() * 2);
+    out.push_str("link:");
+    for byte in digest {
+        // `write!` into a `String` cannot fail; the lowercase hex is fixed-width.
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
 }
 
 /// A bounds-checked cursor over an untrusted byte slice.
@@ -897,5 +928,39 @@ mod device_list_signing_tests {
         let primary: IdentityKeyPair = generate_identity_key_pair();
         let list = SignedDeviceList::sign(&primary, 1, entries()).expect("signing must succeed");
         assert_eq!(list.verify(&account(&primary)), Ok(()));
+    }
+
+    /// The link key is a pure function of the 33-byte serialized identity key: the same
+    /// input always yields the same `link:`-prefixed lowercase-hex SHA-256 digest. The
+    /// expected value below is the recorded vector the TypeScript test asserts against,
+    /// so a change to the derivation (hash, prefix, or hex case) breaks both sides.
+    #[test]
+    fn derive_link_key_matches_the_recorded_vector() {
+        // SHA-256 of 33 bytes of 0x01, lowercase hex, prefixed with "link:".
+        const EXPECTED: &str =
+            "link:ce041765675ad4d93378e20bd3a7d0d97ddcf3385fb6341581b21d4bc9e3e69e";
+        let key = [0x01u8; 33];
+        assert_eq!(derive_link_key(&key), Ok(EXPECTED.to_string()));
+        // Deterministic: a second call returns the identical string.
+        assert_eq!(derive_link_key(&key), derive_link_key(&key));
+    }
+
+    /// A 32-byte identity key is not a serialized libsignal `IdentityKey` (which is one
+    /// type byte plus 32 key bytes), so it must be rejected rather than hashed.
+    #[test]
+    fn derive_link_key_rejects_a_32_byte_identity_key() {
+        assert_eq!(
+            derive_link_key(&[0x01u8; 32]),
+            Err(DeviceListError::BadIdentityKeyLength)
+        );
+    }
+
+    /// The empty input is likewise not a serialized identity key.
+    #[test]
+    fn derive_link_key_rejects_empty_input() {
+        assert_eq!(
+            derive_link_key(&[]),
+            Err(DeviceListError::BadIdentityKeyLength)
+        );
     }
 }
