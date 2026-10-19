@@ -192,6 +192,40 @@ impl RelayStore {
         }
     }
 
+    /// Read the envelope for a recipient without consuming it.
+    ///
+    /// Same expiry semantics as [`RelayStore::pickup`]: an absent row is
+    /// [`StoreError::NotFound`], and a row whose expiry is at or before now is
+    /// [`StoreError::Expired`]. Unlike `pickup`, a live row is left in place, so a
+    /// caller can inspect an envelope and still pick it up afterwards. An expired row
+    /// is discarded, so the next call reports `NotFound` instead of `Expired` again.
+    pub fn peek(&self, recipient_id: &str) -> Result<Vec<u8>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(Vec<u8>, i64, i64)> = conn
+            .query_row(
+                "SELECT value, expiry_secs, expiry_nanos FROM prekeys WHERE recipient_id = ?1",
+                params![recipient_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(io_err)?;
+        let Some((value, secs, nanos)) = row else {
+            return Err(StoreError::NotFound);
+        };
+        match expiry_from_parts(secs, nanos) {
+            // An unrepresentable expiry is treated as expired: never served.
+            Some(expiry) if expiry > SystemTime::now() => Ok(value),
+            _ => {
+                conn.execute(
+                    "DELETE FROM prekeys WHERE recipient_id = ?1",
+                    params![recipient_id],
+                )
+                .map_err(io_err)?;
+                Err(StoreError::Expired)
+            }
+        }
+    }
+
     /// Purge the stored envelope for a recipient regardless of TTL.
     pub fn purge(&self, recipient_id: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -220,7 +254,10 @@ impl RelayStore {
 
     /// Introspect whether a public method is exposed.
     pub fn has_method(name: &str) -> bool {
-        matches!(name, "store" | "pickup" | "purge" | "count" | "open")
+        matches!(
+            name,
+            "store" | "pickup" | "peek" | "purge" | "count" | "open"
+        )
     }
 }
 
@@ -480,6 +517,126 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::Io(_))),
             "an unwritable store must surface the failure, got: {result:?}"
+        );
+    }
+
+    /// Insert a `prekeys` row with an exact expiry instant. `store` can only express
+    /// "now + ttl", which cannot deterministically produce an already-expired row, so
+    /// the expiry is injected at the datastore boundary — the same place `break_table`
+    /// injects its fault.
+    fn insert_prekey(store: &RelayStore, recipient_id: &str, value: &[u8], expiry_secs: i64) {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO prekeys (recipient_id, value, expiry_secs, expiry_nanos)
+                 VALUES (?1, ?2, ?3, 0)",
+                params![recipient_id, value.to_vec(), expiry_secs],
+            )
+            .unwrap();
+    }
+
+    /// `peek` must be non-destructive: reading the same key twice yields identical
+    /// bytes and leaves the row in place for the `pickup` that follows. Delegating to
+    /// `pickup` would return the right bytes once and then report `NotFound`.
+    #[test]
+    fn relay_store_peek_is_non_destructive() {
+        let store = RelayStore::new();
+        store
+            .store("bob", b"hi".to_vec(), Duration::from_secs(60))
+            .unwrap();
+
+        assert_eq!(
+            store.peek("bob"),
+            Ok(b"hi".to_vec()),
+            "the first peek must return the stored bytes"
+        );
+        assert_eq!(
+            store.peek("bob"),
+            Ok(b"hi".to_vec()),
+            "a second peek must return identical bytes: peek must not consume the row"
+        );
+        assert_eq!(
+            store.pickup("bob"),
+            Ok(b"hi".to_vec()),
+            "the row must still be there for pickup after peeking"
+        );
+        assert_eq!(
+            store.pickup("bob"),
+            Err(StoreError::NotFound),
+            "pickup must still consume the row"
+        );
+
+        assert_eq!(
+            store.peek("nobody"),
+            Err(StoreError::NotFound),
+            "peek on an unknown key must report NotFound"
+        );
+    }
+
+    /// An expired row is reported as `Expired` exactly once. `peek` may discard it,
+    /// but it must not report `NotFound` on the first call, and must not report
+    /// `Expired` forever by leaving the dead row in place.
+    #[test]
+    fn relay_store_peek_reports_expired_once_and_discards_the_row() {
+        let store = RelayStore::new();
+        insert_prekey(&store, "bob", b"hi", 1_699_999_999);
+
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::Expired),
+            "an expired row must report Expired, not NotFound"
+        );
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::NotFound),
+            "the expired row must be gone after the first peek"
+        );
+        assert_eq!(
+            store.pickup("bob"),
+            Err(StoreError::NotFound),
+            "pickup must not resurrect the discarded row"
+        );
+    }
+
+    /// `peek` is public, so the introspection helper must report it. The repo
+    /// already holds this rule for `open` (relay/tests/store_persistence.rs), and a
+    /// caller that probes `has_method` before dispatching would otherwise be told
+    /// the method does not exist.
+    #[test]
+    fn relay_store_has_method_reports_peek() {
+        assert!(
+            RelayStore::has_method("peek"),
+            "RelayStore::peek is public, so has_method must report it"
+        );
+        assert!(
+            !RelayStore::has_method("peekk"),
+            "has_method must not report methods that do not exist"
+        );
+    }
+
+    /// `peek` must match `pickup` at the boundary: `pickup` treats an expiry equal to
+    /// now as expired (strict `>`), so `peek` must too. A row stamped with the current
+    /// second and zero nanos is at or before now, hence never live.
+    #[test]
+    fn relay_store_peek_treats_expiry_at_now_as_expired() {
+        let store = RelayStore::new();
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_prekey(&store, "bob", b"hi", now_secs);
+
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::Expired),
+            "an expiry at or before now must not be served, matching pickup"
+        );
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::NotFound),
+            "the boundary-expired row must be discarded by the first peek"
         );
     }
 }
