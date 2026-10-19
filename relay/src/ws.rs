@@ -1448,6 +1448,65 @@ impl WsRelayClient {
         }
     }
 
+    /// Publish an opaque discovery blob for the given recipient.
+    ///
+    /// The relay never parses the blob — it is end-to-end-encrypted bytes. The
+    /// server caps it at `discovery::MAX_DISCOVERY_BLOB_BYTES` and rejects an
+    /// oversize publish with `DiscoveryTooLarge` *before* touching the stored
+    /// blob, so a failed oversize publish leaves the previous blob intact.
+    pub async fn publish_discovery(
+        &mut self,
+        recipient_id: &str,
+        blob: &[u8],
+    ) -> Result<(), WsClientError> {
+        let (challenge_id, pow_solution) = self.solve_challenge(recipient_id).await?;
+        let req = serde_json::json!({
+            "op": "publish_discovery",
+            "recipient_id": recipient_id,
+            "discovery": b64_encode(blob),
+            "challenge_id": challenge_id,
+            "pow_solution": pow_solution,
+        });
+        let resp = self.round_trip(req).await?;
+        if resp["ok"] == true {
+            Ok(())
+        } else {
+            Err(WsClientError::Relay(
+                resp["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Look up the opaque discovery blob for the given recipient.
+    ///
+    /// Mirrors [`Self::lookup_prekey`]: the relay reuses the `bundle` response
+    /// field for the opaque blob. Only `NotFound`/`Expired` map to
+    /// [`WsClientError::NotFound`]; transport, server and decode failures keep
+    /// their original error.
+    pub async fn lookup_discovery(&mut self, recipient_id: &str) -> Result<Vec<u8>, WsClientError> {
+        let req = serde_json::json!({
+            "op": "lookup_discovery",
+            "recipient_id": recipient_id,
+        });
+        let resp = self.round_trip(req).await?;
+        if resp["ok"] == true {
+            let bundle_b64 = resp["bundle"]
+                .as_str()
+                .ok_or_else(|| WsClientError::Relay("missing bundle field".into()))?;
+            b64_decode(bundle_b64).map_err(WsClientError::Decode)
+        } else {
+            let err = resp["error"].as_str().unwrap_or("unknown error");
+            if err == "NotFound" || err == "Expired" {
+                Err(WsClientError::NotFound)
+            } else {
+                Err(WsClientError::Relay(err.to_string()))
+            }
+        }
+    }
+
     /// Send a Sealed Sender envelope to the given recipient.
     pub async fn send_envelope(
         &mut self,
@@ -1535,6 +1594,70 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MD-7: the discovery helpers round-trip an opaque blob through a live
+    /// in-process relay, and a failed oversize publish must not corrupt the
+    /// stored blob or the client's challenge/session state for the next lookup.
+    #[tokio::test]
+    async fn discovery_publish_lookup_round_trip_and_oversize_failure() {
+        let handle = start_ws_listener_for_test(60).await;
+        let mut client = WsRelayClient::connect(handle.addr)
+            .await
+            .expect("connect to the in-process relay");
+
+        // Deterministic 1024-byte blob: 1024 bytes -> 1368 base64 chars.
+        let blob: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        assert_eq!(blob.len(), 1024);
+
+        client
+            .publish_discovery("peer-1", &blob)
+            .await
+            .expect("publish_discovery must succeed for a 1024-byte blob");
+
+        let first = client
+            .lookup_discovery("peer-1")
+            .await
+            .expect("first lookup_discovery must succeed");
+        assert_eq!(
+            first, blob,
+            "the first lookup must return the exact 1024 bytes"
+        );
+
+        let second = client
+            .lookup_discovery("peer-1")
+            .await
+            .expect("second lookup_discovery must succeed");
+        assert_eq!(
+            second, blob,
+            "the second lookup must return the exact 1024 bytes"
+        );
+
+        // Unknown handle -> NotFound.
+        let missing = client.lookup_discovery("peer-missing").await;
+        assert!(
+            matches!(&missing, Err(WsClientError::NotFound)),
+            "an unknown handle must map to WsClientError::NotFound, got: {missing:?}"
+        );
+
+        // Oversize publish (65537 > 65536 cap) must fail, without assuming a variant.
+        let oversize = vec![0xA5u8; 65_537];
+        let oversize_result = client.publish_discovery("peer-1", &oversize).await;
+        assert!(
+            oversize_result.is_err(),
+            "a 65537-byte publish must be rejected, got: {oversize_result:?}"
+        );
+
+        // The failed publish must not have corrupted the stored blob or the
+        // client's session state: the next lookup still returns the original bytes.
+        let after_failure = client
+            .lookup_discovery("peer-1")
+            .await
+            .expect("lookup after a failed oversize publish must still succeed");
+        assert_eq!(
+            after_failure, blob,
+            "the failed oversize publish must not corrupt the stored blob"
+        );
+    }
 
     #[test]
     fn b64_round_trip() {
