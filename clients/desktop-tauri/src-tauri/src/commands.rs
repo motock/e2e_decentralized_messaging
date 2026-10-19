@@ -31,8 +31,8 @@
 use crate::conversation::ConversationStore;
 use crate::error::ShellError;
 use crate::identity_store::{
-    identity_error_message, load_or_create_identity_at, load_or_create_identity_keypair_at,
-    load_or_create_store_key_at, next_correlation_id,
+    identity_error_message, load_or_create_identity_at, load_or_create_store_key_at,
+    next_correlation_id,
 };
 use crate::relay_client::{EnvelopeKind, RelayClient, RelayError};
 use crate::ui::{render_conversation, Direction};
@@ -247,7 +247,7 @@ async fn send_message_inner(
     let mut delivered = false;
     if let Some(url) = relay_url() {
         let store = open_store(&dir, &key)?;
-        let identity = load_or_create_identity_keypair_at(&dir)?;
+        let identity = load_identity_keypair(&dir)?;
         if let Some(mut session) = load_session(&store, &identity, &peer).await? {
             let envelope = session
                 .encrypt(body.as_bytes())
@@ -292,7 +292,7 @@ async fn receive_and_decrypt_inner(
     };
 
     let store = open_store(&dir, &key)?;
-    let identity = load_or_create_identity_keypair_at(&dir)?;
+    let identity = load_identity_keypair(&dir)?;
     let mut session = load_session(&store, &identity, &peer).await?;
     let mut client = RelayClient::connect(&url).await?;
 
@@ -381,6 +381,20 @@ fn open_store(dir: &Path, key: &[u8; 32]) -> Result<EncryptedStore, CommandError
     EncryptedStore::open(dir, key).map_err(|err| {
         let correlation_id = next_correlation_id();
         eprintln!("shell: correlation {correlation_id}: cannot open encrypted store: {err}");
+        CommandError::Session(identity_error_message(correlation_id))
+    })
+}
+
+/// Load the identity keypair persisted by the DT-1 identity command.
+///
+/// The conversation and verification paths need the keypair to restore a ratchet session. It is
+/// read back from the same encrypted store `generate_identity` writes, so there is exactly one
+/// identity per install; `load_or_create_identity_at` mints one on a genuine first run.
+fn load_identity_keypair(dir: &Path) -> Result<core_crypto::identity::IdentityKeyPair, CommandError> {
+    let serialized = load_or_create_identity_at(dir)?;
+    core_crypto::identity::IdentityKeyPair::from_bytes(&serialized).map_err(|err| {
+        let correlation_id = next_correlation_id();
+        eprintln!("shell: correlation {correlation_id}: stored identity is unusable: {err}");
         CommandError::Session(identity_error_message(correlation_id))
     })
 }
