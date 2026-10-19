@@ -331,9 +331,6 @@ fn audit_identity_event(event: &str, correlation_id: u64, detail: &str) {
     eprintln!("audit: {event} correlation={correlation_id} {detail}");
 }
 
-/// Monotonic per-process id correlating the generic message returned over IPC with the detailed
-/// local log line that explains it (CLAUDE.md: generic error to the caller, full detail logged
-/// locally).
 /// Load (or mint) the encrypted-store key for `dir`.
 ///
 /// Shared by the conversation and verification stores so every piece of shell
@@ -347,6 +344,9 @@ pub(crate) fn load_or_create_store_key_at(dir: &Path) -> Result<[u8; STORE_KEY_L
     load_or_create_store_key(dir, correlation_id)
 }
 
+/// Monotonic per-process id correlating the generic message returned over IPC with the detailed
+/// local log line that explains it (CLAUDE.md: generic error to the caller, full detail logged
+/// locally).
 pub(crate) fn next_correlation_id() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
