@@ -79,13 +79,48 @@ impl From<core_crypto::session::SessionError> for CommandError {
 
 impl From<crate::conversation::ConversationError> for CommandError {
     fn from(err: crate::conversation::ConversationError) -> Self {
-        CommandError::Conversation(err.to_string())
+        map_conversation_error(err)
     }
 }
 
 impl From<crate::verify::VerificationError> for CommandError {
     fn from(err: crate::verify::VerificationError) -> Self {
-        CommandError::Verification(err.to_string())
+        map_verification_error(err)
+    }
+}
+
+/// Map a conversation error onto the IPC error, keeping store detail local.
+///
+/// A `Store` failure carries the underlying SQLite text, which can include
+/// internal statements and paths. That detail is logged here with a
+/// correlation id; the webview gets a generic message, matching the identity
+/// commands' error contract.
+fn map_conversation_error(err: crate::conversation::ConversationError) -> CommandError {
+    use crate::conversation::ConversationError;
+    match err {
+        ConversationError::Store(detail) => {
+            let correlation_id = next_correlation_id();
+            eprintln!("shell: correlation {correlation_id}: conversation store error: {detail}");
+            CommandError::Conversation(format!(
+                "conversation store unavailable (reference {correlation_id})"
+            ))
+        }
+        other => CommandError::Conversation(other.to_string()),
+    }
+}
+
+/// [`map_conversation_error`] for the verification store.
+fn map_verification_error(err: crate::verify::VerificationError) -> CommandError {
+    use crate::verify::VerificationError;
+    match err {
+        VerificationError::Store(detail) => {
+            let correlation_id = next_correlation_id();
+            eprintln!("shell: correlation {correlation_id}: verification store error: {detail}");
+            CommandError::Verification(format!(
+                "verification store unavailable (reference {correlation_id})"
+            ))
+        }
+        other => CommandError::Verification(other.to_string()),
     }
 }
 
@@ -97,9 +132,6 @@ impl From<crate::relay_client::RelayError> for CommandError {
 
 /// Prefix for a persisted ratchet session inside the encrypted store.
 const SESSION_KEY_PREFIX: &str = "session:";
-
-/// Environment variable naming the relay the shell talks to (operator config, not webview input).
-const RELAY_URL_ENV: &str = "DESKTOP_RELAY_URL";
 
 /// Generate a fresh identity keypair and return its public key bytes.
 #[tauri::command]
@@ -245,7 +277,7 @@ async fn send_message_inner(
     conversation.record_sent(&peer, body.as_bytes(), now_ts())?;
 
     let mut delivered = false;
-    if let Some(url) = relay_url() {
+    if let Some(config) = relay_config(&app) {
         let store = open_store(&dir, &key)?;
         let identity = load_identity_keypair(&dir)?;
         if let Some(mut session) = load_session(&store, &identity, &peer).await? {
@@ -255,7 +287,7 @@ async fn send_message_inner(
                 .map_err(|err| CommandError::Session(err.to_string()))?;
             save_session(&store, &peer, &session).await?;
 
-            let mut client = RelayClient::connect(&url).await?;
+            let mut client = RelayClient::connect_config(&config).await?;
             client
                 .send_envelope(&peer, &envelope, Some(EnvelopeKind::Direct))
                 .await?;
@@ -287,14 +319,14 @@ async fn receive_and_decrypt_inner(
     let key = load_or_create_store_key_at(&dir)?;
     let conversation = ConversationStore::open(&dir, &key)?;
 
-    let Some(url) = relay_url() else {
+    let Some(config) = relay_config(&app) else {
         return view(&conversation, &peer, false);
     };
 
     let store = open_store(&dir, &key)?;
     let identity = load_identity_keypair(&dir)?;
     let mut session = load_session(&store, &identity, &peer).await?;
-    let mut client = RelayClient::connect(&url).await?;
+    let mut client = RelayClient::connect_config(&config).await?;
 
     loop {
         match client
@@ -401,11 +433,13 @@ fn load_identity_keypair(
     })
 }
 
-fn relay_url() -> Option<String> {
-    std::env::var(RELAY_URL_ENV)
-        .ok()
-        .map(|url| url.trim().to_string())
-        .filter(|url| !url.is_empty())
+/// The relay address resolved once at startup (DT-3), or `None` when the user
+/// configured none. Read from managed state rather than the environment so the
+/// documented CLI > env > config-file precedence and the `ws://` policy apply
+/// to every command identically.
+fn relay_config(app: &tauri::AppHandle) -> Option<crate::relay_config::RelayConfig> {
+    app.try_state::<crate::relay_config::RelayConfigState>()
+        .and_then(|state| state.config().cloned())
 }
 
 fn now_ts() -> i64 {
@@ -541,5 +575,42 @@ mod tests {
             get_conversation_state;
         const _VERIFY: fn(tauri::AppHandle, String) -> Result<VerificationState, CommandError> =
             get_verification_state;
+    }
+
+    #[test]
+    fn conversation_store_errors_do_not_leak_internal_detail_to_the_webview() {
+        let error = map_conversation_error(crate::conversation::ConversationError::Store(
+            "/home/user/.local/share/e2e/store.db: no such table".to_string(),
+        ));
+        let message = match error {
+            CommandError::Conversation(message) => message,
+            other => panic!("expected a conversation error, got: {other:?}"),
+        };
+        assert!(!message.contains("store.db"), "leaked path: {message}");
+        assert!(
+            !message.contains("no such table"),
+            "leaked detail: {message}"
+        );
+        assert!(
+            message.contains("reference"),
+            "missing correlation id: {message}"
+        );
+    }
+
+    #[test]
+    fn verification_store_errors_do_not_leak_internal_detail_to_the_webview() {
+        let error = map_verification_error(crate::verify::VerificationError::Store(
+            "/home/user/.local/share/e2e/store.db: disk I/O error".to_string(),
+        ));
+        let message = match error {
+            CommandError::Verification(message) => message,
+            other => panic!("expected a verification error, got: {other:?}"),
+        };
+        assert!(!message.contains("store.db"), "leaked path: {message}");
+        assert!(!message.contains("disk I/O"), "leaked detail: {message}");
+        assert!(
+            message.contains("reference"),
+            "missing correlation id: {message}"
+        );
     }
 }
