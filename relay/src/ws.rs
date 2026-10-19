@@ -92,6 +92,11 @@ use crate::store::{
     Mailbox, MailboxError, RelayStore, StoreError, DEFAULT_MAX_ENVELOPES_PER_RECIPIENT,
 };
 
+// Discovery blobs live in their own file (`relay/src/discovery.rs`) rather than
+// under a `ws/` directory, so the module path is pinned explicitly.
+#[path = "discovery.rs"]
+mod discovery;
+
 /// Default TTL for stored prekey bundles (24h).
 const DEFAULT_PREKEY_TTL: Duration = Duration::from_secs(86400);
 /// Default TTL for stored Sealed Sender envelopes (7 days).
@@ -305,6 +310,15 @@ pub enum WsRequest {
     },
     #[serde(rename = "lookup_prekey")]
     LookupPrekey { recipient_id: String },
+    #[serde(rename = "publish_discovery")]
+    PublishDiscovery {
+        recipient_id: String,
+        discovery: String,    // base64, opaque end-to-end-encrypted blob
+        challenge_id: String, // hex of challenge nonce
+        pow_solution: String, // base64 of solution bytes
+    },
+    #[serde(rename = "lookup_discovery")]
+    LookupDiscovery { recipient_id: String },
     #[serde(rename = "send_envelope")]
     SendEnvelope {
         recipient_id: String,
@@ -656,6 +670,55 @@ pub async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse 
             WsResponse::ok_simple()
         }
 
+        WsRequest::PublishDiscovery {
+            recipient_id,
+            discovery,
+            challenge_id,
+            pow_solution,
+        } => {
+            // 1. Rate limit
+            {
+                let mut rl = state.rate_limiter.lock().await;
+                if let Err(RateLimitError::Exceeded { .. }) = rl.check(recipient_id.as_bytes(), now)
+                {
+                    warn!(
+                        recipient = %truncate_id(&recipient_id),
+                        "ws: rate limit exceeded on publish_discovery"
+                    );
+                    return WsResponse::err("RateLimitExceeded");
+                }
+            }
+            // 2. PoW verification
+            if let Err(e) = verify_pow(&challenge_id, &pow_solution, state).await {
+                warn!(
+                    recipient = %truncate_id(&recipient_id),
+                    "ws: pow failed on publish_discovery: {e}"
+                );
+                return WsResponse::err(format!("PowFailed: {e}"));
+            }
+            // 3. Decode the blob. The relay never parses or verifies its contents —
+            // it is opaque end-to-end-encrypted bytes.
+            let discovery_bytes = match b64_decode(&discovery) {
+                Ok(b) => b,
+                Err(e) => return WsResponse::err(format!("InvalidBase64: {e}")),
+            };
+            // 4. Size cap, checked BEFORE any store call so an oversize publish
+            // cannot evict or truncate the blob already published under this handle.
+            if discovery_bytes.len() > discovery::MAX_DISCOVERY_BLOB_BYTES {
+                warn!(
+                    recipient = %truncate_id(&recipient_id),
+                    "ws: discovery blob too large on publish_discovery"
+                );
+                return WsResponse::err("DiscoveryTooLarge");
+            }
+            // 5. Store (last write wins).
+            if let Err(e) = discovery::store_blob(&state.prekeys, &recipient_id, discovery_bytes) {
+                return prekey_store_error_response(e);
+            }
+            info!(recipient = %truncate_id(&recipient_id), "ws: discovery published");
+            WsResponse::ok_simple()
+        }
+
         WsRequest::LookupPrekey { recipient_id } => {
             // Lookup is a read — rate-limited but no PoW required (reading a public
             // prekey bundle is not a resource-intensive operation).
@@ -678,6 +741,31 @@ pub async fn handle_request(req: WsRequest, state: &Arc<WsState>) -> WsResponse 
                 Err(StoreError::Io(msg)) => {
                     warn!("ws: prekey store io error: {msg}");
                     WsResponse::err("StoreError: io failure reading the prekey store")
+                }
+            }
+        }
+
+        WsRequest::LookupDiscovery { recipient_id } => {
+            // Lookup is a read — rate-limited but no PoW required (reading an
+            // opaque discovery blob is not a resource-intensive operation).
+            {
+                let mut rl = state.rate_limiter.lock().await;
+                if let Err(RateLimitError::Exceeded { .. }) = rl.check(recipient_id.as_bytes(), now)
+                {
+                    warn!(
+                        recipient = %truncate_id(&recipient_id),
+                        "ws: rate limit exceeded on lookup_discovery"
+                    );
+                    return WsResponse::err("RateLimitExceeded");
+                }
+            }
+            match discovery::load_blob(&state.prekeys, &recipient_id) {
+                Ok(blob_bytes) => WsResponse::ok_bundle(b64_encode(&blob_bytes)),
+                Err(StoreError::NotFound) => WsResponse::err("NotFound"),
+                Err(StoreError::Expired) => WsResponse::err("Expired"),
+                Err(StoreError::Io(msg)) => {
+                    warn!("ws: discovery store io error: {msg}");
+                    WsResponse::err("StoreError: io failure reading the discovery store")
                 }
             }
         }
