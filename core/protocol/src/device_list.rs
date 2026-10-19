@@ -140,6 +140,15 @@ pub enum DeviceListError {
     /// canonical encoding of the record it claims to be.
     #[error("trailing bytes after signed device list")]
     TrailingBytes,
+    /// The list's account binding was not the expected account primary's identity key.
+    /// Checked before the signature so an attacker-signed list is attributed to the
+    /// wrong account rather than accepted on the strength of its own key.
+    #[error("device list is not bound to the expected account")]
+    WrongAccount,
+    /// The primary signature did not verify over the canonical bytes. The list was
+    /// tampered with, or was not signed by the account it names.
+    #[error("device list signature is invalid")]
+    BadSignature,
 }
 
 impl SignedDeviceList {
@@ -279,6 +288,115 @@ impl SignedDeviceList {
         }
 
         Ok(())
+    }
+}
+
+impl SignedDeviceList {
+    /// Sign a device list at `version` with the account primary's identity key.
+    ///
+    /// The account binding is set to `primary`'s *public* identity key — the 33-byte
+    /// serialized form (one `0x05` type byte plus 32 key bytes), never the 32-byte
+    /// private key — so a verifier can attribute the list to its account from the
+    /// record alone.
+    ///
+    /// `version` and `entries` are stored exactly as supplied and the signature is
+    /// computed over [`canonical_bytes`](Self::canonical_bytes) of those stored values.
+    /// Nothing is sorted, deduplicated or reordered: `verify` recomputes the canonical
+    /// bytes over the stored order, so canonicalizing over a different copy would make
+    /// a freshly signed list fail its own signature check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeviceListError::BadSignature`] if the underlying `libsignal` signing
+    /// call fails (unreachable in practice for this workspace's Curve25519 keys, but
+    /// propagated rather than panicking).
+    pub fn sign(
+        primary: &libsignal_protocol::IdentityKeyPair,
+        version: u64,
+        entries: Vec<DeviceListEntry>,
+    ) -> Result<Self, DeviceListError> {
+        // `TryRngCore::unwrap_err` turns the fallible `OsRng` into an infallible one;
+        // the same primitive `fanout::SignedRevocation::sign` uses.
+        use rand::TryRngCore;
+
+        let list = Self {
+            account: primary.public_key().serialize().into_vec(),
+            version,
+            entries,
+            // Filled in below, once the canonical bytes exist.
+            primary_signature: Vec::new(),
+        };
+        let canonical = list.canonical_bytes();
+        let signature = primary
+            .private_key()
+            .calculate_signature_for_multipart_message(
+                &[&canonical],
+                &mut rand::rngs::OsRng.unwrap_err(),
+            )
+            .map_err(|_| DeviceListError::BadSignature)?;
+        Ok(Self {
+            primary_signature: signature.into_vec(),
+            ..list
+        })
+    }
+
+    /// Verify this list against the account primary's public identity key.
+    ///
+    /// Checks run in this order, and the order is load-bearing:
+    ///
+    /// 1. **Account binding.** `self.account` must be byte-identical to
+    ///    `expected_account.serialize()`. This is the cheapest decisive check and it
+    ///    subsumes the 33-byte account-length invariant, so a hand-built record with
+    ///    garbage account bytes is [`DeviceListError::WrongAccount`] rather than a
+    ///    length error — and, because the comparison is over bytes, it never decodes
+    ///    attacker-supplied key material and so never panics.
+    /// 2. **Structural validity.** The MD-1 invariants are re-run over `self.entries`,
+    ///    so a hand-built struct cannot bypass them by skipping `from_bytes`.
+    /// 3. **Signature.** Verified over [`canonical_bytes`](Self::canonical_bytes) using
+    ///    `expected_account` — after step 1 it is byte-identical to `self.account`, so
+    ///    the verifying key is always the caller's, never one the record names.
+    ///
+    /// Checking the signature before the account binding would accept an
+    /// attacker-signed list on the strength of the attacker's own key; checking it
+    /// before the structural pass would report [`DeviceListError::BadSignature`] for a
+    /// list whose real defect is a duplicate device id.
+    ///
+    /// # Errors
+    ///
+    /// - [`DeviceListError::WrongAccount`] if the list is bound to another account.
+    /// - Any structural error [`SignedDeviceList::from_bytes`] can return (e.g.
+    ///   [`DeviceListError::DuplicateDeviceId`]) if the entries are invalid.
+    /// - [`DeviceListError::BadSignature`] if the signature does not verify.
+    pub fn verify(
+        &self,
+        expected_account: &libsignal_protocol::IdentityKey,
+    ) -> Result<(), DeviceListError> {
+        if self.account != expected_account.serialize().into_vec() {
+            return Err(DeviceListError::WrongAccount);
+        }
+        self.validate()?;
+        let canonical = self.canonical_bytes();
+        // Fails closed: a wrong-length signature is `false`, not an exception.
+        if expected_account
+            .public_key()
+            .verify_signature(&canonical, &self.primary_signature)
+        {
+            Ok(())
+        } else {
+            Err(DeviceListError::BadSignature)
+        }
+    }
+
+    /// Whether this list supersedes the version the caller already holds.
+    ///
+    /// `true` iff nothing is held yet, or this list's version is *strictly* greater.
+    /// Strictly greater matters: a replayed same-version list must not be accepted.
+    ///
+    /// Side-effect free — the held version is caller state, so this takes `&self` and
+    /// mutates nothing. A caller that stored `self.version` even when this returned
+    /// `false` would regress its high-water mark and then accept a replay.
+    pub fn is_newer_than(&self, held_version: Option<u64>) -> bool {
+        held_version.is_none_or(|held| self.version > held)
     }
 }
 
@@ -515,5 +633,269 @@ mod tests {
             SignedDeviceList::from_bytes(&bytes),
             Err(DeviceListError::TooManyEntries)
         );
+    }
+}
+
+/// Signing, verification and version-check coverage for [`SignedDeviceList`]
+/// (spec/v0.md §8.3).
+///
+/// Kept in its own module so the MD-1 wire-format tests above stay untouched: this
+/// module covers the *trust* half of the contract — who signed a list, whether a
+/// hand-built struct can bypass structural validation, and whether a replayed version
+/// is rejected.
+#[cfg(test)]
+mod device_list_signing_tests {
+    use super::*;
+    use crypto::generate_identity_key_pair;
+    use libsignal_protocol::{IdentityKey, IdentityKeyPair};
+
+    /// The account binding a verifier expects: the keypair's public identity key.
+    /// Mirrors `crypto::IdentityKeyPairExt::public_identity`.
+    fn account(pair: &IdentityKeyPair) -> IdentityKey {
+        *pair.identity_key()
+    }
+
+    /// A 33-byte serialized libsignal identity key (0x05 type byte + 32 key bytes).
+    fn key(seed: u8) -> Vec<u8> {
+        let mut k = vec![0x05u8];
+        k.extend_from_slice(&[seed; 32]);
+        k
+    }
+
+    fn entry(device_id: u32, seed: u8) -> DeviceListEntry {
+        DeviceListEntry {
+            device_id,
+            identity_key: key(seed),
+            prekey_bundle: vec![seed; 4],
+        }
+    }
+
+    /// A structurally valid two-device list (primary + one linked device).
+    fn entries() -> Vec<DeviceListEntry> {
+        vec![entry(0, 0x01), entry(1, 0x02)]
+    }
+
+    #[test]
+    fn sign_then_verify_with_matching_account_succeeds() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+
+        // The account binding is the *public* key (33 bytes, leading 0x05), never the
+        // 32-byte private key.
+        assert_eq!(list.account, primary.public_key().serialize().into_vec());
+        assert_eq!(list.account.len(), 33);
+        assert_eq!(list.version, 4);
+        assert_eq!(list.entries, entries());
+        assert!(!list.primary_signature.is_empty());
+
+        assert_eq!(list.verify(&account(&primary)), Ok(()));
+    }
+
+    #[test]
+    fn is_newer_than_none_and_older_versions_true() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+
+        assert!(
+            list.is_newer_than(None),
+            "no held version means any list is newer"
+        );
+        assert!(list.is_newer_than(Some(3)), "version 4 is newer than 3");
+        assert!(list.is_newer_than(Some(1)), "version 4 is newer than 1");
+    }
+
+    #[test]
+    fn is_newer_than_same_and_newer_versions_false() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+
+        // Strictly greater: a replayed same-version list must be rejected.
+        assert!(
+            !list.is_newer_than(Some(4)),
+            "version 4 is not newer than 4"
+        );
+        assert!(
+            !list.is_newer_than(Some(5)),
+            "version 4 is not newer than 5"
+        );
+        assert!(
+            !list.is_newer_than(Some(9)),
+            "version 4 is not newer than 9"
+        );
+    }
+
+    #[test]
+    fn tampered_bundle_byte_fails_signature() {
+        let primary = generate_identity_key_pair();
+        // A distinctive payload so the flipped byte is provably inside an entry's
+        // opaque bundle, not a length prefix or an id field.
+        let bundle = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x11, 0x22, 0x33, 0x44];
+        let list = SignedDeviceList::sign(
+            &primary,
+            4,
+            vec![
+                entry(0, 0x01),
+                DeviceListEntry {
+                    device_id: 1,
+                    identity_key: key(0x02),
+                    prekey_bundle: bundle.clone(),
+                },
+            ],
+        )
+        .expect("signing must succeed");
+
+        let mut bytes = list.to_bytes();
+        let pos = bytes
+            .windows(bundle.len())
+            .position(|w| w == bundle.as_slice())
+            .expect("the bundle payload must appear verbatim in the blob");
+        bytes[pos + 3] ^= 0xFF;
+
+        let tampered =
+            SignedDeviceList::from_bytes(&bytes).expect("a flipped payload byte still parses");
+        assert_ne!(
+            tampered.entries[1].prekey_bundle, bundle,
+            "the tamper must land inside the bundle payload"
+        );
+        assert_eq!(
+            tampered.verify(&account(&primary)),
+            Err(DeviceListError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn verify_with_a_different_account_is_wrong_account() {
+        let primary = generate_identity_key_pair();
+        let other = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+
+        assert_eq!(
+            list.verify(&account(&other)),
+            Err(DeviceListError::WrongAccount)
+        );
+    }
+
+    #[test]
+    fn list_signed_by_attacker_key_is_wrong_account() {
+        let primary = generate_identity_key_pair();
+        let attacker = generate_identity_key_pair();
+        // The attacker signs a perfectly valid list with its own key.
+        let forged = SignedDeviceList::sign(&attacker, 4, entries()).expect("signing must succeed");
+
+        // Verified against the real primary it must be rejected on the account binding,
+        // not accepted because the signature happens to be valid under the attacker key.
+        assert_eq!(
+            forged.verify(&account(&primary)),
+            Err(DeviceListError::WrongAccount)
+        );
+    }
+
+    #[test]
+    fn hand_built_duplicate_ids_fail_structural_validation() {
+        let primary = generate_identity_key_pair();
+        // Correct account, garbage signature: the structural check must fire first so a
+        // hand-built struct cannot bypass the MD-1 invariants.
+        let list = SignedDeviceList {
+            account: primary.public_key().serialize().into_vec(),
+            version: 4,
+            entries: vec![entry(0, 0x01), entry(7, 0x02), entry(7, 0x03)],
+            primary_signature: vec![0x00; 64],
+        };
+
+        assert_eq!(
+            list.verify(&account(&primary)),
+            Err(DeviceListError::DuplicateDeviceId)
+        );
+    }
+
+    #[test]
+    fn hand_built_garbage_account_is_wrong_account_without_panic() {
+        let primary = generate_identity_key_pair();
+        // Five bytes is not a decodable identity key. A verifier that decoded the
+        // attacker-supplied bytes would panic here; comparing bytes first does not.
+        let list = SignedDeviceList {
+            account: vec![0u8; 5],
+            version: 4,
+            entries: entries(),
+            primary_signature: vec![0x00; 64],
+        };
+
+        assert_eq!(
+            list.verify(&account(&primary)),
+            Err(DeviceListError::WrongAccount)
+        );
+    }
+
+    /// The signature must cover the stored entry order: signing must not canonicalize
+    /// over a sorted/deduplicated copy while storing the unsorted `Vec`.
+    #[test]
+    fn signature_covers_stored_entry_order() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+        assert_eq!(
+            list.entries,
+            entries(),
+            "sign must store the entries unchanged"
+        );
+
+        let mut reordered = list.clone();
+        reordered.entries.reverse();
+        assert_eq!(
+            reordered.verify(&account(&primary)),
+            Err(DeviceListError::BadSignature)
+        );
+    }
+
+    /// `is_newer_than` must not mutate: the caller owns the held version.
+    #[test]
+    fn is_newer_than_does_not_mutate_the_list() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 4, entries()).expect("signing must succeed");
+        let before = list.clone();
+
+        assert!(!list.is_newer_than(Some(5)));
+        assert_eq!(list, before, "is_newer_than must be side-effect free");
+        assert_eq!(list.version, 4);
+    }
+
+    /// `sign` must reject nothing it is given — but a caller-supplied list that is
+    /// structurally invalid must still fail `verify`, never panic.
+    #[test]
+    fn verify_never_panics_on_hostile_input() {
+        let primary = generate_identity_key_pair();
+        let hostile = [
+            SignedDeviceList {
+                account: Vec::new(),
+                version: 0,
+                entries: Vec::new(),
+                primary_signature: Vec::new(),
+            },
+            SignedDeviceList {
+                account: vec![0xFF; 33],
+                version: u64::MAX,
+                entries: vec![entry(0, 0x01)],
+                primary_signature: vec![0xFF; 1],
+            },
+            SignedDeviceList {
+                account: primary.public_key().serialize().into_vec(),
+                version: 1,
+                entries: vec![entry(1, 0x01)],
+                primary_signature: vec![0xFF; 64],
+            },
+        ];
+        for list in &hostile {
+            assert!(
+                list.verify(&account(&primary)).is_err(),
+                "hostile list must be rejected, not accepted"
+            );
+        }
+    }
+
+    /// `IdentityKeyPair` is only used to prove the signature type is the libsignal one.
+    #[test]
+    fn sign_accepts_a_libsignal_identity_key_pair() {
+        let primary: IdentityKeyPair = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 1, entries()).expect("signing must succeed");
+        assert_eq!(list.verify(&account(&primary)), Ok(()));
     }
 }
