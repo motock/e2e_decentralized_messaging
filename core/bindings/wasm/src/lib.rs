@@ -51,6 +51,9 @@ use crypto::session;
 use protocol::fanout::{DeviceId, FanoutError, FanoutSession};
 use protocol::group::{GroupMember, GroupSession};
 
+mod device_list;
+pub use device_list::*;
+
 /// A structured, JS-visible error — the WASM analogue of desktop's `ShellError`. Every core
 /// `Result::Err` that crosses the WASM boundary is mapped to this type so JS code can switch on
 /// `kind` and display `message`, the same contract `clients/desktop-tauri` asserts for
