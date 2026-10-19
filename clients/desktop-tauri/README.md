@@ -2,7 +2,8 @@
 
 ## Prerequisites
 
-* **Rust stable** (1.75+). Install via [rustup](https://rustup.rs/).
+* **Rust stable** — 1.82 or newer (the MSRV of the Tauri 2.x line this
+  workspace pins, currently 2.11). Install via [rustup](https://rustup.rs/).
 * **Tauri CLI** – install once per machine:
   ```sh
   cargo install tauri-cli --version "^2" --locked
@@ -45,6 +46,12 @@ The desktop client reads the relay URL from the following sources (in order of p
 3. **JSON config file** specified with `--relay-config`.
 
 See `src-tauri/src/relay_config.rs` for the exact parsing logic.
+
+Plain `ws://` relays are only accepted on loopback hosts (`localhost`,
+`127.0.0.0/8`, `[::1]`). To point the client at a plain `ws://` relay on a
+non-loopback host — e.g. a relay on another machine on your LAN — pass the
+explicit opt-in flag `--allow-insecure-ws`; without it the URL is rejected
+with a validation error.
 
 ## Running Tests
 

@@ -78,18 +78,14 @@ npm install
 
 No environment variables are required for local development at this stage of the project.
 
-Install the Tauri CLI once (CI does not install it for you):
-
-    cargo install tauri-cli --version "^2" --locked
-
-Then run the desktop client:
-
-    cd clients/desktop-tauri && cargo tauri dev
-
 ### 4. Run the app
 
-- **Desktop**: `cd clients/desktop-tauri && cargo tauri dev` (requires the
-  [Tauri CLI](https://tauri.app/start/prerequisites/))
+- **Desktop**: `cd clients/desktop-tauri && cargo tauri dev`. This needs the
+  [Tauri CLI](https://tauri.app/start/prerequisites/), which is not part of the
+  Rust toolchain — install it once per machine with
+  `cargo install tauri-cli --version "^2" --locked` (the desktop CI job
+  installs its own copy, so this is only needed for local runs). See
+  `clients/desktop-tauri/README.md` for prerequisites and build instructions.
 - **Web / iOS / Android**: not yet implemented — see the per-client `README.md` in each
   `clients/*` directory for status.
 
