@@ -3,8 +3,17 @@
 //! Implements the relay's WS wire protocol as documented in `relay/src/ws.rs`:
 //! request a `challenge` op, solve the proof-of-work (20-bit difficulty,
 //! context bytes `ws-relay-v1`), then issue `publish_prekey`, `lookup_prekey`,
-//! `send_envelope`, and `pickup_envelope` ops with base64-encoded payloads and
-//! the solved `challenge_id` / `pow_solution` fields.
+//! `publish_discovery`, `lookup_discovery`, `send_envelope`, and
+//! `pickup_envelope` ops with base64-encoded payloads and the solved
+//! `challenge_id` / `pow_solution` fields.
+//!
+//! ## Discovery blobs (MD-8)
+//!
+//! `publishDiscovery` / `lookupDiscovery` carry an opaque, end-to-end-encrypted
+//! multi-device discovery blob. The relay stores it blind (it never parses the
+//! bytes) and expires it after a TTL, so `lookupDiscovery` returns `null` for
+//! the relay's `NotFound` / `Expired` errors — "nothing to discover yet" is a
+//! normal outcome, not a failure. Every other relay error is surfaced.
 //!
 //! ## Envelope kind (GRP-6, out-of-band)
 //!
@@ -396,6 +405,48 @@ export class RelayTransport {
     async lookupPrekey(recipientId: string): Promise<Uint8Array> {
         const resp = await this.roundTrip({ op: 'lookup_prekey', recipient_id: recipientId });
         if (!resp.bundle) throw new RelayError('lookup_prekey response missing bundle');
+        return base64ToBytes(resp.bundle);
+    }
+
+    /**
+     * Publish an opaque discovery blob for `recipientId` (multi-device
+     * discovery, MD-8).
+     *
+     * The blob is end-to-end-encrypted client output; the relay stores it
+     * blind and never parses it. Like `publishPrekey`, publishing is a write,
+     * so it requires a solved PoW challenge.
+     */
+    async publishDiscovery(recipientId: string, blob: Uint8Array): Promise<void> {
+        const { challengeId, powSolution } = await this.requestChallengeAndSolve(recipientId);
+        await this.roundTrip({
+            op: 'publish_discovery',
+            recipient_id: recipientId,
+            discovery: bytesToBase64(blob),
+            challenge_id: challengeId,
+            pow_solution: powSolution,
+        });
+    }
+
+    /**
+     * Look up the discovery blob published for `recipientId`.
+     *
+     * Returns `null` when the relay has no blob for the recipient — either it
+     * was never published (`NotFound`) or its TTL lapsed (`Expired`). Those are
+     * ordinary "nothing to discover yet" outcomes, not failures. Any other
+     * relay error is surfaced as a `RelayError`, as is an `ok` response that
+     * omits the bundle.
+     */
+    async lookupDiscovery(recipientId: string): Promise<Uint8Array | null> {
+        let resp: any;
+        try {
+            resp = await this.roundTrip({ op: 'lookup_discovery', recipient_id: recipientId });
+        } catch (e) {
+            if (e instanceof RelayError && (e.message === 'NotFound' || e.message === 'Expired')) {
+                return null;
+            }
+            throw e;
+        }
+        if (!resp.bundle) throw new RelayError('lookup_discovery response missing bundle');
         return base64ToBytes(resp.bundle);
     }
 
