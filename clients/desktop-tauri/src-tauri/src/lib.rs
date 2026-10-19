@@ -9,6 +9,7 @@ mod commands;
 mod error;
 mod identity_store;
 pub mod relay_client;
+pub mod relay_config;
 pub mod ui;
 pub mod verify;
 

@@ -196,6 +196,12 @@ impl RelayClient {
         url: &str,
         response_timeout: Duration,
     ) -> Result<Self, RelayError> {
+        // DT-3: refuse a plain ws:// relay on a non-loopback host up front,
+        // before any dial. Plain ws:// exposes recipient IDs and timing to the
+        // network; a remote relay must use wss:// (the caller opts in to an
+        // insecure remote relay through `relay_config` instead of here).
+        crate::relay_config::validate_relay_url(url, false)
+            .map_err(|e| RelayError::Unreachable(e.to_string()))?;
         match connect_async(url).await {
             Ok((ws, _response)) => Ok(Self {
                 ws,
