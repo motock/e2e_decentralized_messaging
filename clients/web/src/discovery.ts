@@ -27,6 +27,21 @@ import * as wasm from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
 import type { DeviceList, DeviceListEntry } from './Conversation';
 
+/**
+ * The signed-device-list bindings this module uses (MD-3).
+ *
+ * Declared locally rather than added to `wasm-bindings.d.ts`: that file is the
+ * ambient fallback for the unbuilt-WASM case and is outside this module's
+ * scope. When `prepare-wasm` has run, wasm-pack's generated `index.d.ts`
+ * declares these functions and the cast below is a no-op.
+ */
+interface DeviceListBindings {
+    /** `u64_le(version) || packed entries`. */
+    verify_device_list(bytes: Uint8Array, expectedAccount: Uint8Array): Uint8Array;
+}
+
+const deviceListWasm = wasm as unknown as DeviceListBindings;
+
 /** The transport surface discovery needs. `RelayTransport` satisfies it. */
 export interface DiscoveryTransport {
     /** Publish (or replace) the discovery blob for `handle`. */
@@ -81,7 +96,7 @@ export async function lookupDeviceList(
 
     await ensureWasmInit();
     // Any verification failure throws out of here — deliberately not caught.
-    const verified = wasm.verify_device_list(signedBytes, expectedAccount);
+    const verified = deviceListWasm.verify_device_list(signedBytes, expectedAccount);
 
     const { version, packedEntries } = splitVerified(verified);
     if (heldVersion !== null && version <= heldVersion) return null;

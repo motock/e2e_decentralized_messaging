@@ -104,14 +104,4 @@ declare module '*/core/bindings/wasm/pkg/index.js' {
    localIdentityKey: Uint8Array,
    remoteIdentityKey: Uint8Array,
  ): string;
-
-  // Signed device list (spec/v0.md §8.3). `version` is a Rust `u64`, which
-  // wasm-bindgen maps to a JS `bigint`. `verify_device_list` returns
-  // `u64_le(version)` followed by the packed entry buffer.
-  export function sign_device_list(
-    primaryPrivateBytes: Uint8Array,
-    version: bigint,
-    entries: Uint8Array,
-  ): Uint8Array;
-  export function verify_device_list(bytes: Uint8Array, expectedAccount: Uint8Array): Uint8Array;
 }
