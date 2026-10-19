@@ -254,7 +254,10 @@ impl RelayStore {
 
     /// Introspect whether a public method is exposed.
     pub fn has_method(name: &str) -> bool {
-        matches!(name, "store" | "pickup" | "purge" | "count" | "open")
+        matches!(
+            name,
+            "store" | "pickup" | "peek" | "purge" | "count" | "open"
+        )
     }
 }
 
@@ -594,6 +597,46 @@ mod tests {
             store.pickup("bob"),
             Err(StoreError::NotFound),
             "pickup must not resurrect the discarded row"
+        );
+    }
+
+    /// `peek` is public, so the introspection helper must report it. The repo
+    /// already holds this rule for `open` (relay/tests/store_persistence.rs), and a
+    /// caller that probes `has_method` before dispatching would otherwise be told
+    /// the method does not exist.
+    #[test]
+    fn relay_store_has_method_reports_peek() {
+        assert!(
+            RelayStore::has_method("peek"),
+            "RelayStore::peek is public, so has_method must report it"
+        );
+        assert!(
+            !RelayStore::has_method("peekk"),
+            "has_method must not report methods that do not exist"
+        );
+    }
+
+    /// `peek` must match `pickup` at the boundary: `pickup` treats an expiry equal to
+    /// now as expired (strict `>`), so `peek` must too. A row stamped with the current
+    /// second and zero nanos is at or before now, hence never live.
+    #[test]
+    fn relay_store_peek_treats_expiry_at_now_as_expired() {
+        let store = RelayStore::new();
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        insert_prekey(&store, "bob", b"hi", now_secs);
+
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::Expired),
+            "an expiry at or before now must not be served, matching pickup"
+        );
+        assert_eq!(
+            store.peek("bob"),
+            Err(StoreError::NotFound),
+            "the boundary-expired row must be discarded by the first peek"
         );
     }
 }
