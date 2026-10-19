@@ -772,6 +772,7 @@ dependencies = [
  "storage",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "transport",
