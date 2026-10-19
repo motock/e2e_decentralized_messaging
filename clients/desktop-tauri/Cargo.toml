@@ -28,12 +28,13 @@ core_storage = { package = "storage", path = "../../core/storage" }
 # clients/web/src/relay_transport.ts). Versions match the entries already locked in
 # Cargo.lock (tokio-tungstenite 0.29.0, base64 0.22.1, sha2 0.10.9, futures-util
 # 0.3.32) so no second copy is pulled in. sha2 is needed to solve the relay's PoW
-# challenge locally (relay/src/pow); tokio(time) bounds each response read.
+# challenge locally (relay/src/pow); tokio(time) bounds each response read and
+# tokio(rt) runs the PoW solve off the async executor via spawn_blocking.
 tokio-tungstenite = "0.29"
 base64 = "0.22"
 sha2 = "0.10"
 futures-util = { version = "0.3", features = ["sink"] }
-tokio = { version = "1", default-features = false, features = ["time"] }
+tokio = { version = "1", default-features = false, features = ["time", "rt"] }
 
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
@@ -49,3 +50,5 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 relay = { path = "../../relay" }
 tokio-tungstenite = "0.29"
 futures = "0.3"
+# tests/relay_client_rework.rs builds challenge wire frames directly.
+base64 = "0.22"

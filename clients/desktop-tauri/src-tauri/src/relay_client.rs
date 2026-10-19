@@ -43,6 +43,17 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 /// request but never answers must surface as an error, not a hang.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound on the PoW difficulty this client will accept from a relay.
+///
+/// The difficulty is relay-controlled, and the solve is up to `2^difficulty`
+/// SHA-256 evaluations — so an unbounded cap would let a hostile or
+/// misconfigured relay pin the client for unbounded work. 28 bits is far
+/// above the relay's real setting of 20 (`relay/src/ws.rs POW_DIFFICULTY`)
+/// while capping the worst case at ~2^28 hashes (~seconds, off the async
+/// executor). A challenge above the cap is rejected with
+/// [`RelayError::Protocol`] before any hashing happens.
+const MAX_POW_DIFFICULTY: u32 = 28;
+
 /// The relay's WS PoW difficulty is 20 bits (relay/src/ws.rs `POW_DIFFICULTY`);
 /// a 32-bit counter space is ample headroom, matching the reference client's
 /// iteration cap.
@@ -157,6 +168,16 @@ pub struct Envelope {
 /// round trips; each protected op fetches and solves a fresh PoW challenge.
 pub struct RelayClient {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// Bound on a single request/response round trip on this connection.
+    response_timeout: Duration,
+    /// Set once a round trip has failed in a way that desynchronizes the
+    /// request/response pairing (a response that never arrived within the
+    /// bound, a send failure, or a transport error). The late reply to the
+    /// abandoned request may still arrive and would otherwise be consumed as
+    /// the NEXT op's response — so once poisoned, every later op fails with
+    /// [`RelayError::ConnectionClosed`] immediately, without touching the
+    /// socket. The connection must be re-established.
+    poisoned: bool,
 }
 
 impl RelayClient {
@@ -165,8 +186,22 @@ impl RelayClient {
     /// Fails closed: an unreachable relay is [`RelayError::Unreachable`], never
     /// a silently-degraded client.
     pub async fn connect(url: &str) -> Result<Self, RelayError> {
+        Self::connect_with_timeout(url, RESPONSE_TIMEOUT).await
+    }
+
+    /// [`RelayClient::connect`] with an explicit per-round-trip response bound
+    /// (the default is [`RESPONSE_TIMEOUT`]). Exposed so tests can exercise
+    /// the timeout path without waiting ten seconds.
+    pub async fn connect_with_timeout(
+        url: &str,
+        response_timeout: Duration,
+    ) -> Result<Self, RelayError> {
         match connect_async(url).await {
-            Ok((ws, _response)) => Ok(Self { ws }),
+            Ok((ws, _response)) => Ok(Self {
+                ws,
+                response_timeout,
+                poisoned: false,
+            }),
             Err(e) => Err(RelayError::Unreachable(e.to_string())),
         }
     }
@@ -311,26 +346,43 @@ impl RelayClient {
             .decode(challenge_b64)
             .map_err(|e| RelayError::Protocol(format!("challenge base64: {e}")))?;
         let (preimage, difficulty) = parse_challenge_wire(&wire)?;
-        let solution = solve_pow(&preimage, difficulty)?;
+        // The solve is a CPU-bound loop of up to 2^difficulty SHA-256
+        // evaluations: run it on the blocking thread pool so a legitimate
+        // (but heavy) challenge can never pin a tokio async worker.
+        let solution = tokio::task::spawn_blocking(move || solve_pow(&preimage, difficulty))
+            .await
+            .map_err(|e| RelayError::PowFailed(format!("pow worker failed: {e}")))??;
         Ok((challenge_id, B64.encode(solution)))
     }
 
     /// Send one request frame and await exactly one response frame, bounded by
-    /// [`RESPONSE_TIMEOUT`].
+    /// this client's round-trip bound.
     ///
     /// The bound is what keeps a stalled or half-dead relay from hanging a
     /// pickup forever: a timeout, a stream end, and a transport error all map
     /// to [`RelayError::ConnectionClosed`] — the op did not complete, so it
     /// must not report `Ok`.
+    ///
+    /// Any of those failures also POISONS the connection: the abandoned
+    /// request's reply may still arrive later, and reading it as the next
+    /// op's response would silently pair one op's answer with another op's
+    /// request (e.g. a late `{"ok":true}` taken as the reply to a
+    /// `send_envelope` that never went through). After poisoning, the socket
+    /// is closed and every later op returns [`RelayError::ConnectionClosed`]
+    /// immediately, without touching the socket — the caller must reconnect.
     async fn round_trip(&mut self, req: Value) -> Result<Value, RelayError> {
+        if self.poisoned {
+            return Err(RelayError::ConnectionClosed);
+        }
         let text = serde_json::to_string(&req)
             .map_err(|e| RelayError::Protocol(format!("request serialization: {e}")))?;
         // A send failure means the socket is already gone: the op cannot
         // complete, so it fails closed rather than reporting Ok.
         if self.ws.send(Message::Text(text.into())).await.is_err() {
+            self.poison().await;
             return Err(RelayError::ConnectionClosed);
         }
-        match timeout(RESPONSE_TIMEOUT, self.ws.next()).await {
+        match timeout(self.response_timeout, self.ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text)
                 .map_err(|e| RelayError::Protocol(format!("response frame: {e}"))),
             Ok(Some(Ok(_))) => {
@@ -338,9 +390,29 @@ impl RelayClient {
                 // handled by tungstenite. Anything else here is a violation.
                 Err(RelayError::Protocol("non-text response frame".into()))
             }
-            Ok(Some(Err(_))) | Ok(None) => Err(RelayError::ConnectionClosed),
-            Err(_elapsed) => Err(RelayError::ConnectionClosed),
+            Ok(Some(Err(_))) | Ok(None) => {
+                // The transport is gone (or broke mid-frame): nothing further
+                // can be paired reliably on this socket.
+                self.poison().await;
+                Err(RelayError::ConnectionClosed)
+            }
+            Err(_elapsed) => {
+                // The response never arrived within the bound — but it may
+                // still arrive later. That stale frame must never be read as
+                // a later op's response, so the connection is poisoned.
+                self.poison().await;
+                Err(RelayError::ConnectionClosed)
+            }
         }
+    }
+
+    /// Poison the connection: stop using the socket for good. Best-effort
+    /// close handshake (the socket may already be unusable — that is fine);
+    /// the poisoned flag is what actually guarantees later ops never touch
+    /// it again.
+    async fn poison(&mut self) {
+        self.poisoned = true;
+        let _ = self.ws.close(None).await;
     }
 }
 
@@ -366,7 +438,7 @@ fn expect_ok(resp: Value) -> Result<(), RelayError> {
 /// Returns the PoW preimage prefix (`context || nonce`) and the difficulty in
 /// bits. Every length is bounds-checked — a malformed challenge is a
 /// [`RelayError::Protocol`], never a panic.
-fn parse_challenge_wire(wire: &[u8]) -> Result<(Vec<u8>, u32), RelayError> {
+pub fn parse_challenge_wire(wire: &[u8]) -> Result<(Vec<u8>, u32), RelayError> {
     if wire.len() < 2 {
         return Err(RelayError::Protocol("challenge wire too short".into()));
     }
@@ -398,11 +470,13 @@ fn parse_challenge_wire(wire: &[u8]) -> Result<(Vec<u8>, u32), RelayError> {
     ]);
     // Difficulty 0 is trivially satisfied (zero leading zero-bits required —
     // the relay's own meets_difficulty accepts it immediately); the scripted
-    // test relay issues exactly that. Only an out-of-range value (>256) is a
-    // protocol violation.
-    if difficulty > 256 {
+    // test relay issues exactly that. Anything above [`MAX_POW_DIFFICULTY`]
+    // is rejected HERE, before any hashing: the difficulty is relay-controlled
+    // and the solve cost is exponential in it, so an unbounded cap would let
+    // a hostile relay pin the client for unbounded work.
+    if difficulty > MAX_POW_DIFFICULTY {
         return Err(RelayError::Protocol(format!(
-            "challenge difficulty out of range: {difficulty}"
+            "challenge difficulty {difficulty} exceeds the client cap of {MAX_POW_DIFFICULTY}"
         )));
     }
     Ok((preimage, difficulty))
