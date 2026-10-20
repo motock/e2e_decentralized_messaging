@@ -31,6 +31,7 @@ import {
     publishSignedDeviceList,
     type DiscoveryTransport,
 } from './discovery';
+import { revokeDevice } from './revocation';
 import './design/AppShell.css';
 
 // SafetyNumberVerification's deriveSafetyNumber calls the real
@@ -556,17 +557,48 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         }
     }, [deviceList, identity]);
 
-    // DR-6b: revoke a linked device — drop it from the held list AND call
-    // `fanout_remove_device` on the live handle. An id that is not in the
-    // list is a no-op: nothing is removed and the live session is left
-    // untouched, so the surviving session is never disturbed.
+    // DR-6b / MD-18: revoke a linked device.
+    //
+    // When the account's OWN signed list is held, a revoke is a PUBLISHED act:
+    // `revokeDevice` verifies the held bytes against the primary, drops the
+    // device, signs version+1 and publishes it, and App then holds the new list
+    // and the new raw bytes together. A verification or publish failure leaves
+    // the held list (and its bytes) untouched — fail closed, never a partial
+    // list on the relay.
+    //
+    // Without a signed own list (the injected-prop path used by tests and a
+    // future DiscoveryRecord transport) the local shortcut still applies: drop
+    // the device from the held list and call `fanout_remove_device` on the live
+    // handle. An id that is not in the list is a no-op.
     const handleRevokeDevice = React.useCallback(
-        (deviceId: number) => {
+        async (deviceId: number) => {
+            const heldOwn = ownListRef.current;
+            if (heldOwn && identity) {
+                try {
+                    const { signedListBytes, deviceList: next } = await revokeDevice({
+                        currentListBytes: heldOwn.bytes,
+                        primaryIdentityHandle: identity.handle,
+                        deviceId,
+                        accountHandle: identity.recipientId,
+                        transport: discoveryTransport,
+                    });
+                    // List and bytes in one step, so they can never diverge.
+                    holdOwnList({
+                        version: next.version,
+                        bytes: signedListBytes,
+                        devices: next.devices,
+                    });
+                } catch {
+                    // Fail closed: an unverifiable list or a failed publish
+                    // leaves whatever is already held untouched.
+                }
+                return;
+            }
             if (!isListedDevice(deviceList, deviceId)) return;
             setDeviceList((held) => (held ? removeDeviceFromList(held, deviceId) : held));
             if (fanoutSession) revokeDeviceOnSession(fanoutSession, deviceId);
         },
-        [deviceList, fanoutSession],
+        [deviceList, fanoutSession, identity, discoveryTransport, holdOwnList],
     );
 
     const handleRemoteIdentityKeyChange = React.useCallback(
@@ -761,18 +793,15 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                           }
                                                         : deviceList
                                                 }
-                                                // Revocation is wired to the
-                                                // injected list only: revoking a
-                                                // device from the HELD own list
-                                                // requires re-signing and
-                                                // re-publishing it, which is
-                                                // MD-18's job. Until then the
-                                                // own list renders read-only
-                                                // rather than offering a control
-                                                // that cannot take effect.
-                                                onRevokeDevice={
-                                                    ownList ? undefined : handleRevokeDevice
-                                                }
+                                                // MD-18: revocation works for
+                                                // BOTH sources — the held own
+                                                // list (re-signed and
+                                                // re-published at version+1)
+                                                // and the injected list (local
+                                                // shortcut). `handleRevokeDevice`
+                                                // picks the path from whether a
+                                                // signed own list is held.
+                                                onRevokeDevice={handleRevokeDevice}
                                                 // MD-17: hand the primary scan path
                                                 // the exact signed bytes and version
                                                 // App holds so it can enforce §8.4
