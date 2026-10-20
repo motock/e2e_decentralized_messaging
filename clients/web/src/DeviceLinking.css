@@ -132,39 +132,3 @@
   text-align: center;
   color: var(--verified-strong);
 }
-
-/* MD-15: safety-number panel — the out-of-band comparison step that gates
-   authorization. Reuses the confirm-panel layout and the mono number plate. */
-.link-safety-panel {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-3);
-  text-align: center;
-  border: 1px solid var(--ink-600);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
-}
-
-.link-step-indicator {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-tertiary);
-}
-
-.link-confirm-check {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--text-secondary);
-  text-align: left;
-}
-
-.link-button-primary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}

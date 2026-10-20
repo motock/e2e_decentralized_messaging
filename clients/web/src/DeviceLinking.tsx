@@ -463,8 +463,8 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
             )}
 
             {safetyNumber && (
-                <section className="link-safety-panel" aria-label="Safety number verification">
-                    <p className="link-step-indicator">Step 2 of 2</p>
+                <section className="link-confirm-panel" aria-label="Safety number verification">
+                    <p className="link-intro-text">Step 2 of 2</p>
                     <p className="link-intro-text">
                         Compare this safety number with the one shown on the other device.
                         The new device learns this account&rsquo;s key from the encrypted
@@ -479,7 +479,16 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                     <p data-testid="link-safety-number" className="link-safety-number">
                         {formatSafetyNumber(safetyNumber)}
                     </p>
-                    <label className="link-confirm-check">
+                    <label
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 'var(--space-2)',
+                            fontSize: 'var(--text-sm)',
+                            color: 'var(--text-secondary)',
+                            textAlign: 'left',
+                        }}
+                    >
                         <input
                             type="checkbox"
                             checked={safetyNumberConfirmed}
@@ -494,6 +503,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                                 type="button"
                                 className="link-button-primary"
                                 disabled={!safetyNumberConfirmed}
+                                style={!safetyNumberConfirmed ? { opacity: 0.5, cursor: 'not-allowed' } : undefined}
                                 onClick={handleAuthorize}
                             >
                                 Authorize device
