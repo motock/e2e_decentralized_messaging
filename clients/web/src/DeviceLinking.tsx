@@ -60,6 +60,22 @@
  *    not trusted from the QR payload alone.
  *  - A handshake that resolves after the user cancelled is dropped, so a late
  *    response cannot reopen the confirmation panel.
+ *  - **Send-failure recovery (MF-3).** Publishing the next signed list and
+ *    sending the new device its encrypted response are two steps, and the
+ *    first one already adds the new device to the list. If the send throws,
+ *    the build result is kept in memory and the screen offers a bounded
+ *    "Retry send" that re-sends the SAME response — no re-sign, no re-publish,
+ *    no new list version — so the device can still learn its id and handle.
+ *    Nothing is persisted and the screen stays pre-confirmation until the
+ *    safety number is confirmed.
+ *
+ *    Known limitation: a page reload between the publish and the send loses
+ *    the in-memory build result, leaving an orphan entry in the published
+ *    list. That device never learns its id, and a re-scan is rejected by
+ *    `buildAndPublishLinkedList`'s duplicate-identity check, so the orphan
+ *    must be revoked out of band. This story deliberately does not attempt an
+ *    automatic rollback publish: a compensating write racing another device's
+ *    publish could truncate the list (§8.4), which is worse than an orphan.
  */
 
 import React, { useEffect, useRef, useState } from 'react';
@@ -77,7 +93,11 @@ import {
 } from './device_linking';
 import { SealGlyph } from './design/SealGlyph';
 import type { DeviceList } from './Conversation';
-import { buildAndPublishLinkedList, sendLinkResponse } from './link_primary';
+import {
+    buildAndPublishLinkedList,
+    sendLinkResponse,
+    type BuildAndPublishLinkedListResult,
+} from './link_primary';
 import { beginLinkRequest, awaitLinkResponse, verifyLinkResponse } from './link_new_device';
 import type { RelayTransport } from './relay_transport';
 import type { StorageGate } from './storage';
@@ -499,6 +519,17 @@ function describeError(e: unknown): string {
 }
 
 /**
+ * MF-3: what the user sees when the link response could not be sent *after* the
+ * device list was published. Deliberately static — a transport error message
+ * could echo payload bytes, and this copy must never carry key material, the
+ * link key or list contents. It also states the real situation: the list is
+ * already updated, so the user must either retry the send or revoke the device.
+ */
+const SEND_FAILED_MESSAGE =
+    'The device list was updated, but the new device did not receive its link response. ' +
+    'Retry the send to finish linking it, or revoke the pending device if it cannot be reached.';
+
+/**
  * The device id the verified list binds to this device.
  *
  * The primary assigns the id when it signs the list, so the verified list — not
@@ -544,6 +575,15 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     const [wasmReady, setWasmReady] = useState(false);
     const [safetyNumberConfirmed, setSafetyNumberConfirmed] = useState(false);
     const [pendingLink, setPendingLink] = useState<PendingLink | null>(null);
+    /**
+     * MF-3: the successful build result whose link response has not been
+     * delivered yet. The list it published already contains the new device, so
+     * this is the only way to finish the link without re-signing or
+     * re-publishing. Held in memory only — never persisted.
+     */
+    const [pendingSend, setPendingSend] = useState<BuildAndPublishLinkedListResult | null>(null);
+    /** True while a (re)send is in flight, so the retry control cannot double-send. */
+    const [sending, setSending] = useState(false);
     /**
      * Guards the one-shot write: a double click (or a re-render racing the
      * awaited `put`) must not persist the list twice. Reset on failure so the
@@ -719,9 +759,42 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                 heldVersion: heldListVersion,
                 accountHandle: accountHandle!,
             });
+            if (attempt !== attemptRef.current) return;
 
             // 2. Send the new device its encrypted response, bound to the
             //    identity the QR named (never to whatever the relay served).
+            //    From here on the list is already published, so a send failure
+            //    must keep `built` for a retry instead of discarding it.
+            setPendingSend(built);
+            await deliverResponse(built, attempt);
+        } catch (e: unknown) {
+            // Fail closed: a rejected build (e.g. a stale held version) publishes
+            // nothing and persists nothing. A failure after the user aborted
+            // must not resurrect the flow.
+            if (attempt !== attemptRef.current) return;
+            setPendingLink(null);
+            setPendingSend(null);
+            setMode(null);
+            setState({ ...initialLinkingState(), error: describeError(e) });
+        }
+    };
+
+    /**
+     * MF-3: send the link response for an already-published build result.
+     *
+     * Split out of `handleScan` so a failed send can be retried with the SAME
+     * result: the list is already published, so re-signing or re-publishing
+     * would mint a second version and could truncate a concurrent publish.
+     * On failure the build result stays in `pendingSend` and the screen shows a
+     * static, non-sensitive error plus the retry control; nothing is persisted
+     * and the flow stays pre-confirmation.
+     */
+    const deliverResponse = async (
+        built: BuildAndPublishLinkedListResult,
+        attempt: number,
+    ): Promise<void> => {
+        setSending(true);
+        try {
             await sendLinkResponse({
                 transport: transport!,
                 linkKey: built.linkKey,
@@ -732,31 +805,41 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                 deviceId: built.deviceId,
                 signedListBytes: built.signedListBytes,
             });
+        } catch {
             if (attempt !== attemptRef.current) return;
-
-            // 3. Hold the list in memory; the safety number gates the write.
-            setPendingLink({
-                accountHandle: accountHandle!,
-                // The primary is device 0 in its own signed list.
-                deviceId: 0,
-                signedListBytes: built.signedListBytes,
-            });
-            setState({
-                phase: 'confirming',
-                qrPayload: null,
-                remoteKey: built.newDeviceIdentityKey,
-                safetyNumber: built.safetyNumber,
-                error: null,
-            });
-        } catch (e: unknown) {
-            // Fail closed: a rejected build (e.g. a stale held version) or a
-            // failed send publishes nothing and persists nothing. A failure
-            // after the user aborted must not resurrect the flow.
-            if (attempt !== attemptRef.current) return;
-            setPendingLink(null);
-            setMode(null);
-            setState({ ...initialLinkingState(), error: describeError(e) });
+            // The list is already published: keep the build result so the user
+            // can retry the send. Static copy only — never the thrown message.
+            setState({ ...initialLinkingState(), error: SEND_FAILED_MESSAGE });
+            return;
+        } finally {
+            if (attempt === attemptRef.current) setSending(false);
         }
+        if (attempt !== attemptRef.current) return;
+
+        // 3. Hold the list in memory; the safety number gates the write.
+        setPendingSend(null);
+        setPendingLink({
+            accountHandle: accountHandle!,
+            // The primary is device 0 in its own signed list.
+            deviceId: 0,
+            signedListBytes: built.signedListBytes,
+        });
+        setState({
+            phase: 'confirming',
+            qrPayload: null,
+            remoteKey: built.newDeviceIdentityKey,
+            safetyNumber: built.safetyNumber,
+            error: null,
+        });
+    };
+
+    /**
+     * MF-3: retry the link response for the build result already published.
+     * Bounded by the user: no automatic retries, no re-publish.
+     */
+    const handleRetrySend = async () => {
+        if (!pendingSend || sending) return;
+        await deliverResponse(pendingSend, attemptRef.current);
     };
 
     const handleConfirm = () => {
@@ -772,6 +855,10 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         setScanInput('');
         setConfirmInput('');
         setPendingLink(null);
+        // MF-3: dropping the build result abandons the retry. The published list
+        // still names the new device, so it must be revoked out of band.
+        setPendingSend(null);
+        setSending(false);
         persistedRef.current = false;
     };
 
@@ -932,7 +1019,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                 </div>
             )}
 
-            {mode === 'scan' && state.phase === 'idle' && (
+            {mode === 'scan' && state.phase === 'idle' && !pendingSend && (
                 <div className="link-choices">
                     <p className="link-intro-text">Enter the linking code shown on the other device:</p>
                     <input
@@ -945,6 +1032,25 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                     />
                     <div className="link-actions">
                         <button className="link-button-primary" onClick={handleScan}>Continue</button>
+                        <button className="link-button-secondary" onClick={handleAbort}>Cancel</button>
+                    </div>
+                </div>
+            )}
+
+            {mode === 'scan' && state.phase === 'idle' && pendingSend && (
+                <div className="link-choices">
+                    <p className="link-intro-text">
+                        The new device is already in the published device list, but it has not
+                        received its link response yet. Retry the send to finish linking it.
+                    </p>
+                    <div className="link-actions">
+                        <button
+                            className="link-button-primary"
+                            onClick={handleRetrySend}
+                            disabled={sending}
+                        >
+                            Retry send
+                        </button>
                         <button className="link-button-secondary" onClick={handleAbort}>Cancel</button>
                     </div>
                 </div>
