@@ -28,17 +28,41 @@
  *    labels the new device's confirmation "Step 2 of 2" — the new device
  *    learns the primary key from the encrypted response, so its confirmation
  *    is a separate step, never a one-step link.
+ *  - **Real handshake and post-confirmation persistence** (MD-16): when the
+ *    caller supplies the optional handshake props, the screen drives the
+ *    actual protocol instead of the local-only flow. As the new device it
+ *    publishes its bundle (`beginLinkRequest`), shows the QR, then polls
+ *    `awaitLinkResponse` with the receiver session that request created — the
+ *    only session whose bundle was published, so the only one that can decrypt
+ *    the primary's response — and re-verifies the signed list with
+ *    `verifyLinkResponse` (MD-14). As the primary it builds and publishes the
+ *    next signed list (`buildAndPublishLinkedList`, always with the caller's
+ *    `heldListVersion` so the §8.4 freshness guard is never disabled) and
+ *    sends the encrypted response (`sendLinkResponse`, bound to the identity
+ *    the QR named). Only after the safety number is confirmed does it persist
+ *    `{accountHandle, deviceId, signedListBytesBase64}` through
+ *    `StorageGate.put('identity', 'account-device-list', ...)` — never
+ *    `localStorage`, and never before confirmation.
  *
  * Security properties:
  *  - Fail closed: malformed payloads and mismatched safety numbers never
  *    reach the `linked` state.
+ *  - Fail closed on a partial handshake configuration, and on a missing
+ *    `heldListVersion` (the freshness guard is never defaulted at the call
+ *    site).
+ *  - The assigned device id is bound to the verified list, not to the
+ *    response's own claim: the id the signer bound to this device's identity
+ *    key must be the id the response reports, and this device must appear
+ *    exactly once in the list.
  *  - No sensitive data in logs: key bytes and payloads are never logged.
  *  - No raw key bytes in the DOM: only the derived safety number is rendered.
  *  - The safety number is re-derived from the raw key bytes on confirmation,
  *    not trusted from the QR payload alone.
+ *  - A handshake that resolves after the user cancelled is dropped, so a late
+ *    response cannot reopen the confirmation panel.
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as wasm from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
 import {
@@ -53,6 +77,11 @@ import {
 } from './device_linking';
 import { SealGlyph } from './design/SealGlyph';
 import type { DeviceList } from './Conversation';
+import { buildAndPublishLinkedList, sendLinkResponse } from './link_primary';
+import { beginLinkRequest, awaitLinkResponse, verifyLinkResponse } from './link_new_device';
+import type { RelayTransport } from './relay_transport';
+import type { StorageGate } from './storage';
+import type { IdentityHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import './DeviceLinking.css';
 
 // ---------------------------------------------------------------------------
@@ -386,6 +415,112 @@ export interface DeviceLinkingProps {
      * authorize control does not render.
      */
     onConfirm?: () => void;
+    /**
+     * MD-16: relay transport used for the real linking handshake. OPTIONAL —
+     * when the handshake props are absent the screen keeps its local-only
+     * behaviour (encode/decode the QR payload and derive the safety number
+     * locally), so existing render sites are unchanged.
+     */
+    transport?: RelayTransport;
+    /**
+     * MD-16: this device's identity handle. Required for either handshake role:
+     * the new device creates its receiver session from it, the primary signs
+     * the device list with it.
+     */
+    identityHandle?: IdentityHandle;
+    /**
+     * MD-16: the storage gate the account device list is persisted through
+     * after the safety number is confirmed. Required for either handshake role;
+     * nothing is ever written to `localStorage`.
+     */
+    storageGate?: StorageGate;
+    /**
+     * MD-16: the account handle the new device joins (display mode) or the
+     * handle the signed list is published under (scan mode).
+     */
+    accountHandle?: string;
+    /**
+     * MD-16: the primary's own prekey bundle, included as device 0 in the list
+     * it signs. Required in scan mode.
+     */
+    primaryBundleBytes?: Uint8Array;
+    /**
+     * MD-16: the currently published signed device list, or `null` when the
+     * account genuinely has none. Required in scan mode so the primary builds
+     * on the list it already holds instead of starting from version 0.
+     */
+    currentListBytes?: Uint8Array | null;
+    /**
+     * MD-16: the list version this device already holds (`deviceList.version`
+     * in the app), or `0` only when the account genuinely has no list.
+     *
+     * Required in scan mode. `verify_device_list` proves authenticity, not
+     * freshness, so omitting this would silently disable the §8.4 rollback
+     * guard — a relay answering `NotFound` could then truncate the device list.
+     * The screen therefore fails closed rather than defaulting it.
+     */
+    heldListVersion?: number;
+}
+
+/**
+ * MD-16: the handshake result awaiting the safety-number confirmation.
+ *
+ * Nothing here is written anywhere until the user confirms the number matches
+ * on both devices — the signed list is held in memory only.
+ */
+interface PendingLink {
+    /** Account handle the new device joins. */
+    accountHandle: string;
+    /** This device's id in the signed list (the primary is device 0). */
+    deviceId: number;
+    /** The signed device list to persist once the number is confirmed. */
+    signedListBytes: Uint8Array;
+}
+
+/** Store and record id the account device list is persisted under. */
+const DEVICE_LIST_STORE = 'identity' as const;
+const DEVICE_LIST_RECORD_ID = 'account-device-list';
+
+/** Base64 for the signed list. The list is public; it is not secret material. */
+function bytesToBase64(bytes: Uint8Array): string {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    if (typeof btoa === 'function') return btoa(binary);
+    return Buffer.from(binary, 'binary').toString('base64');
+}
+
+/**
+ * A user-facing message for a failed handshake step. The linking modules throw
+ * structural messages only (never key bytes, bundles or list contents), so the
+ * message is safe to render; anything else collapses to a static string.
+ */
+function describeError(e: unknown): string {
+    return e instanceof Error && e.message ? e.message : 'Device linking failed';
+}
+
+/**
+ * The device id the verified list binds to this device.
+ *
+ * The primary assigns the id when it signs the list, so the verified list — not
+ * the response's own `deviceId` field — is the authority for it. Requiring
+ * exactly one entry to carry this device's identity key is what makes the id
+ * unambiguous: a list that names this device twice cannot say which id is ours.
+ *
+ * @throws if no entry, or more than one entry, carries this device's key.
+ */
+function deviceIdBoundTo(deviceList: DeviceList, localIdentityKey: Uint8Array): number {
+    const matches = deviceList.devices.filter(
+        (device) =>
+            device.identityKey instanceof Uint8Array &&
+            device.identityKey.length === localIdentityKey.length &&
+            device.identityKey.every((byte, i) => byte === localIdentityKey[i]),
+    );
+    if (matches.length !== 1) {
+        throw new Error(
+            'link response: verified device list does not bind this device exactly once',
+        );
+    }
+    return matches[0].deviceId;
 }
 
 export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
@@ -394,6 +529,13 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     onRevokeDevice,
     safetyNumber,
     onConfirm,
+    transport,
+    identityHandle,
+    storageGate,
+    accountHandle,
+    primaryBundleBytes,
+    currentListBytes,
+    heldListVersion,
 }) => {
     const [state, setState] = useState<LinkingState>(initialLinkingState());
     const [mode, setMode] = useState<'display' | 'scan' | null>(null);
@@ -401,6 +543,37 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     const [confirmInput, setConfirmInput] = useState('');
     const [wasmReady, setWasmReady] = useState(false);
     const [safetyNumberConfirmed, setSafetyNumberConfirmed] = useState(false);
+    const [pendingLink, setPendingLink] = useState<PendingLink | null>(null);
+    /**
+     * Guards the one-shot write: a double click (or a re-render racing the
+     * awaited `put`) must not persist the list twice. Reset on failure so the
+     * user can retry.
+     */
+    const persistedRef = useRef(false);
+    /**
+     * Bumped whenever the user aborts. An in-flight handshake captures the
+     * value it started with and drops its result if it changed, so a response
+     * that arrives after Cancel can never open the confirmation panel.
+     */
+    const attemptRef = useRef(0);
+
+    // The handshake needs a full prop set per role. When none of the handshake
+    // props are supplied the screen keeps its local-only behaviour, so existing
+    // render sites are unchanged.
+    const handshakePropsSupplied =
+        transport !== undefined ||
+        identityHandle !== undefined ||
+        storageGate !== undefined ||
+        accountHandle !== undefined ||
+        primaryBundleBytes !== undefined ||
+        currentListBytes !== undefined ||
+        heldListVersion !== undefined;
+    const handshakeDisplayReady = Boolean(
+        transport && identityHandle && storageGate && accountHandle,
+    );
+    const handshakeScanReady = Boolean(
+        transport && identityHandle && storageGate && accountHandle && primaryBundleBytes,
+    );
 
     useEffect(() => {
         let cancelled = false;
@@ -414,12 +587,94 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     // so a stale "matches" can never authorise a different key pair.
     useEffect(() => {
         setSafetyNumberConfirmed(false);
-    }, [safetyNumber]);
+    }, [safetyNumber, state.safetyNumber]);
 
     const handleDisplay = async () => {
         setMode('display');
-        const newState = await beginDisplay(state, localIdentityKey);
-        setState(newState);
+        if (!handshakePropsSupplied) {
+            const newState = await beginDisplay(state, localIdentityKey);
+            setState(newState);
+            return;
+        }
+        if (!handshakeDisplayReady) {
+            setMode(null);
+            setState({
+                ...initialLinkingState(),
+                error: 'Device linking is not configured for this device',
+            });
+            return;
+        }
+        const attempt = attemptRef.current;
+        try {
+            // 1. Publish this device's bundle and show the QR the primary scans.
+            const request = await beginLinkRequest(transport!, identityHandle!);
+            if (attempt !== attemptRef.current) return;
+            setState({
+                phase: 'displaying',
+                qrPayload: request.qrPayload,
+                remoteKey: null,
+                safetyNumber: null,
+                error: null,
+            });
+
+            // 2. Wait for the primary's encrypted response, then re-verify the
+            //    signed list against this device before trusting anything (MD-14).
+            //    The session must be the one `beginLinkRequest` created: that is
+            //    the session whose bundle was published under the link key, so it
+            //    is the only one that can decrypt the primary's response.
+            const response = await awaitLinkResponse({
+                transport: transport!,
+                linkKey: request.linkKey,
+                receiverSession: request.receiverSession,
+                newDevicePublicKey: localIdentityKey,
+            });
+            if (attempt !== attemptRef.current) return;
+            // The id this device was assigned is only knowable from the verified
+            // list: the QR payload carries no id, and the response's `deviceId` is
+            // an unsigned claim. `expectedDeviceId` below therefore cannot be the
+            // binding guard — it only lets the list be verified and decoded. The
+            // guard is the derivation that follows: the id the signer actually
+            // bound to this device must be the id the response reports. Without it
+            // a response could point at *any* entry in the signed list that happens
+            // to carry this device's key, losing the binding between the id
+            // assigned to this device and the id reported.
+            const verified = verifyLinkResponse({
+                response,
+                expectedDeviceId: response.deviceId,
+                localPublicKey: localIdentityKey,
+            });
+            if (attempt !== attemptRef.current) return;
+            const assignedDeviceId = deviceIdBoundTo(verified.deviceList, localIdentityKey);
+            if (verified.deviceId !== assignedDeviceId) {
+                throw new Error(
+                    'link response: assigned device id is not the id bound to this device',
+                );
+            }
+            if (attempt !== attemptRef.current) return;
+
+            // 3. Hold the list in memory; the safety number gates the write.
+            setPendingLink({
+                accountHandle: verified.accountHandle,
+                deviceId: verified.deviceId,
+                // `verifyLinkResponse` re-verifies these bytes but returns the
+                // converted list, so the blob to persist is the response's.
+                signedListBytes: response.signedListBytes,
+            });
+            setState({
+                phase: 'confirming',
+                qrPayload: request.qrPayload,
+                remoteKey: verified.primaryKey,
+                safetyNumber: verified.safetyNumber,
+                error: null,
+            });
+        } catch (e: unknown) {
+            // Fail closed: no pending link, nothing persisted, no `linked`.
+            // A failure after the user aborted must not resurrect the flow.
+            if (attempt !== attemptRef.current) return;
+            setPendingLink(null);
+            setMode(null);
+            setState({ ...initialLinkingState(), error: describeError(e) });
+        }
     };
 
     const handleScan = async () => {
@@ -427,8 +682,81 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
             setState({ ...state, error: 'Enter a linking code' });
             return;
         }
-        const newState = await beginScan(state, scanInput.trim(), localIdentityKey);
-        setState(newState);
+        if (!handshakePropsSupplied) {
+            const newState = await beginScan(state, scanInput.trim(), localIdentityKey);
+            setState(newState);
+            return;
+        }
+        if (!handshakeScanReady) {
+            setMode(null);
+            setState({
+                ...initialLinkingState(),
+                error: 'Device linking is not configured for this device',
+            });
+            return;
+        }
+        if (heldListVersion === undefined) {
+            // Never default the freshness guard: without the version this
+            // device holds, a relay answering `NotFound` could truncate the
+            // device list (§8.4). Refuse to publish instead.
+            setMode(null);
+            setState({
+                ...initialLinkingState(),
+                error: 'Device list version unavailable; refusing to publish without a freshness check',
+            });
+            return;
+        }
+        const attempt = attemptRef.current;
+        try {
+            // 1. Verify the scanned key, append the new device and publish the
+            //    next signed list — building on the list this device holds.
+            const built = await buildAndPublishLinkedList({
+                transport: transport!,
+                qrPayload: scanInput.trim(),
+                primaryIdentityHandle: identityHandle!,
+                primaryBundleBytes: primaryBundleBytes!,
+                currentListBytes: currentListBytes ?? null,
+                heldVersion: heldListVersion,
+                accountHandle: accountHandle!,
+            });
+
+            // 2. Send the new device its encrypted response, bound to the
+            //    identity the QR named (never to whatever the relay served).
+            await sendLinkResponse({
+                transport: transport!,
+                linkKey: built.linkKey,
+                newDeviceBundle: built.newDeviceBundle,
+                expectedNewDeviceIdentityKey: built.newDeviceIdentityKey,
+                primaryIdentityHandle: identityHandle!,
+                accountHandle: accountHandle!,
+                deviceId: built.deviceId,
+                signedListBytes: built.signedListBytes,
+            });
+            if (attempt !== attemptRef.current) return;
+
+            // 3. Hold the list in memory; the safety number gates the write.
+            setPendingLink({
+                accountHandle: accountHandle!,
+                // The primary is device 0 in its own signed list.
+                deviceId: 0,
+                signedListBytes: built.signedListBytes,
+            });
+            setState({
+                phase: 'confirming',
+                qrPayload: null,
+                remoteKey: built.newDeviceIdentityKey,
+                safetyNumber: built.safetyNumber,
+                error: null,
+            });
+        } catch (e: unknown) {
+            // Fail closed: a rejected build (e.g. a stale held version) or a
+            // failed send publishes nothing and persists nothing. A failure
+            // after the user aborted must not resurrect the flow.
+            if (attempt !== attemptRef.current) return;
+            setPendingLink(null);
+            setMode(null);
+            setState({ ...initialLinkingState(), error: describeError(e) });
+        }
     };
 
     const handleConfirm = () => {
@@ -437,18 +765,59 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     };
 
     const handleAbort = () => {
+        // Invalidate any in-flight handshake so a late response is dropped.
+        attemptRef.current += 1;
         setState(initialLinkingState());
         setMode(null);
         setScanInput('');
         setConfirmInput('');
+        setPendingLink(null);
+        persistedRef.current = false;
     };
 
-    const handleAuthorize = () => {
+    const handleAuthorize = async () => {
         // Fail closed: the control is disabled until confirmed, and a click
         // that somehow reaches it must not authorise an unverified number.
-        if (!safetyNumber || !safetyNumberConfirmed) return;
-        onConfirm?.();
+        if (!safetyNumberConfirmed) return;
+
+        if (!pendingLink) {
+            // MD-15 prop-driven path: the caller performs the authorization.
+            if (!safetyNumber) return;
+            onConfirm?.();
+            return;
+        }
+
+        // MD-16: persist the account device list exactly once, only now that
+        // the safety number has been confirmed out of band.
+        if (!storageGate || persistedRef.current) return;
+        persistedRef.current = true;
+        try {
+            await storageGate.put(DEVICE_LIST_STORE, DEVICE_LIST_RECORD_ID, {
+                accountHandle: pendingLink.accountHandle,
+                deviceId: pendingLink.deviceId,
+                signedListBytesBase64: bytesToBase64(pendingLink.signedListBytes),
+            });
+            setPendingLink(null);
+            setState({
+                phase: 'linked',
+                qrPayload: null,
+                remoteKey: null,
+                safetyNumber: null,
+                error: null,
+            });
+        } catch (e: unknown) {
+            // The write failed: stay pre-confirmation so the user can retry.
+            persistedRef.current = false;
+            setState({ ...state, error: describeError(e) });
+        }
     };
+
+    /**
+     * The number the panel shows: the caller-supplied MD-15 value when present,
+     * otherwise the one the handshake derived (MD-16). Both are already-derived
+     * display strings; raw key bytes never reach the panel.
+     */
+    const panelSafetyNumber = safetyNumber ?? state.safetyNumber;
 
     if (!wasmReady) {
         return <div className="link-loading">Loading device-linking…</div>;
@@ -462,7 +831,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                 </div>
             )}
 
-            {safetyNumber && (
+            {panelSafetyNumber && (
                 <section className="link-confirm-panel" aria-label="Safety number verification">
                     <p className="link-intro-text">Step 2 of 2</p>
                     <p className="link-intro-text">
@@ -471,13 +840,13 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                         response, so its confirmation is a separate step.
                     </p>
                     <SealGlyph
-                        value={safetyNumber}
+                        value={panelSafetyNumber}
                         size={72}
                         tone="neutral"
                         title="Safety number seal for this link"
                     />
                     <p data-testid="link-safety-number" className="link-safety-number">
-                        {formatSafetyNumber(safetyNumber)}
+                        {formatSafetyNumber(panelSafetyNumber)}
                     </p>
                     <label
                         style={{
@@ -497,7 +866,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                         />
                         The safety number matches on both devices
                     </label>
-                    {onConfirm && (
+                    {(onConfirm || pendingLink) && (
                         <div className="link-actions">
                             <button
                                 type="button"
