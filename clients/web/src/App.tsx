@@ -923,15 +923,12 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                 // version actually held, or 0 ONLY
                                                 // when there is genuinely no signed
                                                 // list — never undefined/null, which
-                                                // would disable the guard. Spread
-                                                // through a cast because
-                                                // DeviceLinkingProps does not yet
-                                                // declare these (MD-16); the props
-                                                // are inert until it does.
-                                                {...({
-                                                    currentListBytes: ownList?.bytes ?? null,
-                                                    heldListVersion: ownList?.version ?? 0,
-                                                } as Record<string, unknown>)}
+                                                // would disable the guard. Passed as
+                                                // explicit typed props (DeviceLinkingProps
+                                                // declares both, MD-16) so the §8.4
+                                                // freshness baseline is type-checked.
+                                                currentListBytes={ownList?.bytes ?? null}
+                                                heldListVersion={ownList?.version ?? 0}
                                             />
                                         )}
                                     </SafetyNumberErrorBoundary>
