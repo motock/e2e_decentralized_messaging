@@ -195,14 +195,28 @@ pub fn derive_link_key(identity_key: &[u8]) -> Result<String, WasmError> {
 ///
 /// # Errors
 ///
-/// Returns `WasmError` with `kind = "DeviceList"` if the private bytes are malformed or if
-/// signing fails (`SigningFailed`). Never panics.
+/// Returns `WasmError` with `kind = "DeviceList"` and message
+/// `primary device revocation is not supported` if `device_id` is `0` — device `0` is the
+/// account primary, and primary revocation is out of scope (spec/v0.md §8.3). Returns
+/// `WasmError` with `kind = "DeviceList"` if the private bytes are malformed or if signing
+/// fails (`SigningFailed`). Never panics, and never includes the private key bytes in an
+/// error message.
 #[wasm_bindgen]
 pub fn sign_revocation(
     primary_private_bytes: &[u8],
     device_id: u32,
     version: u64,
 ) -> Result<Vec<u8>, WasmError> {
+    // Device 0 is the account primary. Revoking the primary is out of scope for v0, so
+    // reject it before touching the key bytes or the signing path: a revocation of the
+    // primary would be a self-revocation the relay cannot honour.
+    if device_id == 0 {
+        return Err(WasmError::new(
+            KIND,
+            "primary device revocation is not supported",
+        ));
+    }
+
     let keypair = IdentityKeyPair::from_bytes(primary_private_bytes)
         .map_err(|e| WasmError::new(KIND, &e.to_string()))?;
     let revocation = SignedRevocation::sign(keypair.as_libsignal(), DeviceId(device_id), version)
@@ -268,6 +282,36 @@ mod tests {
         out.extend_from_slice(&(prekey_bundle.len() as u32).to_le_bytes());
         out.extend_from_slice(prekey_bundle);
         out
+    }
+
+    #[test]
+    fn sign_revocation_rejects_device_zero() {
+        let primary = IdentityKeyPair::generate();
+
+        let error = sign_revocation(&private_bytes(&primary), 0, 9)
+            .expect_err("device 0 is the primary and must not be revocable");
+
+        assert_eq!(
+            error.kind(),
+            "DeviceList",
+            "a rejected primary revocation must carry the module's error kind"
+        );
+        // Exact match, not a substring check: the message must be the static reason and
+        // must not leak any part of the private key bytes.
+        assert_eq!(
+            error.message(),
+            "primary device revocation is not supported"
+        );
+    }
+
+    #[test]
+    fn sign_revocation_allows_linked_device() {
+        let primary = IdentityKeyPair::generate();
+
+        assert!(
+            sign_revocation(&private_bytes(&primary), 7, 9).is_ok(),
+            "a linked (nonzero) device id must still sign"
+        );
     }
 
     #[test]
