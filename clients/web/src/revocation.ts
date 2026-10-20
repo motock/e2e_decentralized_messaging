@@ -11,6 +11,9 @@
  * the web-side orchestration: verify the list we hold, drop the device, bump
  * the version, sign, publish.
  *
+ * The `u64_le(version) || packed entries` codec is not duplicated here: it is
+ * imported from `discovery.ts`, which owns the canonical implementation.
+ *
  * Security properties:
  *  - **Fail closed.** `currentListBytes` is verified against the primary's
  *    public key before any of it is trusted. An unverifiable list throws and
@@ -29,8 +32,14 @@
 
 import * as wasm from '../../../core/bindings/wasm/pkg/index.js';
 import { ensureWasmInit } from './wasm_init';
-import { publishSignedDeviceList, toConversationDeviceList, type DiscoveryTransport } from './discovery';
-import type { DeviceList, DeviceListEntry } from './Conversation';
+import {
+    packEntries,
+    publishSignedDeviceList,
+    splitVerified,
+    toConversationDeviceList,
+    type DiscoveryTransport,
+} from './discovery';
+import type { DeviceList } from './Conversation';
 
 /**
  * The signed-device-list bindings this module uses (MD-3).
@@ -129,10 +138,12 @@ export async function revokeDevice({
 
     const remaining = held.devices.filter((device) => device.deviceId !== deviceId);
     const nextVersion = version + 1;
+    // `sign_device_list` prepends `u64_le(version)` itself, so hand it only the
+    // entry portion of the packed buffer.
     const signedListBytes = deviceListWasm.sign_device_list(
         primaryIdentityHandle.private_bytes(),
         nextVersion,
-        packDeviceListEntries(remaining),
+        packEntries(nextVersion, remaining).subarray(VERSION_PREFIX_LEN),
     );
 
     await publishSignedDeviceList(transport, accountHandle, signedListBytes);
@@ -141,67 +152,4 @@ export async function revokeDevice({
         signedListBytes,
         deviceList: { version: nextVersion, devices: remaining },
     };
-}
-
-/**
- * Split the `u64_le(version) || packed entries` buffer `verify_device_list`
- * returns. Mirrors discovery.ts's private splitter so this module does not
- * depend on its internals.
- */
-function splitVerified(verified: Uint8Array): { version: number; packedEntries: Uint8Array } {
-    if (verified.length < VERSION_PREFIX_LEN) {
-        throw new Error('device list: verified buffer is truncated');
-    }
-    const view = new DataView(verified.buffer, verified.byteOffset, verified.byteLength);
-    const raw = view.getBigUint64(0, true);
-    if (raw > BigInt(Number.MAX_SAFE_INTEGER)) {
-        throw new Error('device list: version is out of range');
-    }
-    return { version: Number(raw), packedEntries: verified.subarray(VERSION_PREFIX_LEN) };
-}
-
-/**
- * Pack device-list entries for `sign_device_list`:
- * `u32_le(deviceId) | u32_le(identityLen) | identity | u32_le(bundleLen) | bundle`,
- * concatenated with no count prefix (the layout `toConversationDeviceList`
- * parses). Mirrors App.tsx's packer; kept local so this module does not depend
- * on App's internals.
- */
-function packDeviceListEntries(entries: DeviceListEntry[]): Uint8Array {
-    let size = 0;
-    for (const entry of entries) {
-        size += 4 + 4 + entry.identityKey.length + 4 + entry.bundleBytes.length;
-    }
-    const out = new Uint8Array(size);
-    const view = new DataView(out.buffer);
-    let pos = 0;
-    for (const entry of entries) {
-        if (
-            !Number.isSafeInteger(entry.deviceId) ||
-            entry.deviceId < 0 ||
-            entry.deviceId > 0xffffffff
-        ) {
-            throw new Error('device list: device id is out of range');
-        }
-        // Validate before signing: a malformed entry must never be signed and
-        // published, because peers verify the signature and then trust the
-        // contents.
-        if (entry.identityKey.length !== 33) {
-            throw new Error('device list: identity key is not 33 bytes');
-        }
-        if (entry.bundleBytes.length === 0) {
-            throw new Error('device list: bundle is empty');
-        }
-        view.setUint32(pos, entry.deviceId, true);
-        pos += 4;
-        view.setUint32(pos, entry.identityKey.length, true);
-        pos += 4;
-        out.set(entry.identityKey, pos);
-        pos += entry.identityKey.length;
-        view.setUint32(pos, entry.bundleBytes.length, true);
-        pos += 4;
-        out.set(entry.bundleBytes, pos);
-        pos += entry.bundleBytes.length;
-    }
-    return out;
 }
