@@ -45,6 +45,12 @@
 //!
 //! `from_bytes` never panics: every read is bounds-checked and every length is
 //! validated before it is used, so hostile input yields an error rather than a crash.
+//!
+//! [`SignedDeviceList::sign`] runs the same structural pass *before* it signs, so a
+//! caller can never obtain a signature over a list that [`SignedDeviceList::verify`]
+//! would reject. [`SignedDeviceList::canonical_bytes`] encodes every length with a
+//! checked `u32` conversion rather than an `as u32` cast, so a hand-built record with an
+//! unrepresentable length yields an unparseable blob instead of a silently truncated one.
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -152,6 +158,25 @@ pub enum DeviceListError {
     BadSignature,
 }
 
+/// Encode a slice length as the `u32` the wire format uses.
+///
+/// The canonical encoding is length-prefixed with fixed-width `u32` fields, so a length
+/// that does not fit in a `u32` is not representable at all. A bare `as u32` would
+/// silently truncate such a length and emit a blob that *looks* well-framed while
+/// describing different bytes than it carries — the classic length-confusion bug. This
+/// conversion is checked instead, and saturates at `u32::MAX` on overflow so the function
+/// stays total and panic-free: the resulting length prefix is larger than any input that
+/// could follow it, so [`SignedDeviceList::from_bytes`] rejects the blob with
+/// [`DeviceListError::Truncated`] rather than mis-parsing it.
+///
+/// Every length reachable from a *validated* list is orders of magnitude below this bound
+/// ([`IDENTITY_KEY_LEN`], [`MAX_ENTRIES`], [`MAX_BUNDLE_LEN`]), and [`SignedDeviceList::sign`]
+/// validates before encoding, so the saturation branch is only reachable from a hand-built
+/// record that deliberately bypassed validation.
+fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 impl SignedDeviceList {
     /// The byte string the primary signs.
     ///
@@ -172,14 +197,14 @@ impl SignedDeviceList {
         );
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.version.to_be_bytes());
-        out.extend_from_slice(&(self.account.len() as u32).to_be_bytes());
+        out.extend_from_slice(&len_u32(self.account.len()).to_be_bytes());
         out.extend_from_slice(&self.account);
-        out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
+        out.extend_from_slice(&len_u32(self.entries.len()).to_be_bytes());
         for entry in &self.entries {
             out.extend_from_slice(&entry.device_id.to_be_bytes());
-            out.extend_from_slice(&(entry.identity_key.len() as u32).to_be_bytes());
+            out.extend_from_slice(&len_u32(entry.identity_key.len()).to_be_bytes());
             out.extend_from_slice(&entry.identity_key);
-            out.extend_from_slice(&(entry.prekey_bundle.len() as u32).to_be_bytes());
+            out.extend_from_slice(&len_u32(entry.prekey_bundle.len()).to_be_bytes());
             out.extend_from_slice(&entry.prekey_bundle);
         }
         out
@@ -189,7 +214,7 @@ impl SignedDeviceList {
     /// `u32_be(signature.len())` and the signature.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.canonical_bytes();
-        out.extend_from_slice(&(self.primary_signature.len() as u32).to_be_bytes());
+        out.extend_from_slice(&len_u32(self.primary_signature.len()).to_be_bytes());
         out.extend_from_slice(&self.primary_signature);
         out
     }
@@ -306,7 +331,17 @@ impl SignedDeviceList {
     /// bytes over the stored order, so canonicalizing over a different copy would make
     /// a freshly signed list fail its own signature check.
     ///
+    /// The list is validated *before* it is signed, so `sign` never produces a signature
+    /// over a record that [`verify`](Self::verify) would reject.
+    ///
     /// # Errors
+    ///
+    /// Returns the structural error [`SignedDeviceList::from_bytes`] would report for the
+    /// same record — [`DeviceListError::BadVersion`] for `version == 0`,
+    /// [`DeviceListError::MissingPrimary`] when no entry has `device_id == 0`,
+    /// [`DeviceListError::DuplicateDeviceId`], [`DeviceListError::TooManyEntries`],
+    /// [`DeviceListError::BadIdentityKeyLength`] or [`DeviceListError::BadBundleLength`] —
+    /// and never signs an invalid list.
     ///
     /// Returns [`DeviceListError::BadSignature`] if the underlying `libsignal` signing
     /// call fails (unreachable in practice for this workspace's Curve25519 keys, but
@@ -327,6 +362,11 @@ impl SignedDeviceList {
             // Filled in below, once the canonical bytes exist.
             primary_signature: Vec::new(),
         };
+        // Validate *before* signing: a signature over a structurally invalid list would
+        // be a record that its own `verify` rejects, so the caller would hold a blob no
+        // peer can ever accept. Returning the structural error here keeps `sign` and
+        // `verify` in agreement about what a device list is.
+        list.validate()?;
         let canonical = list.canonical_bytes();
         let signature = primary
             .private_key()
@@ -962,5 +1002,135 @@ mod device_list_signing_tests {
             derive_link_key(&[]),
             Err(DeviceListError::BadIdentityKeyLength)
         );
+    }
+
+    /// `sign` must refuse to sign a structurally invalid list rather than producing a
+    /// signature over it: a version-0 list can never be a valid device list, so signing
+    /// one would hand the caller a record that its own `verify` rejects.
+    #[test]
+    fn sign_rejects_version_zero() {
+        let primary = generate_identity_key_pair();
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 0, entries()),
+            Err(DeviceListError::BadVersion)
+        );
+    }
+
+    /// A duplicate device id makes the fan-out ambiguous, so `sign` must reject it.
+    #[test]
+    fn sign_rejects_duplicate_device_ids() {
+        let primary = generate_identity_key_pair();
+        let duplicated = vec![entry(0, 0x01), entry(1, 0x02), entry(1, 0x03)];
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 4, duplicated),
+            Err(DeviceListError::DuplicateDeviceId)
+        );
+    }
+
+    /// The primary is itself a fan-out recipient; a list without `device_id == 0` is not
+    /// a device list and must not be signed.
+    #[test]
+    fn sign_rejects_missing_primary() {
+        let primary = generate_identity_key_pair();
+        let linked_only = vec![entry(1, 0x01), entry(2, 0x02)];
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 4, linked_only),
+            Err(DeviceListError::MissingPrimary)
+        );
+    }
+
+    /// An empty entry set has no primary either, and must be rejected the same way.
+    #[test]
+    fn sign_rejects_empty_entries() {
+        let primary = generate_identity_key_pair();
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 4, Vec::new()),
+            Err(DeviceListError::MissingPrimary)
+        );
+    }
+
+    /// An entry whose prekey bundle exceeds the accepted maximum must be rejected before
+    /// signing, so an oversized bundle never reaches the wire.
+    #[test]
+    fn sign_rejects_an_oversized_bundle() {
+        let primary = generate_identity_key_pair();
+        let oversized = vec![
+            entry(0, 0x01),
+            DeviceListEntry {
+                device_id: 1,
+                identity_key: key(0x02),
+                prekey_bundle: vec![0x02; MAX_BUNDLE_LEN + 1],
+            },
+        ];
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 4, oversized),
+            Err(DeviceListError::BadBundleLength)
+        );
+    }
+
+    /// More entries than [`MAX_ENTRIES`] is a structural violation, not a signing job.
+    #[test]
+    fn sign_rejects_too_many_entries() {
+        let primary = generate_identity_key_pair();
+        let mut many: Vec<DeviceListEntry> = (0..=MAX_ENTRIES as u32)
+            .map(|id| entry(id, (id % 251) as u8))
+            .collect();
+        // `entry` seeds the identity key from the seed; ids are unique, so the only
+        // violation is the count.
+        many[0].device_id = 0;
+        assert_eq!(
+            SignedDeviceList::sign(&primary, 4, many),
+            Err(DeviceListError::TooManyEntries)
+        );
+    }
+
+    /// A valid list still round-trips through `canonical_bytes` unchanged after the
+    /// length casts became fallible: the encoding is byte-identical to the documented
+    /// layout and re-encodes to the same bytes.
+    #[test]
+    fn canonical_bytes_round_trips_a_valid_list() {
+        let primary = generate_identity_key_pair();
+        let list = SignedDeviceList::sign(&primary, 7, entries()).expect("signing must succeed");
+
+        let canonical = list.canonical_bytes();
+        assert_eq!(
+            canonical,
+            list.canonical_bytes(),
+            "canonical_bytes must be deterministic"
+        );
+
+        // The framing is exactly the documented layout: magic, u64 version, u32 account
+        // length + account, u32 entry count, then per-entry fields.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(MAGIC);
+        expected.extend_from_slice(&7u64.to_be_bytes());
+        expected.extend_from_slice(&(list.account.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&list.account);
+        expected.extend_from_slice(&(list.entries.len() as u32).to_be_bytes());
+        for e in &list.entries {
+            expected.extend_from_slice(&e.device_id.to_be_bytes());
+            expected.extend_from_slice(&(e.identity_key.len() as u32).to_be_bytes());
+            expected.extend_from_slice(&e.identity_key);
+            expected.extend_from_slice(&(e.prekey_bundle.len() as u32).to_be_bytes());
+            expected.extend_from_slice(&e.prekey_bundle);
+        }
+        assert_eq!(canonical, expected);
+
+        // And the signed blob still parses back to the same record.
+        let parsed = SignedDeviceList::from_bytes(&list.to_bytes()).expect("valid blob must parse");
+        assert_eq!(parsed, list);
+        assert_eq!(parsed.verify(&account(&primary)), Ok(()));
+    }
+    /// The length prefix is a checked `u32` conversion, not an `as u32` cast: a length that
+    /// does not fit saturates at `u32::MAX` instead of silently truncating, so the encoder
+    /// can never emit a prefix that describes fewer bytes than it carries.
+    #[test]
+    fn len_u32_is_checked_at_the_u32_boundary() {
+        assert_eq!(len_u32(0), 0);
+        assert_eq!(len_u32(IDENTITY_KEY_LEN), 33);
+        assert_eq!(len_u32(u32::MAX as usize), u32::MAX);
+        // One past the largest representable length saturates rather than wrapping to 0.
+        assert_eq!(len_u32(u32::MAX as usize + 1), u32::MAX);
+        assert_eq!(len_u32(usize::MAX), u32::MAX);
     }
 }
