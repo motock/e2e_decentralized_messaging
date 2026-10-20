@@ -96,7 +96,7 @@ The hard part of "decentralized Signal." Approach:
   `spec/v0.md` §8: unlinking a device revokes its `DeviceAddress`, drops its prekey bundle from
   the account's `DiscoveryRecord`, tears down its sessions, and rejects its Sealed Sender
   certificates, propagated as a signed, monotonically versioned device list. The wire shapes are
-  Phase 6 work; revoking the *primary* device is an open item (`spec/v0.md` §7).
+  specified in `spec/v0.md` §7.1; revoking the *primary* device is an open item (`spec/v0.md` §7).
 
 ---
 
@@ -150,6 +150,10 @@ What exists and is tested right now (see the per-crate tests and `docs/threat-mo
 - **Built:** the Rust core (`core/crypto`, `core/protocol`, `core/storage`, `core/transport`,
   including Sealed Sender and padding), the standalone relay (`relay/`), the UniFFI and WASM
   bindings, the web client (`clients/web`), and the desktop client (`clients/desktop-tauri`).
+  This includes the multi-device wire shapes: the primary-signed device list in
+  `core/protocol/src/device_list.rs`, the signed revocation record and per-device fan-out in
+  `core/protocol/src/fanout.rs`, and the relay's opaque discovery-blob storage in
+  `relay/src/discovery.rs` (the `publish_discovery` / `lookup_discovery` ops in `relay/src/ws.rs`).
 - **Scaffolded only:** `clients/desktop`, `clients/ios`, and `clients/android` are placeholder
   directories with a README each — no implementation yet (Phase 8).
 - **Not started:** multi-device history sync (a later epic, per §4) and the Phase 9 hardening
