@@ -32,8 +32,16 @@ const BUNDLE = new Uint8Array([9, 9, 9]);
 /** The fake relay's discovery store, keyed by handle. */
 const relay = {
     byHandle: new Map<string, Uint8Array>(),
-    defaultBlob: null as Uint8Array | null,
+    /**
+     * The blob served for the account's OWN handle (the recipient id, which the
+     * test only learns after render). Peer handles are always served from
+     * `byHandle`, so own-list and peer-list lookups return DISTINCT blobs —
+     * sharing one blob is what hid the own-list/recipient-list mix-up.
+     */
+    ownBlob: null as Uint8Array | null,
     published: [] as { handle: string; blob: Uint8Array }[],
+    /** Handles looked up, in call order — lets a test await discovery. */
+    lookups: [] as string[],
     /** When set, verification for this expected account throws. */
     throwFor: null as Uint8Array | null,
 };
@@ -118,8 +126,10 @@ vi.mock('../src/relay_transport', () => ({
                 relay.published.push({ handle, blob });
                 relay.byHandle.set(handle, blob);
             },
-            lookupDiscovery: async (handle: string) =>
-                relay.byHandle.get(handle) ?? relay.defaultBlob,
+            lookupDiscovery: async (handle: string) => {
+                relay.lookups.push(handle);
+                return relay.byHandle.has(handle) ? relay.byHandle.get(handle)! : relay.ownBlob;
+            },
         };
     }),
 }));
@@ -199,32 +209,41 @@ beforeEach(async () => {
     linkProps.length = 0;
     relay.byHandle.clear();
     relay.published.length = 0;
-    relay.defaultBlob = null;
+    relay.ownBlob = null;
+    relay.lookups.length = 0;
     relay.throwFor = null;
     const dbs = (fakeIndexedDB as any)._databases;
     if (dbs && typeof dbs.clear === 'function') dbs.clear();
 });
 
 describe('App device discovery (MD-17)', () => {
-    test('a version-2 list from discovery reaches Conversation', async () => {
-        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
-        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
-        relay.defaultBlob = signedBlob(2, [dev0, dev1]);
+    const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
+    const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
+    const dev2 = { deviceId: 2, identityKey: new Uint8Array(33).fill(3), bundleBytes: BUNDLE };
 
-        await renderApp();
+    /** Report a peer's real remote identity key, as Conversation does. */
+    async function reportPeer(peerId: string, key: Uint8Array): Promise<void> {
+        act(() => {
+            lastConv().onRemoteIdentityKeyChange(peerId, key);
+        });
+        // Let the async lookup settle.
+        await act(async () => {
+            await Promise.resolve();
+        });
+    }
 
-        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
-        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0, 1]);
-        // Nothing was published: the account already had a list.
-        expect(relay.published).toHaveLength(0);
-    });
+    async function openLinkView(): Promise<void> {
+        fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+        await waitFor(() => expect(lastLink()).toBeTruthy());
+    }
 
     test('an empty account list publishes version 1 containing device 0', async () => {
         await renderApp();
 
         await waitFor(() => expect(relay.published).toHaveLength(1));
         const { handle, blob } = relay.published[0];
-        expect(handle).toBe(keypairs[0].pub && lastConv().identity.recipientId);
+        // Published under the account's own handle — the recipient id.
+        expect(handle).toBe(lastConv().identity.recipientId);
         expect(blob[0]).toBe(1);
 
         const entries = decodePacked(blob.slice(1));
@@ -232,73 +251,113 @@ describe('App device discovery (MD-17)', () => {
         expect(entries[0].deviceId).toBe(0);
         expect(entries[0].identityKey).toEqual(keypairs[0].pub);
         expect(entries[0].bundleBytes).toEqual(BUNDLE);
+    });
 
-        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(1));
-        expect(lastConv().deviceList.devices[0].deviceId).toBe(0);
+    test('the own list is never written into the recipient device list', async () => {
+        // Regression guard: `deviceList` is the RECIPIENT's list and Conversation
+        // fans a 1:1 send out to every device in it. Seeding our own device 0
+        // there makes every send fan out to this very device.
+        await renderApp();
+        await waitFor(() => expect(relay.published).toHaveLength(1));
+
+        expect(lastConv().deviceList).toBeUndefined();
+    });
+
+    test('the own list reaches DeviceLinking as the linked-devices list', async () => {
+        await renderApp();
+        await waitFor(() => expect(relay.published).toHaveLength(1));
+
+        await openLinkView();
+        expect(lastLink().deviceList.version).toBe(1);
+        expect(lastLink().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0]);
     });
 
     test('DeviceLinking receives the held raw bytes and version', async () => {
         await renderApp();
         await waitFor(() => expect(relay.published).toHaveLength(1));
 
-        fireEvent.click(screen.getByRole('button', { name: 'Link' }));
-
-        await waitFor(() => expect(lastLink()).toBeTruthy());
+        await openLinkView();
         expect(lastLink().currentListBytes).toEqual(relay.published[0].blob);
         expect(lastLink().heldListVersion).toBe(1);
     });
 
-    test('a newer peer list replaces the held one', async () => {
-        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
-        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
-        relay.defaultBlob = signedBlob(2, [dev0, dev1]);
+    test('held bytes match the fetched list when the relay already holds one', async () => {
+        const blob = signedBlob(2, [dev0, dev1]);
+        relay.ownBlob = blob;
 
         await renderApp();
+        await waitFor(() => expect(relay.lookups.length).toBeGreaterThan(0));
+
+        await openLinkView();
+        // The bytes handed to DeviceLinking are the exact blob that produced
+        // the held version — never a stale/absent pair.
+        expect(lastLink().currentListBytes).toEqual(blob);
+        expect(lastLink().heldListVersion).toBe(2);
+        expect(lastLink().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0, 1]);
+        // A list already held is never re-seeded.
+        expect(relay.published).toHaveLength(0);
+    });
+
+    test('a peer list from discovery reaches Conversation', async () => {
+        relay.byHandle.set('peer-handle', signedBlob(2, [dev0, dev1]));
+
+        await renderApp();
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
+
         await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0, 1]);
+    });
 
-        // The peer's real identity key arrives; the relay serves a NEWER list.
-        const peerKey = new Uint8Array(33).fill(7);
-        relay.byHandle.set('peer-handle', signedBlob(3, [dev0, dev1]));
+    test("a peer's fresh version-1 list is applied even though the own list is version 1", async () => {
+        // The §8.4 baseline is per account: comparing the peer's version against
+        // OUR OWN list's version would reject a brand-new peer's first list.
+        relay.byHandle.set('peer-handle', signedBlob(1, [dev0, dev1]));
 
-        act(() => {
-            lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
-        });
+        await renderApp();
+        await waitFor(() => expect(relay.published).toHaveLength(1)); // own list is v1
 
-        await waitFor(() => expect(lastConv().deviceList.version).toBe(3));
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
+
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(1));
         expect(lastConv().deviceList.devices).toHaveLength(2);
     });
 
-    test('an older peer list does not replace the held one', async () => {
-        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
-        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
-        relay.defaultBlob = signedBlob(2, [dev0, dev1]);
+    test('switching peers compares each peer against its own held version', async () => {
+        relay.byHandle.set('peer-a', signedBlob(5, [dev0, dev1, dev2]));
+        relay.byHandle.set('peer-b', signedBlob(1, [dev0]));
 
         await renderApp();
+
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(5));
+
+        // Peer B's list is older than peer A's but newer than anything held FOR
+        // PEER B, so it must be applied.
+        await reportPeer('peer-b', new Uint8Array(33).fill(8));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(1));
+        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0]);
+    });
+
+    test('an older peer list does not replace the held one', async () => {
+        relay.byHandle.set('peer-handle', signedBlob(2, [dev0, dev1]));
+
+        await renderApp();
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
         await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
 
-        // The peer reports its real identity key; the relay serves a STALE
-        // version-1 list for it. Monotonicity (§8.4) must reject it.
-        const peerKey = new Uint8Array(33).fill(7);
+        // A replayed STALE version-1 list for the same peer must be rejected.
         relay.byHandle.set('peer-handle', signedBlob(1, [dev0]));
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
 
-        act(() => {
-            lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
-        });
-
-        // Give the async lookup a chance to settle, then assert nothing moved.
-        await act(async () => {
-            await Promise.resolve();
-        });
         expect(lastConv().deviceList.version).toBe(2);
         expect(lastConv().deviceList.devices).toHaveLength(2);
     });
 
     test('a failed verification leaves the previous list untouched and does not throw', async () => {
-        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
-        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
-        relay.defaultBlob = signedBlob(2, [dev0, dev1]);
+        relay.byHandle.set('peer-handle', signedBlob(2, [dev0, dev1]));
 
         await renderApp();
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
         await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
 
         // Any rejection that escapes the effect (rather than being swallowed)
@@ -313,12 +372,7 @@ describe('App device discovery (MD-17)', () => {
             relay.byHandle.set('peer-handle', signedBlob(9, [dev0]));
 
             // Must not throw out of render/act.
-            act(() => {
-                lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
-            });
-            await act(async () => {
-                await Promise.resolve();
-            });
+            await reportPeer('peer-handle', peerKey);
 
             expect(lastConv().deviceList.version).toBe(2);
             expect(lastConv().deviceList.devices).toHaveLength(2);
@@ -332,30 +386,56 @@ describe('App device discovery (MD-17)', () => {
         await renderApp();
         await waitFor(() => expect(relay.published).toHaveLength(1));
 
-        fireEvent.click(screen.getByRole('button', { name: 'Link' }));
-        await waitFor(() => expect(lastLink()).toBeTruthy());
+        await openLinkView();
 
         expect(lastLink().heldListVersion).not.toBeUndefined();
         expect(lastLink().heldListVersion).not.toBeNull();
         expect(typeof lastLink().heldListVersion).toBe('number');
-        expect(lastLink().heldListVersion).toBe(lastConv().deviceList.version);
+        expect(lastLink().heldListVersion).toBe(lastLink().deviceList.version);
     });
 
-    test('held bytes match the fetched list when the relay already holds one', async () => {
-        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
-        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
-        const blob = signedBlob(2, [dev0, dev1]);
-        relay.defaultBlob = blob;
+    test('held bytes and version stay in lockstep after a peer list is applied', async () => {
+        // Regression guard: the held pair must come from ONE source (the own
+        // list). Reading the version off the recipient's list would pair our own
+        // bytes with the peer's version — and MD-18 would re-sign from the wrong
+        // blob.
+        const ownBlob = signedBlob(2, [dev0, dev1]);
+        relay.ownBlob = ownBlob;
+        relay.byHandle.set('peer-handle', signedBlob(9, [dev0, dev1, dev2]));
 
         await renderApp();
-        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+        await waitFor(() => expect(relay.lookups.length).toBeGreaterThan(0));
 
-        fireEvent.click(screen.getByRole('button', { name: 'Link' }));
-        await waitFor(() => expect(lastLink()).toBeTruthy());
+        await reportPeer('peer-handle', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(9));
 
-        // The bytes handed to DeviceLinking are the exact blob that produced
-        // the held version — never a stale/absent pair.
-        expect(lastLink().currentListBytes).toEqual(blob);
+        await openLinkView();
+        expect(lastLink().currentListBytes).toEqual(ownBlob);
         expect(lastLink().heldListVersion).toBe(2);
+    });
+
+    test('an expired relay blob re-publishes the held list instead of seeding v1', async () => {
+        const ownBlob = signedBlob(2, [dev0, dev1]);
+        relay.ownBlob = ownBlob;
+
+        await renderApp();
+        await waitFor(() => expect(relay.lookups.length).toBeGreaterThan(0));
+        await openLinkView();
+        expect(lastLink().heldListVersion).toBe(2);
+
+        // The relay's blob expires (TTL): the next lookup finds nothing.
+        relay.ownBlob = null;
+        // A relay URL change re-runs the own-list effect.
+        fireEvent.change(screen.getByLabelText('Relay URL'), {
+            target: { value: 'ws://localhost:9000' },
+        });
+        fireEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+        await waitFor(() => expect(relay.published).toHaveLength(1));
+        // The held list is re-published as-is: same version, every linked
+        // device still present — never a v1 seed that drops device 1.
+        expect(relay.published[0].blob).toEqual(ownBlob);
+        expect(relay.published[0].blob[0]).toBe(2);
+        expect(decodePacked(relay.published[0].blob.slice(1))).toHaveLength(2);
     });
 });
