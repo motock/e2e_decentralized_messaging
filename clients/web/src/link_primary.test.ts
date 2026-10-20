@@ -533,6 +533,54 @@ describe('buildAndPublishLinkedList held version', () => {
         expect(result.deviceId).toBe(3);
         expect(transport.publishDiscovery).toHaveBeenCalledTimes(1);
     });
+
+    it('rejects a missing list when a version is already held (relay NotFound rollback)', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+
+        // The relay answers `NotFound`, so the caller has no list to verify. The
+        // effective current version is 0, which is older than the held version:
+        // signing here would publish version 1 holding only device 0 + the new
+        // device, silently dropping every other device.
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(NEW_KEY),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: null,
+                heldVersion: 9,
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/older than the version already held/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a held version that is not a non-negative safe integer', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+
+        // `NaN` compares false against every version, so an unvalidated guard
+        // would silently disable rollback protection.
+        for (const heldVersion of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY]) {
+            await expect(
+                buildAndPublishLinkedList({
+                    transport: asTransport(transport),
+                    qrPayload: qrPayloadFor(NEW_KEY),
+                    primaryIdentityHandle: handle,
+                    primaryBundleBytes: PRIMARY_BUNDLE,
+                    currentListBytes: version7ListBytes(),
+                    heldVersion,
+                    accountHandle: ACCOUNT_HANDLE,
+                }),
+            ).rejects.toThrow(/held version is not a valid list version/);
+        }
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
 });
 
 // ---------------------------------------------------------------------------

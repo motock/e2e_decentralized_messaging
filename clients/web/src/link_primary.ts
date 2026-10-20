@@ -32,9 +32,13 @@
  *    `currentListBytes` is run through `verify_device_list` against the primary's
  *    public identity key before its entries or version are used, so a tampered
  *    list cannot seed the next version. Verification proves *authenticity*, not
- *    *freshness*: a relay can serve an older validly-signed list. Callers that
- *    hold a version MUST pass `heldVersion`, so a rollback is rejected before
- *    signing (§8.4); without it this function cannot detect a replay.
+ *    *freshness*: a relay can serve an older validly-signed list, or answer
+ *    `NotFound` so the caller starts from version 0 and drops every device but
+ *    the primary. Callers that hold a version MUST pass `heldVersion`: the
+ *    freshness gate runs on **both** paths — against the verified version, and
+ *    against `0` when no list was supplied — so either rollback is rejected
+ *    before signing (§8.4). Without `heldVersion` this function cannot detect a
+ *    replay.
  *  - **Device 0 is preserved.** The primary is itself a fan-out recipient, so
  *    every published list contains device 0 exactly once.
  *  - **No sensitive data in logs or errors.** Identity keys, private bytes,
@@ -108,10 +112,14 @@ export interface BuildAndPublishLinkedListArgs {
      * holds none.
      *
      * `verify_device_list` proves authenticity, not freshness, so a relay can
-     * serve an older validly-signed list. When this is supplied the verified
-     * version must be `>= heldVersion`, otherwise the request is rejected before
-     * signing (spec/v0.md §8.4). Callers that track a version MUST pass it —
-     * this function has no other way to detect a rollback.
+     * serve an older validly-signed list — or no list at all, which would make
+     * this function start from version 0 and drop every device but the primary.
+     * When this is supplied the effective current version (the verified version,
+     * or `0` when `currentListBytes` is `null`) must be `>= heldVersion`,
+     * otherwise the request is rejected before signing (spec/v0.md §8.4).
+     * Callers that track a version MUST pass it — this function has no other way
+     * to detect a rollback. A value that is not a non-negative safe integer is
+     * rejected rather than silently disabling the guard.
      */
     heldVersion?: number | null;
     /** Relay handle the signed list is published under. */
@@ -150,6 +158,31 @@ export function nextDeviceId(entries: { deviceId: number }[]): number {
         }
     }
     return max + 1;
+}
+
+/**
+ * Reject a rollback before anything is signed (spec/v0.md §8.4).
+ *
+ * `verify_device_list` proves a list was signed by the primary; it says nothing
+ * about freshness, so a relay can serve an older validly-signed list. It can
+ * also answer `NotFound`, which makes the caller start from version 0 and drop
+ * every device but the primary — the same rollback by another route. Both
+ * branches of {@link buildAndPublishLinkedList} therefore run this check, with
+ * `currentVersion` being the verified version or `0` when no list was supplied.
+ *
+ * A `heldVersion` that is not a non-negative safe integer is rejected rather
+ * than silently disabling the guard (`NaN` compares false against everything).
+ */
+function assertFresh(currentVersion: number, heldVersion: number | null): void {
+    if (heldVersion === null) {
+        return;
+    }
+    if (!Number.isSafeInteger(heldVersion) || heldVersion < 0) {
+        throw new Error('link request: held version is not a valid list version');
+    }
+    if (currentVersion < heldVersion) {
+        throw new Error('link request: current list is older than the version already held');
+    }
 }
 
 /**
@@ -218,15 +251,14 @@ export async function buildAndPublishLinkedList(
             },
         ];
         currentVersion = 0;
+        // No list from the relay is indistinguishable from a relay that answered
+        // `NotFound`: starting at version 0 would drop every device but the
+        // primary, so the freshness gate must run here too.
+        assertFresh(currentVersion, heldVersion);
     } else {
         const verified = deviceListWasm.verify_device_list(currentListBytes, primaryPublicBytes);
         currentVersion = readVersion(verified);
-        // Verification proves the list was signed by the primary; it says nothing
-        // about freshness. Reject a rollback before signing, so a relay cannot
-        // make us re-sign an older list and resurrect revoked devices (§8.4).
-        if (heldVersion !== null && currentVersion < heldVersion) {
-            throw new Error('link request: current list is older than the version already held');
-        }
+        assertFresh(currentVersion, heldVersion);
         const packedEntries = verified.subarray(VERSION_PREFIX_LEN);
         entries = toConversationDeviceList(currentVersion, packedEntries).devices.map(
             (device) => ({
