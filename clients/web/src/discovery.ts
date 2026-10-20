@@ -9,7 +9,13 @@
  * The signing and verification live in the Rust core and are exposed through
  * the WASM bindings (`sign_device_list` / `verify_device_list`). This module is
  * the web-side orchestration: publish, verify-then-convert, and the packed-entry
- * decoder.
+ * codec.
+ *
+ * This module also owns the canonical codec for the buffer
+ * `verify_device_list` returns — `u64_le(version) || packed entries` — as
+ * {@link packEntries} and {@link splitVerified}. Every web module that reads or
+ * writes that layout imports these two rather than carrying a private copy, so
+ * the framing cannot drift between callers.
  *
  * Security properties:
  *  - **Never returns unverified bytes.** `lookupDeviceList` calls
@@ -135,11 +141,84 @@ export function toConversationDeviceList(version: number, packedEntries: Uint8Ar
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Shared codec for `u64_le(version) || packed entries`
 // ---------------------------------------------------------------------------
 
-/** Split `verify_device_list`'s output into its version and entry buffer. */
-function splitVerified(verified: Uint8Array): { version: number; packedEntries: Uint8Array } {
+/**
+ * Encode a versioned device list into the buffer layout `verify_device_list`
+ * returns: `u64_le(version) || packed entries`, where the entries are
+ * `u32_le(deviceId) | u32_le(identityLen) | identity | u32_le(bundleLen) | bundle`
+ * concatenated with no count prefix.
+ *
+ * The exact inverse of {@link splitVerified}. Callers that need only the entry
+ * portion (e.g. `sign_device_list`, which prepends the version itself) take
+ * `.subarray(VERSION_PREFIX_LEN)` of the result.
+ *
+ * @throws if `version` is not a non-negative safe integer, or if any entry is
+ *   malformed. Validation happens before anything is encoded, so a rejected
+ *   call leaves no partial output behind.
+ */
+export function packEntries(version: number, entries: DeviceListEntry[]): Uint8Array {
+    // `setBigUint64` would happily encode 2^53 and peers would then read a
+    // version this side can no longer represent. Reject before encoding, and
+    // never fold the version through a 32-bit operator (`version | 0` turns
+    // 2^53 into 0).
+    if (!Number.isSafeInteger(version) || version < 0) {
+        throw new Error('device list: version is out of range');
+    }
+
+    let size = VERSION_PREFIX_LEN;
+    for (const entry of entries) {
+        size += 4 + 4 + entry.identityKey.length + 4 + entry.bundleBytes.length;
+    }
+
+    const out = new Uint8Array(size);
+    const view = new DataView(out.buffer);
+    view.setBigUint64(0, BigInt(version), true);
+    let pos = VERSION_PREFIX_LEN;
+
+    for (const entry of entries) {
+        // `setUint32` silently wraps, so an out-of-range id from a hostile list
+        // would pack as a different id (2^32 packs as 0, colliding with the
+        // primary and failing Rust structural validation). Reject instead.
+        if (
+            !Number.isSafeInteger(entry.deviceId) ||
+            entry.deviceId < 0 ||
+            entry.deviceId > 0xffffffff
+        ) {
+            throw new Error('device list: device id is out of range');
+        }
+        // Validate before signing: a malformed entry must never be signed and
+        // published, because peers verify the signature and then trust the
+        // contents.
+        if (entry.identityKey.length !== 33) {
+            throw new Error('device list: identity key is not 33 bytes');
+        }
+        if (entry.bundleBytes.length === 0) {
+            throw new Error('device list: bundle is empty');
+        }
+        view.setUint32(pos, entry.deviceId, true);
+        pos += 4;
+        view.setUint32(pos, entry.identityKey.length, true);
+        pos += 4;
+        out.set(entry.identityKey, pos);
+        pos += entry.identityKey.length;
+        view.setUint32(pos, entry.bundleBytes.length, true);
+        pos += 4;
+        out.set(entry.bundleBytes, pos);
+        pos += entry.bundleBytes.length;
+    }
+
+    return out;
+}
+
+/**
+ * Split `verify_device_list`'s output into its version and entry buffer.
+ *
+ * @throws if the buffer is shorter than the 8-byte version prefix (a truncated
+ *   read must not zero-fill) or if the version exceeds `Number.MAX_SAFE_INTEGER`.
+ */
+export function splitVerified(verified: Uint8Array): { version: number; packedEntries: Uint8Array } {
     if (verified.length < VERSION_PREFIX_LEN) {
         throw new Error('device list: verified buffer is truncated');
     }
@@ -150,6 +229,10 @@ function splitVerified(verified: Uint8Array): { version: number; packedEntries: 
     }
     return { version: Number(raw), packedEntries: verified.subarray(VERSION_PREFIX_LEN) };
 }
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
 /** Read a little-endian `u32`, bounds-checked against the buffer length. */
 function readU32(view: DataView, length: number, pos: number): number {
