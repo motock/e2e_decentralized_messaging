@@ -299,6 +299,36 @@ async function seedOwnDeviceList(
     };
 }
 
+/** Store and record id the linking handshake (MD-16) persists the link under. */
+const ACCOUNT_DEVICE_LIST_STORE = 'identity' as const;
+const ACCOUNT_DEVICE_LIST_RECORD_ID = 'account-device-list';
+
+/** The parts of the persisted account-device link record the receive path needs. */
+export interface AccountDeviceLink {
+    /** The account handle this device is linked to. */
+    accountHandle: string;
+    /** This device's id in the account's signed list (the primary is 0). */
+    deviceId: number;
+}
+
+/**
+ * MD-17b: structurally validate the persisted account-device link record.
+ *
+ * The linking handshake writes `{ accountHandle, deviceId, signedListBytesBase64 }`
+ * under the `identity` store. Anything else — no record at all, a record from an
+ * older/foreign writer, or a corrupted one — yields `null`, so the caller falls
+ * back to the bare recipient id. This never throws: a bad record must not break
+ * render, and the record's list bytes are never logged or echoed.
+ */
+export function parseAccountDeviceLink(raw: unknown): AccountDeviceLink | null {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const { accountHandle, deviceId, signedListBytesBase64 } = raw as Record<string, unknown>;
+    if (typeof accountHandle !== 'string' || accountHandle.length === 0) return null;
+    if (typeof deviceId !== 'number' || !Number.isInteger(deviceId) || deviceId < 0) return null;
+    if (typeof signedListBytesBase64 !== 'string') return null;
+    return { accountHandle, deviceId };
+}
+
 export default function App({ deviceList: deviceListProp }: { deviceList?: DeviceList } = {}) {
     const [identity, setIdentity] = React.useState<PersistedIdentity | null>(null);
     // The encrypted store opened for identity loading, held so the relay
@@ -329,6 +359,37 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         if (deviceListProp === undefined) return;
         setDeviceList((held) => applyDeviceListUpdate(held, deviceListProp));
     }, [deviceListProp]);
+
+    // MD-17b: this device's account-device link, as persisted by the linking
+    // handshake (MD-16). `null` means "not linked / no usable record" — the
+    // receive loop then polls the bare recipient id, which is also what the
+    // primary device (id 0) does.
+    const [accountDeviceLink, setAccountDeviceLink] = React.useState<AccountDeviceLink | null>(
+        null,
+    );
+    React.useEffect(() => {
+        if (!identity || !sessionGate) return;
+        let cancelled = false;
+        (async () => {
+            let link: AccountDeviceLink | null = null;
+            try {
+                const raw = await sessionGate.get(
+                    ACCOUNT_DEVICE_LIST_STORE,
+                    ACCOUNT_DEVICE_LIST_RECORD_ID,
+                );
+                link = parseAccountDeviceLink(raw);
+            } catch {
+                // A missing or undecryptable record is not fatal: fall back to
+                // the bare recipient id. The record carries signed list bytes,
+                // so nothing about it is logged.
+                link = null;
+            }
+            if (!cancelled) setAccountDeviceLink(link);
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [identity, sessionGate]);
 
     // Retry-with-backoff prekey publish + Connecting/Connected/Unreachable
     // status. The receiver session it produces on success is handed to
@@ -765,6 +826,8 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                         receiverSession={conn.receiverSession ?? undefined}
                                         onRemoteIdentityKeyChange={handleRemoteIdentityKeyChange}
                                         deviceList={deviceList}
+                                        accountHandle={accountDeviceLink?.accountHandle}
+                                        deviceId={accountDeviceLink?.deviceId}
                                     />
                                 )}
                                 {view === 'group' && (

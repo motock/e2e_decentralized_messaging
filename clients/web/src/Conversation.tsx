@@ -140,6 +140,22 @@ export interface ConversationProps {
      * one envelope addressed to the bare peer id.
      */
     deviceList?: DeviceList;
+    /**
+     * MD-17b: the account handle this device is linked to, as persisted by
+     * MD-16 under the `account-device-list` record. Together with `deviceId`
+     * it selects the mailbox the receive loop polls: a LINKED device
+     * (`deviceId >= 1`) is addressed as `${accountHandle}:${deviceId}`, while
+     * the primary device (id 0) and the unlinked case keep polling the bare
+     * `identity.recipientId`. Absent props therefore preserve the legacy
+     * bare-id behaviour.
+     */
+    accountHandle?: string;
+    /**
+     * MD-17b: this device's id within the account's signed device list.
+     * Device 0 is the primary and is received on the bare account handle;
+     * linked devices are >= 1. Ignored unless `accountHandle` is also set.
+     */
+    deviceId?: number;
 }
 
 // StoreName is a type, not a runtime object - 'messages' is a plain string
@@ -179,6 +195,8 @@ export const Conversation: React.FC<ConversationProps> = ({
     onRemoteIdentityKeyChange,
     receiverSession,
     deviceList,
+    accountHandle,
+    deviceId,
 }) => {
     const [messages, setMessages] = useState<Message[]>([]);
     const [peerId, setPeerId] = useState('');
@@ -308,8 +326,17 @@ export const Conversation: React.FC<ConversationProps> = ({
                     receiverSessionRef.current = propSession;
                 }
 
+                // MD-17b: a LINKED device (id >= 1) receives on its own
+                // `account:device` mailbox; the primary (id 0) and the
+                // unlinked case keep polling the bare recipient id, which is
+                // what the relay routes the account handle to.
+                const receiveAddress =
+                    accountHandle && deviceId !== undefined && deviceId >= 1
+                        ? `${accountHandle}:${deviceId}`
+                        : identity!.recipientId;
+
                 const picked = await transportRef.current.pickupEnvelope(
-                    identity!.recipientId,
+                    receiveAddress,
                 );
 
                 // ── Envelope-kind routing (GRP-6, out-of-band) ──────────────
@@ -410,7 +437,7 @@ export const Conversation: React.FC<ConversationProps> = ({
             if (timer) clearInterval(timer);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [identity]);
+    }, [identity, accountHandle, deviceId]);
 
     // Report the active peer's remote identity key (or null, if no session exists for them
     // yet) whenever the peer id changes, so SafetyNumberVerification always reflects the
