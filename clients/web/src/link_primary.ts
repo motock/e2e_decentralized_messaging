@@ -8,16 +8,33 @@
  * the next version (spec/v0.md §8.3).
  *
  * Security properties:
- *  - **The relay is not trusted.** The bundle is looked up under the derived
- *    link key, and its identity key must byte-match the scanned QR key. A
- *    mismatch throws before anything is signed or published, so an
- *    attacker-substituted bundle cannot get a device into the signed list.
+ *  - **The relay is not trusted for identity binding.** The bundle is looked up
+ *    under the derived link key, and its identity key must byte-match the
+ *    scanned QR key. A mismatch throws before anything is signed or published,
+ *    so a bundle for a *different* identity cannot get a device into the signed
+ *    list. This binds the bundle to the scanned identity key; it does **not**
+ *    authenticate the bundle's prekeys — `bundle_identity_key_bytes` does not
+ *    check signatures, so a relay can still serve a same-identity bundle with
+ *    substituted prekeys (a denial of service, not an impersonation). Verifying
+ *    the signed-prekey/Kyber signatures before signing is a follow-up.
+ *  - **No duplicate identity keys.** The new device's identity key is compared
+ *    against every existing entry, device 0 included, and a match rejects before
+ *    signing. `FanoutSession::establish_from_bundles` rejects a list carrying one
+ *    identity under two device ids (`FanoutError::DuplicateIdentity`), so
+ *    publishing one would break every sender's fan-out to the account. This also
+ *    stops a re-scan of the same QR from re-adding a device under its old key
+ *    (spec/v0.md §8.4). Re-adding a *revoked* device whose key is no longer in
+ *    the list needs local revocation state, which this module does not hold —
+ *    that is a follow-up, not something this check can cover.
  *  - **No fallback bundle.** A missing bundle (`NotFound`) rejects the whole
  *    request; there is no synthesized or cached bundle path.
- *  - **The current list is verified, never trusted.** `currentListBytes` is run
- *    through `verify_device_list` against the primary's public identity key
- *    before its entries or version are used, so a tampered or replayed list
- *    cannot seed the next version.
+ *  - **The current list is verified, never trusted for authenticity.**
+ *    `currentListBytes` is run through `verify_device_list` against the primary's
+ *    public identity key before its entries or version are used, so a tampered
+ *    list cannot seed the next version. Verification proves *authenticity*, not
+ *    *freshness*: a relay can serve an older validly-signed list. Callers that
+ *    hold a version MUST pass `heldVersion`, so a rollback is rejected before
+ *    signing (§8.4); without it this function cannot detect a replay.
  *  - **Device 0 is preserved.** The primary is itself a fan-out recipient, so
  *    every published list contains device 0 exactly once.
  *  - **No sensitive data in logs or errors.** Identity keys, private bytes,
@@ -86,6 +103,17 @@ export interface BuildAndPublishLinkedListArgs {
     primaryBundleBytes: Uint8Array;
     /** The currently published signed list, or `null` when none exists yet. */
     currentListBytes: Uint8Array | null;
+    /**
+     * The list version this device already holds, or `null`/omitted when it
+     * holds none.
+     *
+     * `verify_device_list` proves authenticity, not freshness, so a relay can
+     * serve an older validly-signed list. When this is supplied the verified
+     * version must be `>= heldVersion`, otherwise the request is rejected before
+     * signing (spec/v0.md §8.4). Callers that track a version MUST pass it —
+     * this function has no other way to detect a rollback.
+     */
+    heldVersion?: number | null;
     /** Relay handle the signed list is published under. */
     accountHandle: string;
 }
@@ -134,16 +162,18 @@ export function nextDeviceId(entries: { deviceId: number }[]): number {
  *     difference, before signing or publishing;
  *  4. take the entries from the *verified* current list, or seed device 0 from
  *     the primary's own key and bundle when there is no list yet;
- *  5. append the new device at `nextDeviceId(entries)`;
- *  6. sign at `(current version or 0) + 1` with the primary's private bytes;
- *  7. publish the signed blob under `accountHandle`.
+ *  5. reject if the new identity key is already in the list (device 0 included);
+ *  6. append the new device at `nextDeviceId(entries)`;
+ *  7. sign at `(current version or 0) + 1` with the primary's private bytes;
+ *  8. publish the signed blob under `accountHandle`.
  *
  * Lookup, verification, and mismatch errors propagate unchanged: nothing is
  * published on any failure path.
  *
  * @throws if the QR payload is malformed, the bundle is missing, the bundle's
- *   identity key differs from the QR key, the current list fails verification,
- *   or signing/publishing fails.
+ *   identity key differs from the QR key, the new identity key is already in the
+ *   list, the current list fails verification or is older than `heldVersion`, or
+ *   signing/publishing fails.
  */
 export async function buildAndPublishLinkedList(
     args: BuildAndPublishLinkedListArgs,
@@ -154,6 +184,7 @@ export async function buildAndPublishLinkedList(
         primaryIdentityHandle,
         primaryBundleBytes,
         currentListBytes,
+        heldVersion = null,
         accountHandle,
     } = args;
 
@@ -190,6 +221,12 @@ export async function buildAndPublishLinkedList(
     } else {
         const verified = deviceListWasm.verify_device_list(currentListBytes, primaryPublicBytes);
         currentVersion = readVersion(verified);
+        // Verification proves the list was signed by the primary; it says nothing
+        // about freshness. Reject a rollback before signing, so a relay cannot
+        // make us re-sign an older list and resurrect revoked devices (§8.4).
+        if (heldVersion !== null && currentVersion < heldVersion) {
+            throw new Error('link request: current list is older than the version already held');
+        }
         const packedEntries = verified.subarray(VERSION_PREFIX_LEN);
         entries = toConversationDeviceList(currentVersion, packedEntries).devices.map(
             (device) => ({
@@ -200,14 +237,24 @@ export async function buildAndPublishLinkedList(
         );
     }
 
-    // 5. Append the new device at the next free id.
+    // 5. The new identity must not already be in the list. A duplicate identity
+    //    under two device ids makes `FanoutSession::establish_from_bundles` fail
+    //    for every sender, and re-adding a device under its old key is exactly
+    //    what §8.4 forbids. Device 0 is included in the comparison.
+    for (const entry of entries) {
+        if (bytesEqual(entry.identityKey, newDeviceIdentityKey)) {
+            throw new Error('link request: identity key is already present in the device list');
+        }
+    }
+
+    // 6. Append the new device at the next free id.
     const deviceId = nextDeviceId(entries);
     const nextEntries: DeviceListEntryInput[] = [
         ...entries,
         { deviceId, identityKey: newDeviceIdentityKey, bundleBytes: newDeviceBundle },
     ];
 
-    // 6. Sign the complete list at the next version.
+    // 7. Sign the complete list at the next version.
     const version = currentVersion + 1;
     const signedListBytes = deviceListWasm.sign_device_list(
         primaryIdentityHandle.private_bytes(),
@@ -215,7 +262,7 @@ export async function buildAndPublishLinkedList(
         packEntries(nextEntries),
     );
 
-    // 7. Publish the signed blob under the account handle.
+    // 8. Publish the signed blob under the account handle.
     await publishSignedDeviceList(transport, accountHandle, signedListBytes);
 
     return {
@@ -233,7 +280,7 @@ export async function buildAndPublishLinkedList(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/** Constant-time-ish byte equality for two byte arrays of any length. */
+/** Byte equality for two byte arrays. Not constant-time; identity keys are public. */
 function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     if (a.length !== b.length) return false;
     let diff = 0;
@@ -271,6 +318,16 @@ function packEntries(entries: DeviceListEntryInput[]): Uint8Array {
     const view = new DataView(out.buffer);
     let pos = 0;
     for (const entry of entries) {
+        // `setUint32` silently wraps, so an out-of-range id from a hostile list
+        // would pack as a different id (2^32 packs as 0, colliding with the
+        // primary and failing Rust structural validation). Reject instead.
+        if (
+            !Number.isSafeInteger(entry.deviceId) ||
+            entry.deviceId < 0 ||
+            entry.deviceId > 0xffffffff
+        ) {
+            throw new Error('device list: device id is out of range');
+        }
         view.setUint32(pos, entry.deviceId, true);
         pos += 4;
         view.setUint32(pos, entry.identityKey.length, true);

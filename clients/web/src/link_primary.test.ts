@@ -413,3 +413,154 @@ describe('buildAndPublishLinkedList missing bundle', () => {
         expect(mocks.sign_device_list).not.toHaveBeenCalled();
     });
 });
+
+// ---------------------------------------------------------------------------
+// buildAndPublishLinkedList — duplicate identity keys (BLOCKING 1)
+// ---------------------------------------------------------------------------
+
+describe('buildAndPublishLinkedList duplicate identity key', () => {
+    it('rejects and publishes nothing when the QR key is already in the list', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+        // The bundle genuinely belongs to DEVICE2_KEY, so the identity-binding
+        // check passes and the duplicate check is what rejects.
+        mocks.bundle_identity_key_bytes.mockReturnValue(DEVICE2_KEY);
+
+        // The version-7 list already carries DEVICE2_KEY at device 2.
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(DEVICE2_KEY),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: version7ListBytes(),
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/already present/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a QR naming the primary identity key (device 0 is compared too)', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+        mocks.bundle_identity_key_bytes.mockReturnValue(PRIMARY_PUBLIC);
+
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(PRIMARY_PUBLIC),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: version7ListBytes(),
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/already present/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a re-scan of a device that was already linked', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+        // A list that already contains NEW_KEY at device 3 (a prior successful link).
+        const listWithNewKey = encodeVerifiedList(8, [
+            { deviceId: 0, identityKey: PRIMARY_PUBLIC, bundleBytes: PRIMARY_BUNDLE },
+            { deviceId: 2, identityKey: DEVICE2_KEY, bundleBytes: DEVICE2_BUNDLE },
+            { deviceId: 3, identityKey: NEW_KEY, bundleBytes: NEW_BUNDLE },
+        ]);
+        mocks.verify_device_list.mockReturnValue(listWithNewKey);
+
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(NEW_KEY),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: listWithNewKey,
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/already present/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// buildAndPublishLinkedList — freshness / rollback (BLOCKING 2)
+// ---------------------------------------------------------------------------
+
+describe('buildAndPublishLinkedList held version', () => {
+    it('rejects a verified list older than the version already held', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+
+        // The relay serves a validly-signed v7 list while this device holds v9.
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(NEW_KEY),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: version7ListBytes(),
+                heldVersion: 9,
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/older than the version already held/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+
+    it('publishes version 8 when the held version matches the verified list', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+
+        const result = await buildAndPublishLinkedList({
+            transport: asTransport(transport),
+            qrPayload: qrPayloadFor(NEW_KEY),
+            primaryIdentityHandle: handle,
+            primaryBundleBytes: PRIMARY_BUNDLE,
+            currentListBytes: version7ListBytes(),
+            heldVersion: 7,
+            accountHandle: ACCOUNT_HANDLE,
+        });
+
+        expect(result.version).toBe(8);
+        expect(result.deviceId).toBe(3);
+        expect(transport.publishDiscovery).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// buildAndPublishLinkedList — hostile device ids (packing range check)
+// ---------------------------------------------------------------------------
+
+describe('buildAndPublishLinkedList device id range', () => {
+    it('rejects a list whose next device id would overflow u32', async () => {
+        const transport = makeTransport();
+        const { handle } = makeIdentityHandle();
+        const hostile = encodeVerifiedList(7, [
+            { deviceId: 0, identityKey: PRIMARY_PUBLIC, bundleBytes: PRIMARY_BUNDLE },
+            { deviceId: 0xffffffff, identityKey: DEVICE2_KEY, bundleBytes: DEVICE2_BUNDLE },
+        ]);
+        mocks.verify_device_list.mockReturnValue(hostile);
+
+        await expect(
+            buildAndPublishLinkedList({
+                transport: asTransport(transport),
+                qrPayload: qrPayloadFor(NEW_KEY),
+                primaryIdentityHandle: handle,
+                primaryBundleBytes: PRIMARY_BUNDLE,
+                currentListBytes: hostile,
+                accountHandle: ACCOUNT_HANDLE,
+            }),
+        ).rejects.toThrow(/out of range/);
+
+        expect(transport.publishDiscovery).not.toHaveBeenCalled();
+        expect(mocks.sign_device_list).not.toHaveBeenCalled();
+    });
+});
