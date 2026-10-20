@@ -21,11 +21,19 @@
  *  - **Safety-number confirmation** gate: the user must enter the safety
  *    number they see on the other device; a mismatch aborts the link (fail
  *    closed).
+ *  - **Safety-number panel** (MD-15): when the caller supplies the derived
+ *    `safetyNumber`, the screen renders it for out-of-band comparison and
+ *    gates authorization behind an explicit confirmation control. The
+ *    authorize action stays disabled until the user confirms, and the copy
+ *    labels the new device's confirmation "Step 2 of 2" — the new device
+ *    learns the primary key from the encrypted response, so its confirmation
+ *    is a separate step, never a one-step link.
  *
  * Security properties:
  *  - Fail closed: malformed payloads and mismatched safety numbers never
  *    reach the `linked` state.
  *  - No sensitive data in logs: key bytes and payloads are never logged.
+ *  - No raw key bytes in the DOM: only the derived safety number is rendered.
  *  - The safety number is re-derived from the raw key bytes on confirmation,
  *    not trusted from the QR payload alone.
  */
@@ -337,6 +345,16 @@ function QrCodeSvg({ payload }: { payload: string }): React.ReactElement {
 // DeviceLinking component
 // ---------------------------------------------------------------------------
 
+/**
+ * Group a safety number into blocks of five digits so two people can read it
+ * aloud and compare it without losing their place. Idempotent: an already
+ * grouped value (the wasm binding returns one) is re-grouped identically.
+ */
+export function formatSafetyNumber(raw: string): string {
+    const digits = raw.replace(/\s+/g, '');
+    return digits.replace(/(.{5})/g, '$1 ').trim();
+}
+
 export interface DeviceLinkingProps {
     localIdentityKey: Uint8Array;
     /**
@@ -353,18 +371,36 @@ export interface DeviceLinkingProps {
      * revoke controls do not render.
      */
     onRevokeDevice?: (deviceId: number) => void;
+    /**
+     * MD-15: the safety number this device must compare out-of-band with the
+     * other device before the link is authorised. OPTIONAL — without it no
+     * safety-number panel renders, so existing render sites that pass only
+     * `localIdentityKey` are unchanged. The value is the already-derived
+     * display string; raw key bytes are never accepted or rendered here.
+     */
+    safetyNumber?: string;
+    /**
+     * MD-15: called when the user has confirmed the safety number matches and
+     * activated the authorize control. The component only reports the intent;
+     * the caller performs the authorization. OPTIONAL — without it the
+     * authorize control does not render.
+     */
+    onConfirm?: () => void;
 }
 
 export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     localIdentityKey,
     deviceList,
     onRevokeDevice,
+    safetyNumber,
+    onConfirm,
 }) => {
     const [state, setState] = useState<LinkingState>(initialLinkingState());
     const [mode, setMode] = useState<'display' | 'scan' | null>(null);
     const [scanInput, setScanInput] = useState('');
     const [confirmInput, setConfirmInput] = useState('');
     const [wasmReady, setWasmReady] = useState(false);
+    const [safetyNumberConfirmed, setSafetyNumberConfirmed] = useState(false);
 
     useEffect(() => {
         let cancelled = false;
@@ -373,6 +409,12 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         });
         return () => { cancelled = true; };
     }, []);
+
+    // A new safety number is a new comparison: drop any earlier confirmation
+    // so a stale "matches" can never authorise a different key pair.
+    useEffect(() => {
+        setSafetyNumberConfirmed(false);
+    }, [safetyNumber]);
 
     const handleDisplay = async () => {
         setMode('display');
@@ -401,6 +443,13 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         setConfirmInput('');
     };
 
+    const handleAuthorize = () => {
+        // Fail closed: the control is disabled until confirmed, and a click
+        // that somehow reaches it must not authorise an unverified number.
+        if (!safetyNumber || !safetyNumberConfirmed) return;
+        onConfirm?.();
+    };
+
     if (!wasmReady) {
         return <div className="link-loading">Loading device-linking…</div>;
     }
@@ -411,6 +460,57 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                 <div role="alert" className="link-error">
                     {state.error}
                 </div>
+            )}
+
+            {safetyNumber && (
+                <section className="link-confirm-panel" aria-label="Safety number verification">
+                    <p className="link-intro-text">Step 2 of 2</p>
+                    <p className="link-intro-text">
+                        Compare this safety number with the one shown on the other device.
+                        The new device learns this account&rsquo;s key from the encrypted
+                        response, so its confirmation is a separate step.
+                    </p>
+                    <SealGlyph
+                        value={safetyNumber}
+                        size={72}
+                        tone="neutral"
+                        title="Safety number seal for this link"
+                    />
+                    <p data-testid="link-safety-number" className="link-safety-number">
+                        {formatSafetyNumber(safetyNumber)}
+                    </p>
+                    <label
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 'var(--space-2)',
+                            fontSize: 'var(--text-sm)',
+                            color: 'var(--text-secondary)',
+                            textAlign: 'left',
+                        }}
+                    >
+                        <input
+                            type="checkbox"
+                            checked={safetyNumberConfirmed}
+                            onChange={(e) => setSafetyNumberConfirmed(e.target.checked)}
+                            aria-label="Safety number matches on both devices"
+                        />
+                        The safety number matches on both devices
+                    </label>
+                    {onConfirm && (
+                        <div className="link-actions">
+                            <button
+                                type="button"
+                                className="link-button-primary"
+                                disabled={!safetyNumberConfirmed}
+                                style={!safetyNumberConfirmed ? { opacity: 0.5, cursor: 'not-allowed' } : undefined}
+                                onClick={handleAuthorize}
+                            >
+                                Authorize device
+                            </button>
+                        </div>
+                    )}
+                </section>
             )}
 
             {deviceList && (
@@ -506,7 +606,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
 
             {state.phase === 'linked' && (
                 <div className="link-success">
-                    <SealGlyph value={localIdentityKey.join(',')} size={56} tone="verified" title="Device linked" />
+                    <SealGlyph value="device-linked" size={56} tone="verified" title="Device linked" />
                     <p role="status">Device linked successfully!</p>
                     <button className="link-button-primary" onClick={handleAbort}>Link another device</button>
                 </div>
