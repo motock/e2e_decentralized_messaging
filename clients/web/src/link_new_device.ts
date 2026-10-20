@@ -58,11 +58,24 @@
  * still passes both checks. A caller must not treat the result as trusted
  * without an out-of-band confirmation (a short code the user compares on both
  * devices) before persisting the device list or showing the account handle.
+ *
+ * ## Verifying before persisting (MD-14)
+ *
+ * `verifyLinkResponse` is the boundary that turns a `LinkResponse` into the
+ * version, `DeviceList`, and safety number a caller can act on. It re-runs
+ * `verify_device_list` rather than trusting the object it is handed, converts
+ * the packed entries with the shared decoder, requires the assigned device id
+ * to be present in the verified list, and derives the safety number from
+ * `primaryPublicKey` and this device's own key. It **persists nothing**: the
+ * caller shows the safety number for the out-of-band comparison and only
+ * persists after the user confirms it (MD-16).
  */
 
 import * as wasm from '../../../core/bindings/wasm/pkg/index.js';
 import type { IdentityHandle, SessionHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import { RelayError, type RelayTransport } from './relay_transport';
+import { toConversationDeviceList } from './discovery';
+import type { DeviceList } from './Conversation';
 
 /**
  * The one binding this module needs that is not yet present in the checked-in
@@ -80,6 +93,12 @@ interface LocalBindings {
      * bound to another account, or a malformed blob.
      */
     verify_device_list(bytes: Uint8Array, expectedAccount: Uint8Array): Uint8Array;
+    /**
+     * Derive the out-of-band safety number two identity keys share
+     * (`core/crypto/src/device_qr.rs`). Symmetric in its arguments; throws if
+     * either key is not a serialized identity key.
+     */
+    derive_safety_number(localKey: Uint8Array, remoteKey: Uint8Array): string;
 }
 
 const localWasm = wasm as unknown as LocalBindings;
@@ -480,4 +499,129 @@ export async function awaitLinkResponse({
     const envelope = await pickupWithRetry(transport, linkKey, maxAttempts, delayMs, signal);
     const plaintext = wasm.decrypt_message(receiverSession, envelope);
     return parseLinkResponse(plaintext, newDevicePublicKey);
+}
+
+// ---------------------------------------------------------------------------
+// Verifying the response before anything is persisted (MD-14)
+// ---------------------------------------------------------------------------
+
+export interface VerifyLinkResponseOptions {
+    /** The response `awaitLinkResponse` returned. Treated as untrusted input. */
+    response: LinkResponse;
+    /**
+     * The device id this device was assigned. Must be a positive integer and
+     * must match the id the response reports.
+     */
+    expectedDeviceId: number;
+    /** This device's own 33-byte identity public key. */
+    localPublicKey: Uint8Array;
+}
+
+/** A link response whose device list has been re-verified and converted. */
+export interface VerifiedLinkResponse {
+    accountHandle: string;
+    deviceId: number;
+    /** The key that signed the list — *not* proven to be the legitimate primary. */
+    primaryKey: Uint8Array;
+    /** Version the verified list was signed at. */
+    version: number;
+    /** The verified, converted device list. */
+    deviceList: DeviceList;
+    /**
+     * Out-of-band code the user compares on both devices. Until it matches,
+     * nothing here may be persisted (MD-16).
+     */
+    safetyNumber: string;
+}
+
+/**
+ * Re-verify a link response's signed device list and convert it for display.
+ *
+ * `awaitLinkResponse` already verified the list, but this is a public boundary
+ * that accepts a caller-supplied object, so it verifies again rather than
+ * trusting the caller: `signedListBytes` must carry a valid signature by
+ * `response.primaryPublicKey`, and the verified list must contain the assigned
+ * device id with a well-formed identity key. Any failure throws — no partial
+ * result and no unverified `DeviceList` is ever returned.
+ *
+ * **This function persists nothing.** The response is not authenticated to the
+ * legitimate primary device (the QR carries no primary key), so the caller must
+ * show `safetyNumber` for an out-of-band comparison and only persist after the
+ * user confirms it (MD-16).
+ *
+ * @throws if the response is structurally invalid, the list fails verification,
+ *   the version prefix is truncated or out of range, the packed entries are
+ *   malformed, the assigned id is missing from the list, or the safety number
+ *   cannot be derived.
+ */
+export function verifyLinkResponse({
+    response,
+    expectedDeviceId,
+    localPublicKey,
+}: VerifyLinkResponseOptions): VerifiedLinkResponse {
+    if (response === null || typeof response !== 'object') {
+        throw new Error('link response must be an object');
+    }
+    const { accountHandle, deviceId, primaryPublicKey, signedListBytes } = response;
+
+    if (typeof accountHandle !== 'string' || accountHandle.length === 0) {
+        throw new Error('link response field "accountHandle" must be a non-empty string');
+    }
+    if (!Number.isSafeInteger(deviceId) || deviceId < 1) {
+        throw new Error('link response field "deviceId" must be a positive integer');
+    }
+    if (!Number.isSafeInteger(expectedDeviceId) || expectedDeviceId < 1) {
+        throw new Error('expectedDeviceId must be a positive integer');
+    }
+    if (!(primaryPublicKey instanceof Uint8Array) || primaryPublicKey.length !== IDENTITY_KEY_BYTES) {
+        throw new Error(`link response field "primaryPublicKey" must be a ${IDENTITY_KEY_BYTES}-byte Uint8Array`);
+    }
+    if (!(signedListBytes instanceof Uint8Array)) {
+        throw new Error('link response field "signedListBytes" must be a Uint8Array');
+    }
+    if (!(localPublicKey instanceof Uint8Array) || localPublicKey.length !== IDENTITY_KEY_BYTES) {
+        throw new Error(`localPublicKey must be a ${IDENTITY_KEY_BYTES}-byte Uint8Array`);
+    }
+
+    // 1. Re-verify. Any throw propagates: unverified bytes never become a list.
+    const verified = localWasm.verify_device_list(signedListBytes, primaryPublicKey);
+
+    // 2. Read the `u64_le` version prefix, bounds-checked.
+    if (!(verified instanceof Uint8Array) || verified.length < VERSION_PREFIX_LEN) {
+        throw new Error('link response: verified device list is truncated');
+    }
+    const view = new DataView(verified.buffer, verified.byteOffset, verified.byteLength);
+    const rawVersion = view.getBigUint64(0, true);
+    if (rawVersion > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error('link response: device list version is out of range');
+    }
+    const version = Number(rawVersion);
+
+    // 3. Convert the packed entries with the shared decoder.
+    const deviceList = toConversationDeviceList(version, verified.subarray(VERSION_PREFIX_LEN));
+
+    // 4. The list must contain the id the response reports *and* the id the
+    //    caller expects; a disagreement means the response is not for us.
+    if (deviceId !== expectedDeviceId) {
+        throw new Error('link response: assigned device id does not match the expected id');
+    }
+    const assigned = deviceList.devices.find((device) => device.deviceId === expectedDeviceId);
+    if (assigned === undefined) {
+        throw new Error('link response: verified device list does not contain the assigned device id');
+    }
+    if (!(assigned.identityKey instanceof Uint8Array) || assigned.identityKey.length !== IDENTITY_KEY_BYTES) {
+        throw new Error('link response: assigned device entry has a malformed identity key');
+    }
+
+    // 5. The out-of-band code the user compares before anything is persisted.
+    const safetyNumber = localWasm.derive_safety_number(primaryPublicKey, localPublicKey);
+
+    return {
+        accountHandle,
+        deviceId,
+        primaryKey: primaryPublicKey,
+        version,
+        deviceList,
+        safetyNumber,
+    };
 }
