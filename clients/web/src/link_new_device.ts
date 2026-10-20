@@ -65,10 +65,11 @@
  * version, `DeviceList`, and safety number a caller can act on. It re-runs
  * `verify_device_list` rather than trusting the object it is handed, converts
  * the packed entries with the shared decoder, requires the assigned device id
- * to be present in the verified list, and derives the safety number from
- * `primaryPublicKey` and this device's own key. It **persists nothing**: the
- * caller shows the safety number for the out-of-band comparison and only
- * persists after the user confirms it (MD-16).
+ * to be present in the verified list **and bound to this device's own identity
+ * key**, and derives the safety number from `primaryPublicKey` and that same
+ * local key. It **persists nothing**: the caller shows the safety number for
+ * the out-of-band comparison and only persists after the user confirms it
+ * (MD-16).
  */
 
 import * as wasm from '../../../core/bindings/wasm/pkg/index.js';
@@ -78,11 +79,13 @@ import { toConversationDeviceList } from './discovery';
 import type { DeviceList } from './Conversation';
 
 /**
- * The one binding this module needs that is not yet present in the checked-in
+ * The bindings this module needs that are not yet present in the checked-in
  * WASM package declarations (`clients/web/src/wasm-bindings.d.ts`). Declared
  * narrowly here and reached through a cast, mirroring how the rest of the web
  * client consumes not-yet-declared exports — the ambient declaration file is
- * deliberately left untouched.
+ * deliberately left untouched. `derive_safety_number` is *not* listed: it is
+ * already declared there (and in the generated package declarations), so it is
+ * called through the ambient type to avoid a duplicate declaration drifting.
  */
 interface LocalBindings {
     derive_link_key(publicKey: Uint8Array): string;
@@ -93,12 +96,6 @@ interface LocalBindings {
      * bound to another account, or a malformed blob.
      */
     verify_device_list(bytes: Uint8Array, expectedAccount: Uint8Array): Uint8Array;
-    /**
-     * Derive the out-of-band safety number two identity keys share
-     * (`core/crypto/src/device_qr.rs`). Symmetric in its arguments; throws if
-     * either key is not a serialized identity key.
-     */
-    derive_safety_number(localKey: Uint8Array, remoteKey: Uint8Array): string;
 }
 
 const localWasm = wasm as unknown as LocalBindings;
@@ -340,6 +337,31 @@ function listContainsDevice(
 }
 
 /**
+ * Validate the display-bound account handle.
+ *
+ * Shared by both response paths (`parseLinkResponse` and `verifyLinkResponse`)
+ * so the checks cannot drift: the handle is rendered in the linking UI, so it
+ * is bounded in length and free of control/bidi characters that would let an
+ * attacker spoof what the user reads while confirming the safety number.
+ */
+function validateAccountHandle(value: unknown): string {
+    if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new Error('link response field "accountHandle" must be a non-empty string');
+    }
+    if (value.length > MAX_ACCOUNT_HANDLE_LENGTH) {
+        throw new Error(
+            `link response field "accountHandle" must be at most ${MAX_ACCOUNT_HANDLE_LENGTH} characters`,
+        );
+    }
+    if (FORBIDDEN_HANDLE_CHARS.test(value)) {
+        throw new Error(
+            'link response field "accountHandle" must not contain control or bidi characters',
+        );
+    }
+    return value;
+}
+
+/**
  * Parse and validate the decrypted response payload.
  *
  * Fail closed: every field is checked — including the device list's signature
@@ -358,20 +380,7 @@ function parseLinkResponse(plaintext: Uint8Array, newDevicePublicKey: Uint8Array
     }
     const record = parsed as Record<string, unknown>;
 
-    const accountHandle = record.accountHandle;
-    if (typeof accountHandle !== 'string' || accountHandle.trim().length === 0) {
-        throw new Error('link response field "accountHandle" must be a non-empty string');
-    }
-    if (accountHandle.length > MAX_ACCOUNT_HANDLE_LENGTH) {
-        throw new Error(
-            `link response field "accountHandle" must be at most ${MAX_ACCOUNT_HANDLE_LENGTH} characters`,
-        );
-    }
-    if (FORBIDDEN_HANDLE_CHARS.test(accountHandle)) {
-        throw new Error(
-            'link response field "accountHandle" must not contain control or bidi characters',
-        );
-    }
+    const accountHandle = validateAccountHandle(record.accountHandle);
 
     const deviceId = record.deviceId;
     if (typeof deviceId !== 'number' || !Number.isInteger(deviceId) || deviceId < 1) {
@@ -541,32 +550,40 @@ export interface VerifiedLinkResponse {
  * that accepts a caller-supplied object, so it verifies again rather than
  * trusting the caller: `signedListBytes` must carry a valid signature by
  * `response.primaryPublicKey`, and the verified list must contain the assigned
- * device id with a well-formed identity key. Any failure throws — no partial
- * result and no unverified `DeviceList` is ever returned.
+ * device id bound to `localPublicKey` (byte-for-byte) with a well-formed
+ * identity key. The account handle is re-validated with the same display-bound
+ * rules as `parseLinkResponse`. Any failure throws — no partial result and no
+ * unverified `DeviceList` is ever returned.
  *
  * **This function persists nothing.** The response is not authenticated to the
  * legitimate primary device (the QR carries no primary key), so the caller must
  * show `safetyNumber` for an out-of-band comparison and only persist after the
  * user confirms it (MD-16).
  *
+ * **Version monotonicity is the caller's job.** `version` is returned as-is and
+ * is not compared against a held version (there is none at link bootstrap). The
+ * persisting caller (MD-16) must seed its held version from this value;
+ * otherwise a later rollback to an older signed list would be accepted as an
+ * update (spec/v0.md §8.4, cf. `discovery.ts`).
+ *
  * @throws if the response is structurally invalid, the list fails verification,
  *   the version prefix is truncated or out of range, the packed entries are
- *   malformed, the assigned id is missing from the list, or the safety number
- *   cannot be derived.
+ *   malformed, the assigned id is missing from the list or bound to another
+ *   key, or the safety number cannot be derived.
  */
 export function verifyLinkResponse({
     response,
     expectedDeviceId,
     localPublicKey,
 }: VerifyLinkResponseOptions): VerifiedLinkResponse {
-    if (response === null || typeof response !== 'object') {
+    if (response === null || typeof response !== 'object' || Array.isArray(response)) {
         throw new Error('link response must be an object');
     }
     const { accountHandle, deviceId, primaryPublicKey, signedListBytes } = response;
 
-    if (typeof accountHandle !== 'string' || accountHandle.length === 0) {
-        throw new Error('link response field "accountHandle" must be a non-empty string');
-    }
+    // Same display-bound validation as `parseLinkResponse`: the handle is shown
+    // to the user while they confirm the safety number.
+    validateAccountHandle(accountHandle);
     if (!Number.isSafeInteger(deviceId) || deviceId < 1) {
         throw new Error('link response field "deviceId" must be a positive integer');
     }
@@ -576,8 +593,20 @@ export function verifyLinkResponse({
     if (!(primaryPublicKey instanceof Uint8Array) || primaryPublicKey.length !== IDENTITY_KEY_BYTES) {
         throw new Error(`link response field "primaryPublicKey" must be a ${IDENTITY_KEY_BYTES}-byte Uint8Array`);
     }
+    if (primaryPublicKey[0] !== IDENTITY_KEY_TYPE_BYTE) {
+        throw new Error(
+            'link response field "primaryPublicKey" must be a type-tagged Curve25519 identity key (0x05)',
+        );
+    }
     if (!(signedListBytes instanceof Uint8Array)) {
         throw new Error('link response field "signedListBytes" must be a Uint8Array');
+    }
+    // Cap before the bytes reach WASM: an unbounded caller-supplied buffer is
+    // copied into the module, so a hostile caller could amplify memory.
+    if (signedListBytes.length > MAX_SIGNED_LIST_BYTES) {
+        throw new Error(
+            `link response field "signedListBytes" must be at most ${MAX_SIGNED_LIST_BYTES} bytes`,
+        );
     }
     if (!(localPublicKey instanceof Uint8Array) || localPublicKey.length !== IDENTITY_KEY_BYTES) {
         throw new Error(`localPublicKey must be a ${IDENTITY_KEY_BYTES}-byte Uint8Array`);
@@ -612,9 +641,21 @@ export function verifyLinkResponse({
     if (!(assigned.identityKey instanceof Uint8Array) || assigned.identityKey.length !== IDENTITY_KEY_BYTES) {
         throw new Error('link response: assigned device entry has a malformed identity key');
     }
+    // Bind the entry to *this* device. Without this, a validly-signed list could
+    // pair the assigned id with an attacker-chosen key: the caller would persist
+    // a list in which "this device" is the attacker's, while the safety number
+    // is still derived from the honest local key — so the out-of-band comparison
+    // would not cover the list entry it is supposed to vouch for.
+    if (!assigned.identityKey.every((byte, i) => byte === localPublicKey[i])) {
+        throw new Error(
+            'link response: assigned device entry identity key does not match this device',
+        );
+    }
 
     // 5. The out-of-band code the user compares before anything is persisted.
-    const safetyNumber = localWasm.derive_safety_number(primaryPublicKey, localPublicKey);
+    //    Symmetric in its arguments; derived from the honest local key, which is
+    //    why step 4 must bind the list entry to that same key.
+    const safetyNumber = wasm.derive_safety_number(primaryPublicKey, localPublicKey);
 
     return {
         accountHandle,

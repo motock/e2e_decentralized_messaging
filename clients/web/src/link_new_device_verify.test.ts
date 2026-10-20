@@ -311,6 +311,107 @@ describe('verifyLinkResponse — rejects unverified or inconsistent responses', 
     });
 });
 
+// ── Boundary hardening (review round 2) ─────────────────────────────────────
+//
+// `verifyLinkResponse` is the API MD-16 persists from, so every check
+// `parseLinkResponse` performs must hold here too — otherwise the gaps are
+// inherited by the persisting caller.
+
+describe('verifyLinkResponse — binds the assigned entry to this device', () => {
+    it('rejects a list whose assigned id carries a foreign identity key', () => {
+        // The list is validly signed by the primary, but "this device" at the
+        // assigned id is bound to an attacker-chosen key. The safety number is
+        // still derived from the honest local key, so accepting this would let
+        // the out-of-band comparison cover a list entry it does not describe.
+        const foreignBinding = signList(primaryPublicKey, 7, [
+            { deviceId: 1, identityKey: otherDeviceKey },
+            { deviceId: ASSIGNED_DEVICE_ID, identityKey: otherDeviceKey },
+        ]);
+
+        expect(() =>
+            verify({ response: makeResponse({ signedListBytes: foreignBinding }) }),
+        ).toThrow(/identity key/i);
+    });
+
+    it('rejects a foreign key that differs from the local key in one byte', () => {
+        const almostLocal = Uint8Array.from(localPublicKey);
+        almostLocal[almostLocal.length - 1] ^= 0x01;
+        const nearMiss = signList(primaryPublicKey, 7, [
+            { deviceId: ASSIGNED_DEVICE_ID, identityKey: almostLocal },
+        ]);
+
+        expect(() => verify({ response: makeResponse({ signedListBytes: nearMiss }) })).toThrow();
+    });
+
+    it('accepts the honest binding and returns this device key in the list', () => {
+        const result = verify();
+
+        const assigned = result.deviceList.devices.find(
+            (device) => device.deviceId === ASSIGNED_DEVICE_ID,
+        );
+        expect(assigned?.identityKey).toEqual(localPublicKey);
+    });
+});
+
+describe('verifyLinkResponse — validates the display-bound account handle', () => {
+    it('rejects a handle longer than 64 characters', () => {
+        expect(() =>
+            verify({ response: makeResponse({ accountHandle: 'a'.repeat(65) }) }),
+        ).toThrow(/accountHandle/);
+    });
+
+    it('accepts a handle of exactly 64 characters', () => {
+        expect(verify({ response: makeResponse({ accountHandle: 'a'.repeat(64) }) }).accountHandle)
+            .toHaveLength(64);
+    });
+
+    it('rejects a handle containing bidi overrides or control characters', () => {
+        for (const handle of ['al\u202eice', 'al\u2066ice', 'al\u0000ice', 'al\u009bice']) {
+            expect(() =>
+                verify({ response: makeResponse({ accountHandle: handle }) }),
+            ).toThrow(/accountHandle/);
+        }
+    });
+
+    it('rejects a whitespace-only handle', () => {
+        expect(() => verify({ response: makeResponse({ accountHandle: '   ' }) })).toThrow(
+            /accountHandle/,
+        );
+    });
+});
+
+describe('verifyLinkResponse — bounds the untrusted inputs', () => {
+    it('rejects a signed list larger than 64 KiB before verifying it', () => {
+        const payload = new Uint8Array(64 * 1024 + 1);
+        const oversized = Uint8Array.from([...payload, ...signature(payload, primaryPublicKey)]);
+
+        expect(() =>
+            verify({ response: makeResponse({ signedListBytes: oversized }) }),
+        ).toThrow(/signedListBytes/);
+        expect(mocks.verify_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a primary key without the identity-key type byte', () => {
+        const wrongType = Uint8Array.from(primaryPublicKey);
+        wrongType[0] = 0x02;
+
+        expect(() =>
+            verify({ response: makeResponse({ primaryPublicKey: wrongType }) }),
+        ).toThrow(/primaryPublicKey/);
+        expect(mocks.verify_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects an array posing as a response object', () => {
+        expect(() =>
+            verifyLinkResponse({
+                response: [] as unknown as Parameters<typeof verifyLinkResponse>[0]['response'],
+                expectedDeviceId: ASSIGNED_DEVICE_ID,
+                localPublicKey,
+            }),
+        ).toThrow(/object/);
+    });
+});
+
 // ── No persistence ──────────────────────────────────────────────────────────
 
 describe('verifyLinkResponse — persists nothing', () => {
