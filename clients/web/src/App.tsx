@@ -367,6 +367,12 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
     const [accountDeviceLink, setAccountDeviceLink] = React.useState<AccountDeviceLink | null>(
         null,
     );
+    // MF-2: this device's id in the account's signed list, as persisted by the
+    // linking handshake. `null` means "not resolved yet" — deliberately NOT 0,
+    // so a linked device never flashes the primary-only revoke control while
+    // the record is still being read. A missing, unreadable or malformed record
+    // resolves to 0 (the primary), matching the pre-MF-2 behaviour.
+    const [currentDeviceId, setCurrentDeviceId] = React.useState<number | null>(null);
     React.useEffect(() => {
         if (!identity || !sessionGate) return;
         let cancelled = false;
@@ -384,7 +390,15 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                 // so nothing about it is logged.
                 link = null;
             }
-            if (!cancelled) setAccountDeviceLink(link);
+            if (!cancelled) {
+                setAccountDeviceLink(link);
+                // MF-2: only a structurally valid record carries a usable id.
+                // Everything else (no record, unreadable, malformed, missing or
+                // non-integer id) is the primary, device 0. The fallback lives
+                // here — in the missing/malformed/error path — and never in a
+                // `finally`, which would overwrite a successfully loaded id.
+                setCurrentDeviceId(link ? link.deviceId : 0);
+            }
         })();
         return () => {
             cancelled = true;
@@ -885,7 +899,21 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                 // shortcut). `handleRevokeDevice`
                                                 // picks the path from whether a
                                                 // signed own list is held.
-                                                onRevokeDevice={handleRevokeDevice}
+                                                // MF-2: only the primary device
+                                                // (id 0) holds the account's
+                                                // primary signing key, so only it
+                                                // can re-sign and publish a
+                                                // revocation. A linked device gets
+                                                // NO callback at all — the prop is
+                                                // absent, so DeviceLinking renders
+                                                // no revoke control. `null` means
+                                                // the persisted id is not resolved
+                                                // yet: fail closed, no control.
+                                                onRevokeDevice={
+                                                    currentDeviceId === 0
+                                                        ? handleRevokeDevice
+                                                        : undefined
+                                                }
                                                 // MD-17: hand the primary scan path
                                                 // the exact signed bytes and version
                                                 // App holds so it can enforce §8.4
