@@ -443,24 +443,62 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         };
     }, [identity, conn.receiverSession, discoveryTransport, holdOwnList]);
 
-    // MD-17: the version App holds for each PEER's list, keyed by peer id. The
-    // §8.4 baseline must be per account: comparing a peer's version against
-    // this account's own list (or another peer's) would reject a fresh
-    // version-1 list from a new peer and compare unrelated accounts.
-    const peerListVersionsRef = React.useRef(new Map<string, number>());
+    // MD-17: the list App holds for each PEER, keyed by peer id. ONE map holds
+    // both the devices and the version they were signed at, so the §8.4
+    // baseline and the list it guards can never diverge. The baseline must be
+    // per account: comparing a peer's version against this account's own list
+    // (or another peer's) would reject a fresh version-1 list from a new peer
+    // and compare unrelated accounts.
+    const peerListsRef = React.useRef(new Map<string, DeviceList>());
+    // The peer the recipient `deviceList` currently belongs to. Only a genuine
+    // switch may reset the list: re-reporting the SAME peer's key must not
+    // clear a list that the monotonic lookup would then decline to re-apply.
+    // The account is tracked alongside the peer so a per-peer baseline left
+    // over from a previous account cannot reject a fresh list for the same
+    // peer id.
+    const recipientListOwnerRef = React.useRef<{
+        account: string | null;
+        peer: string;
+    } | null>(null);
 
     // MD-17: when Conversation reports a peer's real remote identity key, fetch
     // that peer's signed list and apply it only when strictly newer than the
     // list held FOR THAT PEER (§8.4). A verification failure leaves the held
     // list untouched and never throws out of render.
     React.useEffect(() => {
-        if (!remoteIdentityKey) return;
         const peerId = activePeerId;
-        if (!peerId) return;
+        const account = identity?.recipientId ?? null;
+        const owner = recipientListOwnerRef.current;
+        // Switching peers must never leave the PREVIOUS peer's devices in the
+        // recipient list: Conversation fans a 1:1 send out to every device in
+        // it, so a stale list would encrypt the envelopes to the old peer's
+        // bundles while addressing them to the new peer — undecryptable, and
+        // the message is lost. Reset BEFORE the lookup and independently of its
+        // result: to the list already held for the NEW peer (switching back
+        // must not drop devices the monotonic lookup would decline to
+        // re-apply), else to the injected baseline.
+        //
+        // Only a switch AWAY from a real peer resets. The first peer to become
+        // active is not a switch — there is no previous peer's list to clear —
+        // and resetting there would resurrect devices revoked from the held
+        // list by restoring the (static) injected baseline.
+        const peerChanged = owner !== null && owner.peer !== '' && owner.peer !== peerId;
+        const accountChanged = owner !== null && owner.account !== account;
+        // Track the owner on EVERY run, so the next run compares against the
+        // peer actually held rather than the last one that triggered a reset.
+        recipientListOwnerRef.current = { account, peer: peerId };
+        if (owner === null || peerChanged || accountChanged) {
+            // A baseline from another account is meaningless for this one.
+            if (accountChanged) peerListsRef.current.clear();
+            setDeviceList(
+                (peerId ? peerListsRef.current.get(peerId) : undefined) ?? deviceListProp,
+            );
+        }
+        if (!remoteIdentityKey || !peerId) return;
         let cancelled = false;
         (async () => {
             try {
-                const heldVersion = peerListVersionsRef.current.get(peerId) ?? null;
+                const heldVersion = peerListsRef.current.get(peerId)?.version ?? null;
                 const verified = await lookupDeviceList(
                     discoveryTransport,
                     peerId,
@@ -468,16 +506,17 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                     heldVersion,
                 );
                 if (cancelled || !verified) return;
-                peerListVersionsRef.current.set(peerId, verified.version);
                 // Set the recipient's list directly: the per-peer baseline
                 // above already proved this list is newer than the one held for
                 // this peer, and comparing against the shared state would
                 // reject a peer's fresh list whenever another account's list
                 // happened to be newer.
-                setDeviceList({
+                const next: DeviceList = {
                     version: verified.deviceList.version,
                     devices: verified.deviceList.devices,
-                });
+                };
+                peerListsRef.current.set(peerId, next);
+                setDeviceList(next);
             } catch {
                 // Unverified peer list: keep the held list, swallow the error.
             }
@@ -485,7 +524,13 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         return () => {
             cancelled = true;
         };
-    }, [remoteIdentityKey, activePeerId, discoveryTransport]);
+    }, [
+        remoteIdentityKey,
+        activePeerId,
+        discoveryTransport,
+        deviceListProp,
+        identity?.recipientId,
+    ]);
 
     // DR-6b: the LIVE sender-side fan-out session over the linked devices,
     // kept in lockstep with the held list so a revoke can call

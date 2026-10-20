@@ -438,4 +438,75 @@ describe('App device discovery (MD-17)', () => {
         expect(relay.published[0].blob[0]).toBe(2);
         expect(decodePacked(relay.published[0].blob.slice(1))).toHaveLength(2);
     });
+
+    test('switching to a peer with no list clears the previous peer\'s devices', async () => {
+        // Regression guard: `deviceList` is the RECIPIENT's list and
+        // Conversation fans a 1:1 send out to every device in it. If the
+        // previous peer's list survives a peer switch, the envelopes are
+        // encrypted to the OLD peer's bundles but addressed to the NEW peer's
+        // id — the new peer cannot decrypt and the message is lost.
+        relay.byHandle.set('peer-a', signedBlob(2, [dev0, dev1]));
+
+        await renderApp();
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+
+        // peer-b has published nothing: the held list must not survive.
+        await reportPeer('peer-b', new Uint8Array(33).fill(8));
+        await waitFor(() => expect(lastConv()?.deviceList).toBeUndefined());
+    });
+
+    test('switching to a peer with an older list replaces the previous peer\'s devices', async () => {
+        // The new peer's own list is applied even though its version is LOWER
+        // than the previous peer's: the §8.4 baseline is per account, and the
+        // previous peer's devices must never be fanned out to.
+        relay.byHandle.set('peer-a', signedBlob(5, [dev0, dev1, dev2]));
+        relay.byHandle.set('peer-b', signedBlob(1, [dev0]));
+
+        await renderApp();
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(5));
+
+        await reportPeer('peer-b', new Uint8Array(33).fill(8));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(1));
+        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0]);
+    });
+
+    test('switching back to a peer restores the list held for that peer', async () => {
+        // Clearing on switch must not throw away a list we already verified:
+        // the monotonic lookup would return null for the version we hold, so
+        // the peer's own devices would be lost until the list is bumped.
+        relay.byHandle.set('peer-a', signedBlob(2, [dev0, dev1]));
+        relay.byHandle.set('peer-b', signedBlob(1, [dev0]));
+
+        await renderApp();
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+
+        await reportPeer('peer-b', new Uint8Array(33).fill(8));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(1));
+
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0, 1]);
+    });
+
+    test('re-reporting the same peer\'s key keeps the held list', async () => {
+        // The reset must fire only on a GENUINE peer switch. Clearing on every
+        // key report would drop a list the monotonic lookup then declines to
+        // re-apply (same version), silently losing fan-out to that peer's
+        // linked devices.
+        relay.byHandle.set('peer-a', signedBlob(2, [dev0, dev1]));
+
+        await renderApp();
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+
+        // Conversation re-reports the same peer and key (e.g. after a
+        // reconnect). The relay still serves version 2, which is not newer.
+        await reportPeer('peer-a', new Uint8Array(33).fill(7));
+
+        expect(lastConv().deviceList.version).toBe(2);
+        expect(lastConv().deviceList.devices.map((d: any) => d.deviceId)).toEqual([0, 1]);
+    });
 });
