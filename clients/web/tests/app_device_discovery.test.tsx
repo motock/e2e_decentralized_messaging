@@ -248,6 +248,26 @@ describe('App device discovery (MD-17)', () => {
         expect(lastLink().heldListVersion).toBe(1);
     });
 
+    test('a newer peer list replaces the held one', async () => {
+        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
+        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
+        relay.defaultBlob = signedBlob(2, [dev0, dev1]);
+
+        await renderApp();
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+
+        // The peer's real identity key arrives; the relay serves a NEWER list.
+        const peerKey = new Uint8Array(33).fill(7);
+        relay.byHandle.set('peer-handle', signedBlob(3, [dev0, dev1]));
+
+        act(() => {
+            lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
+        });
+
+        await waitFor(() => expect(lastConv().deviceList.version).toBe(3));
+        expect(lastConv().deviceList.devices).toHaveLength(2);
+    });
+
     test('an older peer list does not replace the held one', async () => {
         const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
         const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
@@ -281,20 +301,31 @@ describe('App device discovery (MD-17)', () => {
         await renderApp();
         await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
 
-        const peerKey = new Uint8Array(33).fill(7);
-        relay.throwFor = peerKey;
-        relay.byHandle.set('peer-handle', signedBlob(9, [dev0]));
+        // Any rejection that escapes the effect (rather than being swallowed)
+        // is recorded here — the effect must contain the verification failure.
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => unhandled.push(reason);
+        process.on('unhandledRejection', onUnhandled);
 
-        // Must not throw out of render/act.
-        act(() => {
-            lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
-        });
-        await act(async () => {
-            await Promise.resolve();
-        });
+        try {
+            const peerKey = new Uint8Array(33).fill(7);
+            relay.throwFor = peerKey;
+            relay.byHandle.set('peer-handle', signedBlob(9, [dev0]));
 
-        expect(lastConv().deviceList.version).toBe(2);
-        expect(lastConv().deviceList.devices).toHaveLength(2);
+            // Must not throw out of render/act.
+            act(() => {
+                lastConv().onRemoteIdentityKeyChange('peer-handle', peerKey);
+            });
+            await act(async () => {
+                await Promise.resolve();
+            });
+
+            expect(lastConv().deviceList.version).toBe(2);
+            expect(lastConv().deviceList.devices).toHaveLength(2);
+            expect(unhandled).toEqual([]);
+        } finally {
+            process.off('unhandledRejection', onUnhandled);
+        }
     });
 
     test('heldListVersion is never undefined while a list is held', async () => {
@@ -308,5 +339,23 @@ describe('App device discovery (MD-17)', () => {
         expect(lastLink().heldListVersion).not.toBeNull();
         expect(typeof lastLink().heldListVersion).toBe('number');
         expect(lastLink().heldListVersion).toBe(lastConv().deviceList.version);
+    });
+
+    test('held bytes match the fetched list when the relay already holds one', async () => {
+        const dev0 = { deviceId: 0, identityKey: new Uint8Array(33).fill(1), bundleBytes: BUNDLE };
+        const dev1 = { deviceId: 1, identityKey: new Uint8Array(33).fill(2), bundleBytes: BUNDLE };
+        const blob = signedBlob(2, [dev0, dev1]);
+        relay.defaultBlob = blob;
+
+        await renderApp();
+        await waitFor(() => expect(lastConv()?.deviceList?.version).toBe(2));
+
+        fireEvent.click(screen.getByRole('button', { name: 'Link' }));
+        await waitFor(() => expect(lastLink()).toBeTruthy());
+
+        // The bytes handed to DeviceLinking are the exact blob that produced
+        // the held version — never a stale/absent pair.
+        expect(lastLink().currentListBytes).toEqual(blob);
+        expect(lastLink().heldListVersion).toBe(2);
     });
 });

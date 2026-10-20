@@ -207,6 +207,33 @@ function packDeviceListEntries(entries: DeviceListEntry[]): Uint8Array {
 const DEVICE_LIST_INITIAL_VERSION = 1;
 
 /**
+ * Wrap a discovery transport so the raw blob the last `lookupDiscovery` saw is
+ * observable.
+ *
+ * `lookupDeviceList` verifies and converts a blob but does not hand back the
+ * signed bytes, and App must keep the exact bytes it holds (for MD-18
+ * revocation and DeviceLinking's freshness guard). Recording them here keeps
+ * the held bytes and the held version in lockstep with a single fetch, without
+ * changing discovery.ts's contract.
+ */
+function recordingDiscovery(inner: DiscoveryTransport): {
+    transport: DiscoveryTransport;
+    lastBlob: () => Uint8Array | null;
+} {
+    let blob: Uint8Array | null = null;
+    return {
+        transport: {
+            publishDiscovery: (handle, bytes) => inner.publishDiscovery(handle, bytes),
+            lookupDiscovery: async (handle) => {
+                blob = await inner.lookupDiscovery(handle);
+                return blob;
+            },
+        },
+        lastBlob: () => blob,
+    };
+}
+
+/**
  * Build, sign and publish the account's initial (version 1) device list
  * containing only device 0 — this device — and return the signed bytes plus
  * the entry that was published.
@@ -312,8 +339,9 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         let cancelled = false;
         (async () => {
             try {
+                const recorder = recordingDiscovery(discoveryTransport);
                 const verified = await lookupDeviceList(
-                    discoveryTransport,
+                    recorder.transport,
                     identity.recipientId,
                     identity.publicBytes,
                     // No list held yet on this path: ask for anything the relay
@@ -322,6 +350,9 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                 );
                 if (cancelled) return;
                 if (verified) {
+                    // Keep the exact signed bytes alongside the version so the
+                    // two never diverge (MD-18 re-signs from these bytes).
+                    setHeldListBytes(recorder.lastBlob());
                     setDeviceList((held) => applyDeviceListUpdate(held, verified.deviceList));
                     return;
                 }
