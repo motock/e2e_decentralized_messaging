@@ -378,6 +378,37 @@ describe('verifyLinkResponse — validates the display-bound account handle', ()
             /accountHandle/,
         );
     });
+
+    it('rejects a handle containing a zero-width character', () => {
+        // U+200B renders as nothing, so "ali\u200Bce" and "alice" look identical
+        // while comparing unequal — a handle-spoofing vector.
+        expect(() =>
+            verify({ response: makeResponse({ accountHandle: 'ali\u200Bce' }) }),
+        ).toThrow(/accountHandle/);
+    });
+
+    it('rejects a handle containing a zero-width no-break space', () => {
+        expect(() =>
+            verify({ response: makeResponse({ accountHandle: 'ali\uFEFFce' }) }),
+        ).toThrow(/accountHandle/);
+    });
+
+    it('rejects a handle containing an Arabic letter mark', () => {
+        expect(() =>
+            verify({ response: makeResponse({ accountHandle: 'ali\u061Cce' }) }),
+        ).toThrow(/accountHandle/);
+    });
+
+    it('rejects a handle containing a line separator', () => {
+        expect(() =>
+            verify({ response: makeResponse({ accountHandle: 'ali\u2028ce' }) }),
+        ).toThrow(/accountHandle/);
+    });
+
+    it('returns the handle trimmed so padded and unpadded handles compare equal', () => {
+        expect(verify({ response: makeResponse({ accountHandle: '  alice  ' }) }).accountHandle)
+            .toBe('alice');
+    });
 });
 
 describe('verifyLinkResponse — bounds the untrusted inputs', () => {
@@ -398,6 +429,14 @@ describe('verifyLinkResponse — bounds the untrusted inputs', () => {
         expect(() =>
             verify({ response: makeResponse({ primaryPublicKey: wrongType }) }),
         ).toThrow(/primaryPublicKey/);
+        expect(mocks.verify_device_list).not.toHaveBeenCalled();
+    });
+
+    it('rejects a local key without the identity-key type byte', () => {
+        const wrongType = Uint8Array.from(localPublicKey);
+        wrongType[0] = 0x04;
+
+        expect(() => verify({ localPublicKey: wrongType })).toThrow(/localPublicKey/);
         expect(mocks.verify_device_list).not.toHaveBeenCalled();
     });
 

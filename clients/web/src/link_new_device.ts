@@ -211,8 +211,20 @@ const MAX_SIGNED_LIST_BYTES = 64 * 1024;
 /** Bytes of the `u64_le` version prefix `verify_device_list` prepends. */
 const VERSION_PREFIX_LEN = 8;
 const HEX_PATTERN = /^[0-9a-fA-F]+$/;
-/** C0/C1 control characters and bidi overrides: handle-spoofing and XSS vectors. */
-const FORBIDDEN_HANDLE_CHARS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+/**
+ * Characters that must never reach the handle the user reads.
+ *
+ *  - C0/C1 controls: terminal escapes and XSS vectors.
+ *  - U+061C (Arabic letter mark), U+200E/U+200F (LRM/RLM), U+202A-U+202E and
+ *    U+2066-U+2069 (bidi embeddings/overrides/isolates): reorder the rendered
+ *    text so the handle can read as something other than what it is.
+ *  - U+200B-U+200D (zero-width space/joiners): invisible, so they let two
+ *    distinct handles render identically.
+ *  - U+2028/U+2029 (line/paragraph separators) and U+FEFF (zero-width no-break
+ *    space): line breaks and invisible padding in a single-line label.
+ */
+const FORBIDDEN_HANDLE_CHARS =
+    /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -341,24 +353,35 @@ function listContainsDevice(
  *
  * Shared by both response paths (`parseLinkResponse` and `verifyLinkResponse`)
  * so the checks cannot drift: the handle is rendered in the linking UI, so it
- * is bounded in length and free of control/bidi characters that would let an
- * attacker spoof what the user reads while confirming the safety number.
+ * is bounded in length and free of control/bidi/zero-width characters that
+ * would let an attacker spoof what the user reads while confirming the safety
+ * number.
+ *
+ * The returned handle is **trimmed**: surrounding whitespace is never part of
+ * the label, and returning it verbatim would let `" alice"` and `"alice"` — which
+ * render identically — compare unequal downstream. The forbidden-character
+ * check runs on the raw value first, so a forbidden character at either edge is
+ * rejected rather than silently trimmed away.
  */
 function validateAccountHandle(value: unknown): string {
-    if (typeof value !== 'string' || value.trim().length === 0) {
+    if (typeof value !== 'string') {
         throw new Error('link response field "accountHandle" must be a non-empty string');
-    }
-    if (value.length > MAX_ACCOUNT_HANDLE_LENGTH) {
-        throw new Error(
-            `link response field "accountHandle" must be at most ${MAX_ACCOUNT_HANDLE_LENGTH} characters`,
-        );
     }
     if (FORBIDDEN_HANDLE_CHARS.test(value)) {
         throw new Error(
             'link response field "accountHandle" must not contain control or bidi characters',
         );
     }
-    return value;
+    const handle = value.trim();
+    if (handle.length === 0) {
+        throw new Error('link response field "accountHandle" must be a non-empty string');
+    }
+    if (handle.length > MAX_ACCOUNT_HANDLE_LENGTH) {
+        throw new Error(
+            `link response field "accountHandle" must be at most ${MAX_ACCOUNT_HANDLE_LENGTH} characters`,
+        );
+    }
+    return handle;
 }
 
 /**
@@ -582,8 +605,9 @@ export function verifyLinkResponse({
     const { accountHandle, deviceId, primaryPublicKey, signedListBytes } = response;
 
     // Same display-bound validation as `parseLinkResponse`: the handle is shown
-    // to the user while they confirm the safety number.
-    validateAccountHandle(accountHandle);
+    // to the user while they confirm the safety number. The validated value is
+    // the trimmed one, so it is what gets returned below.
+    const validatedHandle = validateAccountHandle(accountHandle);
     if (!Number.isSafeInteger(deviceId) || deviceId < 1) {
         throw new Error('link response field "deviceId" must be a positive integer');
     }
@@ -610,6 +634,14 @@ export function verifyLinkResponse({
     }
     if (!(localPublicKey instanceof Uint8Array) || localPublicKey.length !== IDENTITY_KEY_BYTES) {
         throw new Error(`localPublicKey must be a ${IDENTITY_KEY_BYTES}-byte Uint8Array`);
+    }
+    // Fail here rather than in downstream crypto: a key that is not a
+    // type-tagged Curve25519 identity key cannot be this device's own key, so
+    // the binding check below would be comparing against garbage.
+    if (localPublicKey[0] !== IDENTITY_KEY_TYPE_BYTE) {
+        throw new Error(
+            'localPublicKey must be a type-tagged Curve25519 identity key (0x05)',
+        );
     }
 
     // 1. Re-verify. Any throw propagates: unverified bytes never become a list.
@@ -658,7 +690,7 @@ export function verifyLinkResponse({
     const safetyNumber = wasm.derive_safety_number(primaryPublicKey, localPublicKey);
 
     return {
-        accountHandle,
+        accountHandle: validatedHandle,
         deviceId,
         primaryKey: primaryPublicKey,
         version,
