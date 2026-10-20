@@ -100,10 +100,16 @@ These headers complement the CSP meta tag and provide additional protection when
 - For more context on the reduced threat model and how it affects multi-device usage, see [PLAN.md §5](../PLAN.md) (the same link-rather-than-restate convention used in `docs/two-machine-testing.md`).
 
 React app consuming the shared Rust core via WASM bindings (`core/bindings/wasm`).
-Current state: identity, sessions, message history, safety-number verification, and relay
-transport are implemented and covered by the Vitest suite. Target state (not yet built):
-multi-device sync and any native (non-browser) platform — see [PLAN.md §6.5](../PLAN.md) for
-the current-state vs target-state breakdown.
+Current state: identity, sessions, message history, safety-number verification, relay
+transport, and multi-device linking and revocation are implemented and covered by the Vitest
+suite. Device linking is a two-step confirmation flow: the primary fetches the signed device
+list through `lookup_discovery`, binds the fetched bundle identity to the scanned QR key, and
+fails closed on a mismatch; both devices display the same safety number before authorization,
+with the primary confirming first and the new device learning the primary key from the
+encrypted response before its second confirmation. Revocation publishes a signed device list
+with the version incremented by one through `publish_discovery`. Target state (not yet built):
+multi-device history sync and any native (non-browser) platform — see [PLAN.md §6.5](../PLAN.md)
+for the current-state vs target-state breakdown.
 See PLAN.md §5 for the documented reduced threat model on web (no secure enclave): the app
 shows a warning about it before first use, and browser key storage is weaker than on
 mobile/desktop by design of the platform, not by omission in this client.
