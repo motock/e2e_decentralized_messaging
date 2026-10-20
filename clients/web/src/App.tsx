@@ -631,6 +631,13 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
     // future DiscoveryRecord transport) the local shortcut still applies: drop
     // the device from the held list and call `fanout_remove_device` on the live
     // handle. An id that is not in the list is a no-op.
+    //
+    // MF-1: a failed revoke must be VISIBLE, not swallowed. The message is
+    // deliberately generic — the thrown error names the structural failure
+    // (unverifiable list, publish failure) but must never reach the UI, where
+    // it could leak relay detail or be mistaken for success. Cleared on the
+    // next successful revoke.
+    const [revokeError, setRevokeError] = React.useState<string | null>(null);
     const handleRevokeDevice = React.useCallback(
         async (deviceId: number) => {
             const heldOwn = ownListRef.current;
@@ -649,15 +656,21 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                         bytes: signedListBytes,
                         devices: next.devices,
                     });
+                    setRevokeError(null);
                 } catch {
                     // Fail closed: an unverifiable list or a failed publish
-                    // leaves whatever is already held untouched.
+                    // leaves whatever is already held untouched. Surface the
+                    // failure generically (MF-1) — never the thrown message.
+                    setRevokeError(
+                        'Device revocation failed; the device is still trusted by peers',
+                    );
                 }
                 return;
             }
             if (!isListedDevice(deviceList, deviceId)) return;
             setDeviceList((held) => (held ? removeDeviceFromList(held, deviceId) : held));
             if (fanoutSession) revokeDeviceOnSession(fanoutSession, deviceId);
+            setRevokeError(null);
         },
         [deviceList, fanoutSession, identity, discoveryTransport, holdOwnList],
     );
@@ -840,6 +853,14 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                 )}
                                 {view === 'link' && (
                                     <SafetyNumberErrorBoundary>
+                                        {revokeError && (
+                                            <div className="advisory" role="alert">
+                                                <span className="advisory-mark" aria-hidden="true">
+                                                    ERROR
+                                                </span>
+                                                <p className="advisory-text">{revokeError}</p>
+                                            </div>
+                                        )}
                                         {identity && (
                                             <DeviceLinking
                                                 localIdentityKey={identity.publicBytes}
