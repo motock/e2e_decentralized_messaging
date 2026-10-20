@@ -373,3 +373,94 @@ function packEntries(entries: DeviceListEntryInput[]): Uint8Array {
     }
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// Sending the encrypted link response (MD-12)
+// ---------------------------------------------------------------------------
+
+/** The transport surface sending the link response needs. `RelayTransport` satisfies it. */
+export interface LinkResponseTransport {
+    /** Send an envelope to the relay store for later pickup. */
+    sendEnvelope(recipientId: string, envelope: Uint8Array): Promise<void>;
+}
+
+/** Arguments to {@link sendLinkResponse}. */
+export interface SendLinkResponseArgs {
+    /** Relay transport used to deliver the encrypted response. */
+    transport: LinkResponseTransport;
+    /** Relay handle the new device is polling for its response. */
+    linkKey: string;
+    /** The new device's prekey bundle, as fetched from the relay. */
+    newDeviceBundle: Uint8Array;
+    /** The account primary's identity handle (establishes the sender session). */
+    primaryIdentityHandle: IdentityHandle;
+    /** Account handle the new device joins. */
+    accountHandle: string;
+    /** Device id assigned to the new device in the signed list. */
+    deviceId: number;
+    /** The signed device list blob the new device verifies. */
+    signedListBytes: Uint8Array;
+}
+
+/** Lowercase hex for a byte array. Identity keys and signed lists are public. */
+function bytesToHex(bytes: Uint8Array): string {
+    let out = '';
+    for (const byte of bytes) {
+        out += byte.toString(16).padStart(2, '0');
+    }
+    return out;
+}
+
+/**
+ * Send the new device the encrypted link response (spec/v0.md §8.3).
+ *
+ * Steps, in order:
+ *  1. establish a *sender* session from the new device's bundle with the
+ *     primary's identity handle — a malformed bundle throws here, before
+ *     anything is encrypted or sent;
+ *  2. build the response payload `{accountHandle, deviceId,
+ *     primaryPublicKeyHex, signedListBytesHex}` and encode it as UTF-8 JSON.
+ *     `primaryPublicKeyHex` is the primary's identity public key: it is what
+ *     the new device verifies the signed list against and derives the safety
+ *     number from;
+ *  3. encrypt the payload with the ratchet;
+ *  4. send **only the ciphertext** to the relay under the derived link key.
+ *
+ * The plaintext never leaves this function: it is not returned, not attached to
+ * the envelope, and never logged. Errors from session establishment, encryption,
+ * or the send propagate unchanged, so a failure sends nothing.
+ *
+ * @throws if the bundle is malformed or its prekey signatures do not verify, if
+ *   encryption fails, or if the relay rejects the send.
+ */
+export async function sendLinkResponse(args: SendLinkResponseArgs): Promise<void> {
+    const {
+        transport,
+        linkKey,
+        newDeviceBundle,
+        primaryIdentityHandle,
+        accountHandle,
+        deviceId,
+        signedListBytes,
+    } = args;
+
+    await ensureWasmInit();
+
+    // 1. Sender session against the new device's bundle.
+    const session = wasm.establish_session_from_bundle(primaryIdentityHandle, newDeviceBundle);
+
+    // 2. The response payload, as UTF-8 JSON.
+    const payload = {
+        accountHandle,
+        deviceId,
+        primaryPublicKeyHex: bytesToHex(primaryIdentityHandle.public_bytes()),
+        signedListBytesHex: bytesToHex(signedListBytes),
+    };
+    const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+
+    // 3. Encrypt. Only the ciphertext crosses the wire.
+    const envelope = wasm.encrypt_message(session, plaintext);
+
+    // 4. Deliver to the link key the new device is polling.
+    await transport.sendEnvelope(linkKey, envelope);
+}
