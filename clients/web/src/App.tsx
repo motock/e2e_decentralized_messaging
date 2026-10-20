@@ -9,9 +9,11 @@ import { ensureWasmInit } from './wasm_init';
 import {
     fanout_establish,
     fanout_remove_device,
+    publish_bundle_bytes,
     FanoutDeviceInput,
     FanoutHandle,
 } from '../../../core/bindings/wasm/pkg/index.js';
+import * as wasmBindings from '../../../core/bindings/wasm/pkg/index.js';
 import { SealGlyph } from './design/SealGlyph';
 import { StorageGate } from './storage';
 import { getStorageKey, getStoragePassword } from './storage_key';
@@ -19,6 +21,11 @@ import { loadOrGenerateIdentity, type PersistedIdentity } from './identity';
 import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import { useRelayConnection, RelayConnectionPanel } from './useRelayConnection';
 import { applyDeviceListUpdate, type DeviceList, type DeviceListEntry } from './Conversation';
+import {
+    lookupDeviceList,
+    publishSignedDeviceList,
+    type DiscoveryTransport,
+} from './discovery';
 import './design/AppShell.css';
 
 // SafetyNumberVerification's deriveSafetyNumber calls the real
@@ -134,6 +141,102 @@ function isListedDevice(list: DeviceList | undefined, deviceId: number): boolean
     return !!list && list.devices.some((device) => device.deviceId === deviceId);
 }
 
+// ---------------------------------------------------------------------------
+// MD-17: signed device-list discovery
+// ---------------------------------------------------------------------------
+//
+// App owns the account's device list (spec/v0.md §8.3) and now loads it from —
+// and publishes it to — the signed-discovery layer (discovery.ts, MD-9) rather
+// than relying solely on the `deviceList` prop. The prop stays as an
+// initial/override value for tests; discovery populates state when it is absent.
+//
+// The signed-device-list bindings this module needs are not declared in the
+// checked-in ambient fallback (`wasm-bindings.d.ts`), so they are reached
+// through a local cast, mirroring discovery.ts and link_primary.ts. When
+// `prepare-wasm` has run, wasm-pack's generated `index.d.ts` declares them and
+// the cast is a no-op.
+interface DeviceListSignBindings {
+    /** Sign a versioned list; returns the on-the-wire blob. */
+    sign_device_list(
+        primaryPrivateBytes: Uint8Array,
+        version: number,
+        packedEntries: Uint8Array,
+    ): Uint8Array;
+}
+
+const deviceListSignWasm = wasmBindings as unknown as DeviceListSignBindings;
+
+/**
+ * Pack device-list entries for `sign_device_list`:
+ * `u32_le(deviceId) | u32_le(identityLen) | identity | u32_le(bundleLen) | bundle`,
+ * concatenated with no count prefix (the layout `toConversationDeviceList`
+ * parses). Mirrors link_primary.ts's packer; kept local so App does not depend
+ * on the linking module's internals.
+ */
+function packDeviceListEntries(entries: DeviceListEntry[]): Uint8Array {
+    let size = 0;
+    for (const entry of entries) {
+        size += 4 + 4 + entry.identityKey.length + 4 + entry.bundleBytes.length;
+    }
+    const out = new Uint8Array(size);
+    const view = new DataView(out.buffer);
+    let pos = 0;
+    for (const entry of entries) {
+        if (
+            !Number.isSafeInteger(entry.deviceId) ||
+            entry.deviceId < 0 ||
+            entry.deviceId > 0xffffffff
+        ) {
+            throw new Error('device list: device id is out of range');
+        }
+        view.setUint32(pos, entry.deviceId, true);
+        pos += 4;
+        view.setUint32(pos, entry.identityKey.length, true);
+        pos += 4;
+        out.set(entry.identityKey, pos);
+        pos += entry.identityKey.length;
+        view.setUint32(pos, entry.bundleBytes.length, true);
+        pos += 4;
+        out.set(entry.bundleBytes, pos);
+        pos += entry.bundleBytes.length;
+    }
+    return out;
+}
+
+/** The version an account's first published device list carries. */
+const DEVICE_LIST_INITIAL_VERSION = 1;
+
+/**
+ * Build, sign and publish the account's initial (version 1) device list
+ * containing only device 0 — this device — and return the signed bytes plus
+ * the entry that was published.
+ *
+ * Device 0's identity key is the account's own public identity key and its
+ * bundle is the receiver session's published bundle, so a peer that fetches the
+ * list can fan out to this device exactly as it would to a linked one.
+ */
+async function seedOwnDeviceList(
+    transport: DiscoveryTransport,
+    recipientId: string,
+    identity: PersistedIdentity,
+    receiverSession: unknown,
+): Promise<{ signedBytes: Uint8Array; device0: DeviceListEntry }> {
+    const device0: DeviceListEntry = {
+        deviceId: 0,
+        identityKey: identity.publicBytes,
+        bundleBytes: publish_bundle_bytes(
+            receiverSession as Parameters<typeof publish_bundle_bytes>[0],
+        ),
+    };
+    const signedBytes = deviceListSignWasm.sign_device_list(
+        identity.handle.private_bytes(),
+        DEVICE_LIST_INITIAL_VERSION,
+        packDeviceListEntries([device0]),
+    );
+    await publishSignedDeviceList(transport, recipientId, signedBytes);
+    return { signedBytes, device0 };
+}
+
 export default function App({ deviceList: deviceListProp }: { deviceList?: DeviceList } = {}) {
     const [identity, setIdentity] = React.useState<PersistedIdentity | null>(null);
     // The encrypted store opened for identity loading, held so the relay
@@ -164,6 +267,117 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         if (deviceListProp === undefined) return;
         setDeviceList((held) => applyDeviceListUpdate(held, deviceListProp));
     }, [deviceListProp]);
+
+    // Retry-with-backoff prekey publish + Connecting/Connected/Unreachable
+    // status. The receiver session it produces on success is handed to
+    // Conversation's receive loop.
+    //
+    // Declared here (ahead of the discovery effects below) because MD-17's
+    // own-list load needs `conn.receiverSession` to build device 0's bundle.
+    const conn = useRelayConnection(identity, relayUrl, sessionGate);
+
+    // MD-17: the raw signed bytes of the list App currently holds, kept so
+    // MD-18 revocation can re-sign from the exact published state and so
+    // DeviceLinking's primary scan path can enforce §8.4 freshness against it.
+    // `null` means "no signed list held yet".
+    const [heldListBytes, setHeldListBytes] = React.useState<Uint8Array | null>(null);
+
+    // A transport for discovery lookups/publishes. Kept separate from the
+    // group transport (which is tagged 'group') and from Conversation's own
+    // direct transport: discovery blobs are opaque and untagged, so a plain
+    // instance is correct. Memoized on relayUrl so a runtime URL change is
+    // picked up.
+    const discoveryTransport = React.useMemo(
+        () => new RelayTransport(relayUrl),
+        [relayUrl],
+    );
+    // Close the superseded discovery transport when relayUrl changes (same
+    // ref-based pattern as the group transport above, so StrictMode's
+    // mount→cleanup→mount does not close the live instance).
+    const prevDiscoveryTransportRef = React.useRef<RelayTransport | null>(null);
+    React.useEffect(() => {
+        const prev = prevDiscoveryTransportRef.current;
+        prevDiscoveryTransportRef.current = discoveryTransport;
+        if (prev && prev !== discoveryTransport) prev.close();
+    }, [discoveryTransport]);
+
+    // MD-17: load the account's OWN device list once identity and the receiver
+    // session are both available. When the relay holds none, seed version 1
+    // with device 0 (this device), sign it with the identity's private bytes,
+    // publish it, and hold it. A verification failure is NOT fatal here — the
+    // held list is left untouched (fail closed) and the error never escapes
+    // render.
+    React.useEffect(() => {
+        if (!identity || !conn.receiverSession) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const verified = await lookupDeviceList(
+                    discoveryTransport,
+                    identity.recipientId,
+                    identity.publicBytes,
+                    // No list held yet on this path: ask for anything the relay
+                    // has, then apply it monotonically below.
+                    null,
+                );
+                if (cancelled) return;
+                if (verified) {
+                    setDeviceList((held) => applyDeviceListUpdate(held, verified.deviceList));
+                    return;
+                }
+                // Absent (or not newer than nothing): seed and publish v1.
+                const { signedBytes, device0 } = await seedOwnDeviceList(
+                    discoveryTransport,
+                    identity.recipientId,
+                    identity,
+                    conn.receiverSession,
+                );
+                if (cancelled) return;
+                setHeldListBytes(signedBytes);
+                setDeviceList((held) =>
+                    applyDeviceListUpdate(held, {
+                        version: DEVICE_LIST_INITIAL_VERSION,
+                        devices: [device0],
+                    }),
+                );
+            } catch {
+                // Fail closed: an unverifiable or unreachable own list leaves
+                // whatever is already held untouched. Never rethrow out of the
+                // effect — a discovery failure must not take down the app.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [identity, conn.receiverSession, discoveryTransport]);
+
+    // MD-17: when Conversation reports a peer's real remote identity key, fetch
+    // that peer's signed list and apply it only when strictly newer (§8.4). A
+    // verification failure leaves the held list untouched and never throws out
+    // of render.
+    React.useEffect(() => {
+        if (!remoteIdentityKey) return;
+        const peerId = activePeerId;
+        if (!peerId) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const verified = await lookupDeviceList(
+                    discoveryTransport,
+                    peerId,
+                    remoteIdentityKey,
+                    deviceList?.version ?? null,
+                );
+                if (cancelled || !verified) return;
+                setDeviceList((held) => applyDeviceListUpdate(held, verified.deviceList));
+            } catch {
+                // Unverified peer list: keep the held list, swallow the error.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [remoteIdentityKey, activePeerId, discoveryTransport, deviceList?.version]);
 
     // DR-6b: the LIVE sender-side fan-out session over the linked devices,
     // kept in lockstep with the held list so a revoke can call
@@ -244,7 +458,9 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
     // Retry-with-backoff prekey publish + Connecting/Connected/Unreachable
     // status. The receiver session it produces on success is handed to
     // Conversation's receive loop.
-    const conn = useRelayConnection(identity, relayUrl, sessionGate);
+    //
+    // (Declared above, ahead of the MD-17 discovery effects, which need
+    // `conn.receiverSession`.)
 
     // The group view reaches the relay through the same transport surface as
     // the direct path, tagged with this loop's out-of-band envelope kind
@@ -381,6 +597,21 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                 localIdentityKey={identity.publicBytes}
                                                 deviceList={deviceList}
                                                 onRevokeDevice={handleRevokeDevice}
+                                                // MD-17: hand the primary scan path
+                                                // the exact signed bytes and version
+                                                // App holds so it can enforce §8.4
+                                                // freshness. `heldListVersion` is the
+                                                // version actually held, or 0 ONLY when
+                                                // there is genuinely no list — never
+                                                // undefined/null, which would disable
+                                                // the guard. Spread through a cast
+                                                // because DeviceLinkingProps does not
+                                                // yet declare these (MD-16); the props
+                                                // are inert until it does.
+                                                {...({
+                                                    currentListBytes: heldListBytes,
+                                                    heldListVersion: deviceList?.version ?? 0,
+                                                } as Record<string, unknown>)}
                                             />
                                         )}
                                     </SafetyNumberErrorBoundary>
