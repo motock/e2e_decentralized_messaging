@@ -93,7 +93,13 @@ const identityHandle = {
     private_bytes: () => PRIVATE_KEY,
 } as unknown as IdentityHandle;
 
-const receiverSession = { id: 'receiver-session-fixture' } as unknown as SessionHandle;
+/**
+ * The receiver session `beginLinkRequest` creates and publishes the bundle for.
+ * Deliberately a distinct object from anything the caller could pass in: the
+ * screen must decrypt with *this* session, because it is the only one whose
+ * bundle the primary ever saw.
+ */
+const publishedReceiverSession = { id: 'published-receiver-session-fixture' } as unknown as SessionHandle;
 
 const transport = {
     publishPrekey: vi.fn(),
@@ -132,7 +138,21 @@ const VERIFIED_RESPONSE: VerifiedLinkResponse = {
     deviceId: ASSIGNED_DEVICE_ID,
     primaryKey: LINK_RESPONSE.primaryPublicKey,
     version: HELD_LIST_VERSION + 1,
-    deviceList: { version: HELD_LIST_VERSION + 1, devices: [] },
+    deviceList: {
+        version: HELD_LIST_VERSION + 1,
+        devices: [
+            {
+                deviceId: 0,
+                identityKey: new Uint8Array(33).fill(0x09),
+                bundleBytes: new Uint8Array([0x01]),
+            },
+            {
+                deviceId: ASSIGNED_DEVICE_ID,
+                identityKey: LOCAL_KEY,
+                bundleBytes: NEW_DEVICE_BUNDLE,
+            },
+        ],
+    },
     safetyNumber: SAFETY_NUMBER,
 };
 
@@ -150,7 +170,7 @@ beforeEach(() => {
     beginMock.mockResolvedValue({
         qrPayload: QR_PAYLOAD,
         linkKey: LINK_KEY,
-        receiverSession,
+        receiverSession: publishedReceiverSession,
         bundleBytes: NEW_DEVICE_BUNDLE,
     });
     awaitMock.mockResolvedValue(LINK_RESPONSE);
@@ -179,7 +199,6 @@ describe('DeviceLinking handshake: display mode (new device)', () => {
                 localIdentityKey={LOCAL_KEY}
                 transport={transport}
                 identityHandle={identityHandle}
-                receiverSession={receiverSession}
                 storageGate={gate}
                 accountHandle={ACCOUNT_HANDLE}
             />,
@@ -197,11 +216,109 @@ describe('DeviceLinking handshake: display mode (new device)', () => {
             expect.objectContaining({
                 transport,
                 linkKey: LINK_KEY,
-                receiverSession,
+                receiverSession: publishedReceiverSession,
                 newDevicePublicKey: LOCAL_KEY,
             }),
         );
         // Nothing is persisted before the safety number is confirmed.
+        expect(gate.put).not.toHaveBeenCalled();
+    });
+
+    it('decrypts with the receiver session beginLinkRequest published', async () => {
+        // The published session is the only one whose bundle the primary ever
+        // saw. A caller-supplied session would never decrypt the response, so
+        // the screen must use the one the request returned.
+        const gate = makeStorageGate();
+        const pending = deferred<LinkResponse>();
+        awaitMock.mockReturnValue(pending.promise);
+
+        render(
+            <DeviceLinking
+                localIdentityKey={LOCAL_KEY}
+                transport={transport}
+                identityHandle={identityHandle}
+                storageGate={gate}
+                accountHandle={ACCOUNT_HANDLE}
+            />,
+        );
+
+        fireEvent.click(await screen.findByText('Show QR code (this device)'));
+
+        await waitFor(() => {
+            expect(awaitMock).toHaveBeenCalledTimes(1);
+        });
+        const options = awaitMock.mock.calls[0][0];
+        expect(options.receiverSession).toBe(publishedReceiverSession);
+        expect(options.linkKey).toBe(LINK_KEY);
+    });
+
+    it('rejects a response whose id is not the id bound to this device', async () => {
+        // The response claims id 3, but the verified list binds this device's
+        // key to id 5. The response is not for us: fail closed.
+        const gate = makeStorageGate();
+        verifyMock.mockReturnValue({
+            ...VERIFIED_RESPONSE,
+            deviceList: {
+                version: HELD_LIST_VERSION + 1,
+                devices: [
+                    {
+                        deviceId: 5,
+                        identityKey: LOCAL_KEY,
+                        bundleBytes: NEW_DEVICE_BUNDLE,
+                    },
+                ],
+            },
+        });
+
+        render(
+            <DeviceLinking
+                localIdentityKey={LOCAL_KEY}
+                transport={transport}
+                identityHandle={identityHandle}
+                storageGate={gate}
+                accountHandle={ACCOUNT_HANDLE}
+            />,
+        );
+
+        fireEvent.click(await screen.findByText('Show QR code (this device)'));
+
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeTruthy();
+        });
+        expect(screen.queryByTestId('link-safety-number')).toBeNull();
+        expect(screen.queryByText('Device linked successfully!')).toBeNull();
+        expect(gate.put).not.toHaveBeenCalled();
+    });
+
+    it('rejects a verified list that binds this device more than once', async () => {
+        const gate = makeStorageGate();
+        verifyMock.mockReturnValue({
+            ...VERIFIED_RESPONSE,
+            deviceList: {
+                version: HELD_LIST_VERSION + 1,
+                devices: [
+                    { deviceId: ASSIGNED_DEVICE_ID, identityKey: LOCAL_KEY, bundleBytes: NEW_DEVICE_BUNDLE },
+                    { deviceId: 9, identityKey: LOCAL_KEY, bundleBytes: NEW_DEVICE_BUNDLE },
+                ],
+            },
+        });
+
+        render(
+            <DeviceLinking
+                localIdentityKey={LOCAL_KEY}
+                transport={transport}
+                identityHandle={identityHandle}
+                storageGate={gate}
+                accountHandle={ACCOUNT_HANDLE}
+            />,
+        );
+
+        fireEvent.click(await screen.findByText('Show QR code (this device)'));
+
+        await waitFor(() => {
+            expect(screen.getByRole('alert')).toBeTruthy();
+        });
+        expect(screen.queryByText('Device linked successfully!')).toBeNull();
         expect(gate.put).not.toHaveBeenCalled();
     });
 
@@ -213,7 +330,6 @@ describe('DeviceLinking handshake: display mode (new device)', () => {
                 localIdentityKey={LOCAL_KEY}
                 transport={transport}
                 identityHandle={identityHandle}
-                receiverSession={receiverSession}
                 storageGate={gate}
                 accountHandle={ACCOUNT_HANDLE}
             />,
@@ -419,7 +535,6 @@ describe('DeviceLinking handshake: fail closed', () => {
                 localIdentityKey={LOCAL_KEY}
                 transport={transport}
                 identityHandle={identityHandle}
-                receiverSession={receiverSession}
                 storageGate={gate}
                 accountHandle={ACCOUNT_HANDLE}
             />,
@@ -445,7 +560,6 @@ describe('DeviceLinking handshake: fail closed', () => {
                 localIdentityKey={LOCAL_KEY}
                 transport={transport}
                 identityHandle={identityHandle}
-                receiverSession={receiverSession}
                 storageGate={gate}
                 accountHandle={ACCOUNT_HANDLE}
             />,
@@ -478,7 +592,6 @@ describe('DeviceLinking handshake: fail closed', () => {
                 localIdentityKey={LOCAL_KEY}
                 transport={transport}
                 identityHandle={identityHandle}
-                receiverSession={receiverSession}
                 storageGate={gate}
                 accountHandle={ACCOUNT_HANDLE}
             />,

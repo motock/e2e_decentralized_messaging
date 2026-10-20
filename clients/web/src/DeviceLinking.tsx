@@ -32,7 +32,9 @@
  *    caller supplies the optional handshake props, the screen drives the
  *    actual protocol instead of the local-only flow. As the new device it
  *    publishes its bundle (`beginLinkRequest`), shows the QR, then polls
- *    `awaitLinkResponse` and re-verifies the signed list with
+ *    `awaitLinkResponse` with the receiver session that request created — the
+ *    only session whose bundle was published, so the only one that can decrypt
+ *    the primary's response — and re-verifies the signed list with
  *    `verifyLinkResponse` (MD-14). As the primary it builds and publishes the
  *    next signed list (`buildAndPublishLinkedList`, always with the caller's
  *    `heldListVersion` so the §8.4 freshness guard is never disabled) and
@@ -48,6 +50,10 @@
  *  - Fail closed on a partial handshake configuration, and on a missing
  *    `heldListVersion` (the freshness guard is never defaulted at the call
  *    site).
+ *  - The assigned device id is bound to the verified list, not to the
+ *    response's own claim: the id the signer bound to this device's identity
+ *    key must be the id the response reports, and this device must appear
+ *    exactly once in the list.
  *  - No sensitive data in logs: key bytes and payloads are never logged.
  *  - No raw key bytes in the DOM: only the derived safety number is rendered.
  *  - The safety number is re-derived from the raw key bytes on confirmation,
@@ -75,7 +81,7 @@ import { buildAndPublishLinkedList, sendLinkResponse } from './link_primary';
 import { beginLinkRequest, awaitLinkResponse, verifyLinkResponse } from './link_new_device';
 import type { RelayTransport } from './relay_transport';
 import type { StorageGate } from './storage';
-import type { IdentityHandle, SessionHandle } from '../../../core/bindings/wasm/pkg/index.js';
+import type { IdentityHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import './DeviceLinking.css';
 
 // ---------------------------------------------------------------------------
@@ -423,12 +429,6 @@ export interface DeviceLinkingProps {
      */
     identityHandle?: IdentityHandle;
     /**
-     * MD-16: the receiver session `beginLinkRequest` created for this device.
-     * Required in display mode (this device is the new device) so the primary's
-     * encrypted response can be decrypted.
-     */
-    receiverSession?: SessionHandle;
-    /**
      * MD-16: the storage gate the account device list is persisted through
      * after the safety number is confirmed. Required for either handshake role;
      * nothing is ever written to `localStorage`.
@@ -498,6 +498,31 @@ function describeError(e: unknown): string {
     return e instanceof Error && e.message ? e.message : 'Device linking failed';
 }
 
+/**
+ * The device id the verified list binds to this device.
+ *
+ * The primary assigns the id when it signs the list, so the verified list — not
+ * the response's own `deviceId` field — is the authority for it. Requiring
+ * exactly one entry to carry this device's identity key is what makes the id
+ * unambiguous: a list that names this device twice cannot say which id is ours.
+ *
+ * @throws if no entry, or more than one entry, carries this device's key.
+ */
+function deviceIdBoundTo(deviceList: DeviceList, localIdentityKey: Uint8Array): number {
+    const matches = deviceList.devices.filter(
+        (device) =>
+            device.identityKey instanceof Uint8Array &&
+            device.identityKey.length === localIdentityKey.length &&
+            device.identityKey.every((byte, i) => byte === localIdentityKey[i]),
+    );
+    if (matches.length !== 1) {
+        throw new Error(
+            'link response: verified device list does not bind this device exactly once',
+        );
+    }
+    return matches[0].deviceId;
+}
+
 export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     localIdentityKey,
     deviceList,
@@ -506,7 +531,6 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     onConfirm,
     transport,
     identityHandle,
-    receiverSession,
     storageGate,
     accountHandle,
     primaryBundleBytes,
@@ -539,14 +563,13 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     const handshakePropsSupplied =
         transport !== undefined ||
         identityHandle !== undefined ||
-        receiverSession !== undefined ||
         storageGate !== undefined ||
         accountHandle !== undefined ||
         primaryBundleBytes !== undefined ||
         currentListBytes !== undefined ||
         heldListVersion !== undefined;
     const handshakeDisplayReady = Boolean(
-        transport && identityHandle && receiverSession && storageGate && accountHandle,
+        transport && identityHandle && storageGate && accountHandle,
     );
     const handshakeScanReady = Boolean(
         transport && identityHandle && storageGate && accountHandle && primaryBundleBytes,
@@ -596,18 +619,37 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
 
             // 2. Wait for the primary's encrypted response, then re-verify the
             //    signed list against this device before trusting anything (MD-14).
+            //    The session must be the one `beginLinkRequest` created: that is
+            //    the session whose bundle was published under the link key, so it
+            //    is the only one that can decrypt the primary's response.
             const response = await awaitLinkResponse({
                 transport: transport!,
                 linkKey: request.linkKey,
-                receiverSession: receiverSession!,
+                receiverSession: request.receiverSession,
                 newDevicePublicKey: localIdentityKey,
             });
             if (attempt !== attemptRef.current) return;
+            // The id this device was assigned is only knowable from the verified
+            // list: the QR payload carries no id, and the response's `deviceId` is
+            // an unsigned claim. `expectedDeviceId` below therefore cannot be the
+            // binding guard — it only lets the list be verified and decoded. The
+            // guard is the derivation that follows: the id the signer actually
+            // bound to this device must be the id the response reports. Without it
+            // a response could point at *any* entry in the signed list that happens
+            // to carry this device's key, losing the binding between the id
+            // assigned to this device and the id reported.
             const verified = verifyLinkResponse({
                 response,
                 expectedDeviceId: response.deviceId,
                 localPublicKey: localIdentityKey,
             });
+            if (attempt !== attemptRef.current) return;
+            const assignedDeviceId = deviceIdBoundTo(verified.deviceList, localIdentityKey);
+            if (verified.deviceId !== assignedDeviceId) {
+                throw new Error(
+                    'link response: assigned device id is not the id bound to this device',
+                );
+            }
             if (attempt !== attemptRef.current) return;
 
             // 3. Hold the list in memory; the safety number gates the write.
