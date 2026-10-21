@@ -32,6 +32,11 @@ import {
     type DiscoveryTransport,
 } from './discovery';
 import { revokeDevice } from './revocation';
+import {
+    restoreOwnDeviceList,
+    saveOwnDeviceList,
+    verifyOwnDeviceList,
+} from './own_list_store';
 import './design/AppShell.css';
 
 // SafetyNumberVerification's deriveSafetyNumber calls the real
@@ -238,33 +243,6 @@ interface HeldOwnList {
 }
 
 /**
- * Wrap a discovery transport so the raw blob the last `lookupDiscovery` saw is
- * observable.
- *
- * `lookupDeviceList` verifies and converts a blob but does not hand back the
- * signed bytes, and App must keep the exact bytes it holds (for MD-18
- * revocation and DeviceLinking's freshness guard). Recording them here keeps
- * the held bytes and the held version in lockstep with a single fetch, without
- * changing discovery.ts's contract.
- */
-function recordingDiscovery(inner: DiscoveryTransport): {
-    transport: DiscoveryTransport;
-    lastBlob: () => Uint8Array | null;
-} {
-    let blob: Uint8Array | null = null;
-    return {
-        transport: {
-            publishDiscovery: (handle, bytes) => inner.publishDiscovery(handle, bytes),
-            lookupDiscovery: async (handle) => {
-                blob = await inner.lookupDiscovery(handle);
-                return blob;
-            },
-        },
-        lastBlob: () => blob,
-    };
-}
-
-/**
  * Build, sign and publish the account's initial (version 1) device list
  * containing only device 0 — this device — and return the signed bytes plus
  * the entry that was published.
@@ -427,11 +405,25 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
     // (re-running would re-look-up the list it just stored).
     const ownListRef = React.useRef<HeldOwnList | null>(null);
     // Set the held own list — bytes, version and devices in one step, so the
-    // pair can never diverge.
-    const holdOwnList = React.useCallback((next: HeldOwnList) => {
-        ownListRef.current = next;
-        setOwnList(next);
-    }, []);
+    // pair can never diverge. DL-2: also persist it (best-effort) so a reload
+    // can restore this list instead of re-seeding v1 after the relay's 7-day
+    // TTL expires. A failed write must never break the UI.
+    //
+    // This persists on linked devices too: the record is verified and
+    // encrypted, and only the primary publishes (the effect's `isPrimary`
+    // gate), so a linked device can never publish the account list under its
+    // own handle.
+    const holdOwnList = React.useCallback(
+        (next: HeldOwnList) => {
+            ownListRef.current = next;
+            setOwnList(next);
+            if (!sessionGate) return;
+            void saveOwnDeviceList(sessionGate, next).catch(() => {
+                console.warn('device list: could not persist the account device list');
+            });
+        },
+        [sessionGate],
+    );
 
     // A transport for discovery lookups/publishes. Kept separate from the
     // group transport (which is tagged 'group') and from Conversation's own
@@ -466,54 +458,54 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         }
     }, [currentDeviceId, conn.receiverSession]);
 
-    // MD-17: load the account's OWN device list once identity and the receiver
-    // session are both available. When the relay holds none, seed version 1
-    // with device 0 (this device), sign it with the identity's private bytes,
-    // publish it, and hold it. A verification failure is NOT fatal here — the
-    // held list is left untouched (fail closed) and the error never escapes
-    // render.
+    // MD-17 / DL-2: load the account's OWN device list once identity, the
+    // receiver session and the persisted device id are all resolved.
+    //
+    // The list is restored from the encrypted store BEFORE the relay lookup, so
+    // an expired relay blob (7-day TTL) no longer costs the linked devices: the
+    // persisted version is the §8.4 baseline, a strictly newer relay list wins,
+    // and otherwise the persisted list is re-published verbatim. Version 1 is
+    // seeded ONLY when neither exists. A verification failure is NOT fatal here
+    // — the held list is left untouched (fail closed) and the error never
+    // escapes render.
+    //
+    // A linked device (persisted `deviceId !== 0`) does not own the account's
+    // list: it never seeds one and never publishes under its own recipient id.
+    // It may still hold a list the relay serves, which is what the linked-device
+    // view renders — so the fetch runs as soon as identity and the session are
+    // ready, while only the primary publishes.
     React.useEffect(() => {
         if (!identity || !conn.receiverSession) return;
+        // `null` means the persisted device id has not resolved yet: hold what
+        // the relay serves, but publish nothing until we know who owns the list.
+        const isPrimary = currentDeviceId === 0;
         let cancelled = false;
         (async () => {
             try {
-                const held = ownListRef.current;
-                const recorder = recordingDiscovery(discoveryTransport);
-                const verified = await lookupDeviceList(
-                    recorder.transport,
-                    identity.recipientId,
-                    identity.publicBytes,
-                    // §8.4 baseline for OUR OWN list only — never another
-                    // account's version.
-                    held?.version ?? null,
-                );
+                const restored = await restoreOwnDeviceList({
+                    gate: sessionGate,
+                    transport: discoveryTransport,
+                    handle: identity.recipientId,
+                    expectedAccount: identity.publicBytes,
+                    heldVersion: ownListRef.current?.version ?? null,
+                });
                 if (cancelled) return;
-                if (verified) {
-                    const bytes = recorder.lastBlob();
-                    // Bytes and version come from the same fetch, so they stay
-                    // in lockstep (MD-18 re-signs from these bytes).
-                    if (bytes) {
-                        holdOwnList({
-                            version: verified.version,
-                            bytes,
-                            devices: verified.deviceList.devices,
-                        });
+                if (restored) {
+                    holdOwnList(restored.list);
+                    // Re-publish the exact bytes held, never a re-sign, to
+                    // refresh the relay's TTL. Only the primary owns the list.
+                    if (restored.republish && isPrimary) {
+                        await publishSignedDeviceList(
+                            discoveryTransport,
+                            identity.recipientId,
+                            restored.list.bytes,
+                        );
                     }
                     return;
                 }
-                if (held) {
-                    // The relay's blob is gone (TTL) or older than what we
-                    // hold: re-publish the held list at its own version rather
-                    // than seeding v1, which would drop every linked device
-                    // from the published list.
-                    await publishSignedDeviceList(
-                        discoveryTransport,
-                        identity.recipientId,
-                        held.bytes,
-                    );
-                    return;
-                }
-                // Absent: seed and publish v1 containing only device 0.
+                // Neither persisted nor published: seed and publish v1
+                // containing only device 0. Only the primary may do this.
+                if (!isPrimary) return;
                 const seeded = await seedOwnDeviceList(
                     discoveryTransport,
                     identity.recipientId,
@@ -531,7 +523,14 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         return () => {
             cancelled = true;
         };
-    }, [identity, conn.receiverSession, discoveryTransport, holdOwnList]);
+    }, [
+        identity,
+        conn.receiverSession,
+        discoveryTransport,
+        holdOwnList,
+        sessionGate,
+        currentDeviceId,
+    ]);
 
     // MD-17: the list App holds for each PEER, keyed by peer id. ONE map holds
     // both the devices and the version they were signed at, so the §8.4
@@ -715,13 +714,22 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
      * never diverge.
      */
     const handleOwnListPublished = React.useCallback(
-        (bytes: Uint8Array, version: number, devices: DeviceListEntry[]) => {
-            holdOwnList({ version, bytes, devices });
+        (bytes: Uint8Array, version: number, _devices: DeviceListEntry[]) => {
+            // DL-2: never trust the caller's devices array. Verify the signed
+            // bytes against this account's own key and hold the devices they
+            // actually encode; a mismatch throws so the linking hook keeps its
+            // pending send and fails closed.
+            if (!identity) throw new Error('device list: no identity to verify against');
+            const verified = verifyOwnDeviceList(bytes, identity.publicBytes);
+            if (verified.version !== version) {
+                throw new Error('device list: published version does not match its bytes');
+            }
+            holdOwnList(verified);
             // The list changed under the user: a stale revoke error no longer
             // describes what is held.
             setRevokeError(null);
         },
-        [holdOwnList],
+        [holdOwnList, identity],
     );
 
     const handleRemoteIdentityKeyChange = React.useCallback(
