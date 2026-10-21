@@ -92,13 +92,14 @@ import {
     type LinkingState,
 } from './device_linking';
 import { SealGlyph } from './design/SealGlyph';
-import type { DeviceList } from './Conversation';
+import type { DeviceList, DeviceListEntry } from './Conversation';
 import {
     buildAndPublishLinkedList,
     sendLinkResponse,
     type BuildAndPublishLinkedListResult,
 } from './link_primary';
 import { beginLinkRequest, awaitLinkResponse, verifyLinkResponse } from './link_new_device';
+import { revokeDevice } from './revocation';
 import type { RelayTransport } from './relay_transport';
 import type { StorageGate } from './storage';
 import type { IdentityHandle } from '../../../core/bindings/wasm/pkg/index.js';
@@ -421,6 +422,24 @@ export interface DeviceLinkingProps {
      */
     onRevokeDevice?: (deviceId: number) => void;
     /**
+     * MF-10: called with the freshly published signed list after this screen
+     * revokes a pending device itself, so the caller's held own list (bytes,
+     * version and devices) can be replaced in one step.
+     *
+     * This is deliberately NOT `onRevokeDevice`: the publish that put the new
+     * device in the list happened *inside* this screen, so the caller's held
+     * list is still the pre-link version. Routing the revoke through
+     * `onRevokeDevice` would verify that stale list, re-sign the version this
+     * screen already published and collide with it (a rollback / version
+     * reuse). OPTIONAL — without it the revoke control fails closed rather than
+     * publishing a list the caller could never learn about.
+     */
+    onOwnListPublished?: (
+        bytes: Uint8Array,
+        version: number,
+        devices: DeviceListEntry[],
+    ) => void;
+    /**
      * MD-15: the safety number this device must compare out-of-band with the
      * other device before the link is authorised. OPTIONAL — without it no
      * safety-number panel renders, so existing render sites that pass only
@@ -530,6 +549,31 @@ const SEND_FAILED_MESSAGE =
     'Retry the send to finish linking it, or revoke the pending device if it cannot be reached.';
 
 /**
+ * MF-10: what the user sees after the pending device was revoked. Static, and
+ * it names the outcome rather than the mechanism — no ids, keys or list bytes.
+ */
+const PENDING_DEVICE_REVOKED_MESSAGE =
+    'The pending device was revoked. The device list was updated and the new device is no longer trusted.';
+
+/**
+ * MF-10: what the user sees when the revoke could not be published. Static, for
+ * the same reason as {@link SEND_FAILED_MESSAGE}: the thrown message names the
+ * structural failure and must never reach the UI. The pending send is kept, so
+ * the copy points at the remaining way out.
+ */
+const REVOKE_FAILED_MESSAGE =
+    'The pending device could not be revoked. The device list is unchanged and the new device is still listed. ' +
+    'Retry the send to finish linking it, or try the revoke again.';
+
+/**
+ * MF-10: what the user sees when the revoke cannot be published safely — no
+ * `onOwnListPublished` callback to hand the fresh list back to, or a pending
+ * device id that is not a revocable device. Fail closed: nothing is published.
+ */
+const REVOKE_UNAVAILABLE_MESSAGE =
+    'The pending device cannot be revoked from this screen. Retry the send to finish linking it.';
+
+/**
  * The device id the verified list binds to this device.
  *
  * The primary assigns the id when it signs the list, so the verified list — not
@@ -558,6 +602,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     localIdentityKey,
     deviceList,
     onRevokeDevice,
+    onOwnListPublished,
     safetyNumber,
     onConfirm,
     transport,
@@ -584,6 +629,14 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
     const [pendingSend, setPendingSend] = useState<BuildAndPublishLinkedListResult | null>(null);
     /** True while a (re)send is in flight, so the retry control cannot double-send. */
     const [sending, setSending] = useState(false);
+    /** True while a pending-device revoke is in flight (MF-10). */
+    const [revoking, setRevoking] = useState(false);
+    /**
+     * MF-10: the static confirmation shown after the pending device was
+     * revoked. Held separately from `state.error` so the outcome is a status,
+     * not an alert, and so it survives the `pendingSend` reset.
+     */
+    const [revokedNotice, setRevokedNotice] = useState<string | null>(null);
     /**
      * Guards the one-shot write: a double click (or a re-render racing the
      * awaited `put`) must not persist the list twice. Reset on failure so the
@@ -842,6 +895,60 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         await deliverResponse(pendingSend, attemptRef.current);
     };
 
+    /**
+     * MF-10: revoke the device whose link response could not be sent.
+     *
+     * The list to build on is `pendingSend.signedListBytes` — the version this
+     * screen already published (v+1), which contains the new device. The
+     * caller's own held list is still the pre-link version, so it must never be
+     * the base here: re-signing it would reuse v+1 and roll the list back.
+     * `revokeDevice` therefore signs v+2 without the new device.
+     *
+     * Fail closed on every path that cannot leave the caller consistent:
+     *  - no `onOwnListPublished` — publishing would leave the caller holding a
+     *    stale list, so nothing is published;
+     *  - a pending device id that is not a revocable device (device 0 is the
+     *    account's own identity and is never handed to `revokeDevice`).
+     * A failed revoke keeps `pendingSend` and the published v+1 list untouched.
+     */
+    const handleRevokePending = async () => {
+        if (!pendingSend || revoking) return;
+        const { deviceId, signedListBytes } = pendingSend;
+        if (!onOwnListPublished || !identityHandle || !accountHandle || !transport) {
+            setState({ ...initialLinkingState(), error: REVOKE_UNAVAILABLE_MESSAGE });
+            return;
+        }
+        if (!Number.isSafeInteger(deviceId) || deviceId <= 0) {
+            // Device 0 is the primary: revoking it would leave a list no device
+            // can sign for. Never publish, never call `revokeDevice`.
+            setState({ ...initialLinkingState(), error: REVOKE_UNAVAILABLE_MESSAGE });
+            return;
+        }
+
+        setRevoking(true);
+        try {
+            const { signedListBytes: nextBytes, deviceList: next } = await revokeDevice({
+                currentListBytes: signedListBytes,
+                primaryIdentityHandle: identityHandle,
+                deviceId,
+                accountHandle,
+                transport,
+            });
+            // Hand the fresh list back BEFORE dropping the pending send, so the
+            // caller is never left holding the superseded version.
+            onOwnListPublished(nextBytes, next.version, next.devices);
+            setPendingSend(null);
+            setState(initialLinkingState());
+            setRevokedNotice(PENDING_DEVICE_REVOKED_MESSAGE);
+        } catch {
+            // Fail closed: the v+1 list stays published and `pendingSend` stays
+            // so the user can still retry the send. Static copy only.
+            setState({ ...initialLinkingState(), error: REVOKE_FAILED_MESSAGE });
+        } finally {
+            setRevoking(false);
+        }
+    };
+
     const handleConfirm = () => {
         const newState = confirmLink(state, localIdentityKey, confirmInput);
         setState(newState);
@@ -859,6 +966,8 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         // still names the new device, so it must be revoked out of band.
         setPendingSend(null);
         setSending(false);
+        setRevoking(false);
+        setRevokedNotice(null);
         persistedRef.current = false;
     };
 
@@ -1047,13 +1156,26 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
                         <button
                             className="link-button-primary"
                             onClick={handleRetrySend}
-                            disabled={sending}
+                            disabled={sending || revoking}
                         >
                             Retry send
+                        </button>
+                        <button
+                            className="link-button-secondary"
+                            onClick={handleRevokePending}
+                            disabled={sending || revoking}
+                        >
+                            Revoke pending device
                         </button>
                         <button className="link-button-secondary" onClick={handleAbort}>Cancel</button>
                     </div>
                 </div>
+            )}
+
+            {revokedNotice && (
+                <p role="status" className="link-intro-text">
+                    {revokedNotice}
+                </p>
             )}
 
             {state.phase === 'confirming' && state.safetyNumber && (

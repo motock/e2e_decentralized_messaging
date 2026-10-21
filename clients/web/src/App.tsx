@@ -689,6 +689,27 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         [deviceList, fanoutSession, identity, discoveryTransport, holdOwnList],
     );
 
+    /**
+     * MF-10: replace the held own list with the one DeviceLinking published
+     * itself when it revoked a pending device.
+     *
+     * The publish happened inside DeviceLinking, so App's held list is still
+     * the pre-link version. This callback is the only way the fresh bytes,
+     * version and devices reach App — routing it through `handleRevokeDevice`
+     * would verify the stale list and re-sign a version that is already
+     * published. Bytes, version and devices are set in one step so they can
+     * never diverge.
+     */
+    const handleOwnListPublished = React.useCallback(
+        (bytes: Uint8Array, version: number, devices: DeviceListEntry[]) => {
+            holdOwnList({ version, bytes, devices });
+            // The list changed under the user: a stale revoke error no longer
+            // describes what is held.
+            setRevokeError(null);
+        },
+        [holdOwnList],
+    );
+
     const handleRemoteIdentityKeyChange = React.useCallback(
         (peerId: string, key: Uint8Array | null) => {
             setActivePeerId(peerId);
@@ -929,6 +950,20 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                 // freshness baseline is type-checked.
                                                 currentListBytes={ownList?.bytes ?? null}
                                                 heldListVersion={ownList?.version ?? 0}
+                                                // MF-10: DeviceLinking publishes
+                                                // the revoke of a pending device
+                                                // itself (the list it must build
+                                                // on is the one IT published, not
+                                                // the stale one held here), so it
+                                                // hands the fresh bytes/version/
+                                                // devices back through this
+                                                // callback rather than
+                                                // `handleRevokeDevice`.
+                                                onOwnListPublished={
+                                                    currentDeviceId === 0
+                                                        ? handleOwnListPublished
+                                                        : undefined
+                                                }
                                             />
                                         )}
                                     </SafetyNumberErrorBoundary>
