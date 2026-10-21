@@ -212,7 +212,7 @@ describe('resolveGroupRecipients — list-derived device validation', () => {
 
     it('rejects a list whose device identity key is not 33 bytes', async () => {
         mocks.verify_device_list.mockReturnValue(
-            verifiedList(2, [
+            rawVerifiedList(2, [
                 { deviceId: 0, identityKey: key(0x01) },
                 { deviceId: 3, identityKey: new Uint8Array(31).fill(0x05) },
             ]),
