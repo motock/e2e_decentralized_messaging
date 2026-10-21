@@ -107,6 +107,14 @@ const BUILD_RESULT: BuildAndPublishLinkedListResult = {
     safetyNumber: SAFETY_NUMBER,
     linkKey: LINK_KEY,
     newDeviceBundle: NEW_DEVICE_BUNDLE,
+    devices: [
+        { deviceId: 0, identityKey: LOCAL_KEY, bundleBytes: PRIMARY_BUNDLE },
+        {
+            deviceId: ASSIGNED_DEVICE_ID,
+            identityKey: NEW_DEVICE_IDENTITY_KEY,
+            bundleBytes: NEW_DEVICE_BUNDLE,
+        },
+    ],
 };
 
 /** The list the primary holds after the revoke: device 0 only. */
@@ -157,7 +165,9 @@ async function failTheSend(
 }
 
 beforeEach(() => {
-    vi.clearAllMocks();
+    // reset (not clear): a leftover mockRejectedValueOnce from a prior test
+    // must not be consumed by the next test's first send.
+    vi.resetAllMocks();
     buildMock.mockResolvedValue(BUILD_RESULT);
     sendMock.mockResolvedValue(undefined);
     revokeMock.mockResolvedValue(REVOKE_RESULT);
@@ -340,7 +350,13 @@ describe('DeviceLinking pending-device revoke: genuine failure', () => {
         await waitFor(() => expect(revokeMock).toHaveBeenCalledTimes(1));
 
         expect(screen.getByRole('alert').textContent).toContain('device list is unchanged');
-        expect(onOwnListPublished).not.toHaveBeenCalled();
+        // Only the link hand-off (v+1) ran; the failed revoke handed nothing back.
+        expect(onOwnListPublished).toHaveBeenCalledTimes(1);
+        expect(onOwnListPublished).toHaveBeenCalledWith(
+            SIGNED_LIST,
+            HELD_LIST_VERSION + 1,
+            BUILD_RESULT.devices,
+        );
         // The pending send survives so the user can still finish the link.
         expect(screen.getByText('Retry send')).toBeTruthy();
         expect(screen.getByText('Revoke pending device')).toBeTruthy();
@@ -358,7 +374,20 @@ describe('DeviceLinking pending-device revoke: genuine failure', () => {
 
         fireEvent.click(screen.getByText('Revoke pending device'));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledTimes(2));
-        await waitFor(() => expect(onOwnListPublished).toHaveBeenCalledTimes(1));
+        // Link hand-off (v+1), then the successful revoke hand-off (v+2).
+        await waitFor(() => expect(onOwnListPublished).toHaveBeenCalledTimes(2));
+        expect(onOwnListPublished).toHaveBeenNthCalledWith(
+            1,
+            SIGNED_LIST,
+            HELD_LIST_VERSION + 1,
+            BUILD_RESULT.devices,
+        );
+        expect(onOwnListPublished).toHaveBeenNthCalledWith(
+            2,
+            REVOKED_LIST,
+            HELD_LIST_VERSION + 2,
+            REVOKED_DEVICES,
+        );
         expect(screen.queryByText('Revoke pending device')).toBeNull();
     });
 });

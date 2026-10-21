@@ -452,6 +452,20 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         if (prev && prev !== discoveryTransport) prev.close();
     }, [discoveryTransport]);
 
+    // DL-1: the primary's device-0 prekey bundle, handed to the scan path so it
+    // can build and publish the next signed list. Only device 0 (the primary)
+    // may sign; a linked device gets no bundle, so its scan path fails closed.
+    const primaryBundleBytes = React.useMemo(() => {
+        if (currentDeviceId !== 0 || !conn.receiverSession) return undefined;
+        try {
+            return publish_bundle_bytes(
+                conn.receiverSession as Parameters<typeof publish_bundle_bytes>[0],
+            );
+        } catch {
+            return undefined;
+        }
+    }, [currentDeviceId, conn.receiverSession]);
+
     // MD-17: load the account's OWN device list once identity and the receiver
     // session are both available. When the relay holds none, seed version 1
     // with device 0 (this device), sign it with the identity's private bytes,
@@ -964,6 +978,16 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                                         ? handleOwnListPublished
                                                         : undefined
                                                 }
+                                                // DL-1: the real handshake props.
+                                                // Without these the screen stays
+                                                // "not configured" — the scan
+                                                // path never runs. The bundle is
+                                                // primary-only (see the memo).
+                                                transport={discoveryTransport}
+                                                identityHandle={identity.handle}
+                                                storageGate={sessionGate}
+                                                accountHandle={identity.recipientId}
+                                                primaryBundleBytes={primaryBundleBytes}
                                             />
                                         )}
                                     </SafetyNumberErrorBoundary>

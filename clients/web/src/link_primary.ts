@@ -148,6 +148,13 @@ export interface BuildAndPublishLinkedListResult {
     linkKey: string;
     /** The new device's prekey bundle, as fetched from the relay. */
     newDeviceBundle: Uint8Array;
+    /**
+     * The full entry set that was signed and published — device 0 plus every
+     * linked device, including the new one. Exposed so the scan path can hand
+     * the caller exactly what it signed without re-parsing or re-verifying the
+     * blob. A required, enumerable part of the result.
+     */
+    devices: DeviceListEntryInput[];
 }
 
 /**
@@ -311,6 +318,7 @@ export async function buildAndPublishLinkedList(
         safetyNumber: wasm.derive_safety_number(primaryPublicBytes, newDeviceIdentityKey),
         linkKey,
         newDeviceBundle,
+        devices: nextEntries,
     };
 }
 

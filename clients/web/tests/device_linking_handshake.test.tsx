@@ -124,6 +124,14 @@ const BUILD_RESULT: BuildAndPublishLinkedListResult = {
     safetyNumber: SAFETY_NUMBER,
     linkKey: LINK_KEY,
     newDeviceBundle: NEW_DEVICE_BUNDLE,
+    devices: [
+        { deviceId: 0, identityKey: LOCAL_KEY, bundleBytes: PRIMARY_BUNDLE },
+        {
+            deviceId: ASSIGNED_DEVICE_ID,
+            identityKey: NEW_DEVICE_IDENTITY_KEY,
+            bundleBytes: NEW_DEVICE_BUNDLE,
+        },
+    ],
 };
 
 const LINK_RESPONSE: LinkResponse = {
