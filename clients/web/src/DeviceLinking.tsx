@@ -644,6 +644,20 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
      */
     const persistedRef = useRef(false);
     /**
+     * MF-11: mirrors `sending` for the same-tick guarantee. React state is not
+     * updated synchronously, so two clicks dispatched before the re-render both
+     * saw `sending === false` and sent the link response twice. The ref is set
+     * before the await and cleared in `finally`, so a failed send can still be
+     * retried.
+     */
+    const sendingRef = useRef(false);
+    /**
+     * MF-11: mirrors `revoking` for the same reason. Two same-tick clicks would
+     * otherwise both call `revokeDevice` — the second against a list that no
+     * longer contains the device.
+     */
+    const revokingRef = useRef(false);
+    /**
      * Bumped whenever the user aborts. An in-flight handshake captures the
      * value it started with and drops its result if it changed, so a response
      * that arrives after Cancel can never open the confirmation panel.
@@ -846,6 +860,7 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
         built: BuildAndPublishLinkedListResult,
         attempt: number,
     ): Promise<void> => {
+        sendingRef.current = true;
         setSending(true);
         try {
             await sendLinkResponse({
@@ -865,11 +880,16 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
             setState({ ...initialLinkingState(), error: SEND_FAILED_MESSAGE });
             return;
         } finally {
+            // Always release the one-shot guard, so a failed send can be retried.
+            sendingRef.current = false;
             if (attempt === attemptRef.current) setSending(false);
         }
         if (attempt !== attemptRef.current) return;
 
-        // 3. Hold the list in memory; the safety number gates the write.
+        // 3. Hold the list in memory; the safety number gates the write. The
+        //    scanned linking code has served its purpose — drop it so it is not
+        //    retained past the send.
+        setScanInput('');
         setPendingSend(null);
         setPendingLink({
             accountHandle: accountHandle!,
@@ -891,7 +911,9 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
      * Bounded by the user: no automatic retries, no re-publish.
      */
     const handleRetrySend = async () => {
-        if (!pendingSend || sending) return;
+        // `sending` disables the control on the next render; the ref rejects a
+        // second click dispatched in the same tick, before that render.
+        if (!pendingSend || sending || sendingRef.current) return;
         await deliverResponse(pendingSend, attemptRef.current);
     };
 
@@ -912,7 +934,9 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
      * A failed revoke keeps `pendingSend` and the published v+1 list untouched.
      */
     const handleRevokePending = async () => {
-        if (!pendingSend || revoking) return;
+        // `revoking` disables the control on the next render; the ref rejects a
+        // second click dispatched in the same tick, before that render.
+        if (!pendingSend || revoking || revokingRef.current) return;
         const { deviceId, signedListBytes } = pendingSend;
         if (!onOwnListPublished || !identityHandle || !accountHandle || !transport) {
             setState({ ...initialLinkingState(), error: REVOKE_UNAVAILABLE_MESSAGE });
@@ -925,27 +949,41 @@ export const DeviceLinking: React.FC<DeviceLinkingProps> = ({
             return;
         }
 
+        revokingRef.current = true;
         setRevoking(true);
+        let revoked: { signedListBytes: Uint8Array; deviceList: DeviceList };
         try {
-            const { signedListBytes: nextBytes, deviceList: next } = await revokeDevice({
+            revoked = await revokeDevice({
                 currentListBytes: signedListBytes,
                 primaryIdentityHandle: identityHandle,
                 deviceId,
                 accountHandle,
                 transport,
             });
-            // Hand the fresh list back BEFORE dropping the pending send, so the
-            // caller is never left holding the superseded version.
-            onOwnListPublished(nextBytes, next.version, next.devices);
-            setPendingSend(null);
-            setState(initialLinkingState());
-            setRevokedNotice(PENDING_DEVICE_REVOKED_MESSAGE);
         } catch {
             // Fail closed: the v+1 list stays published and `pendingSend` stays
             // so the user can still retry the send. Static copy only.
             setState({ ...initialLinkingState(), error: REVOKE_FAILED_MESSAGE });
+            return;
         } finally {
+            // Always release the one-shot guard, so a failed revoke can be retried.
+            revokingRef.current = false;
             setRevoking(false);
+        }
+
+        // The revoke itself succeeded, so v+2 is published. Drop the pending send
+        // and state the outcome BEFORE handing the fresh list back: a throwing
+        // `onOwnListPublished` must not turn a published revoke into the
+        // "device list is unchanged" failure copy, nor leave `pendingSend` set.
+        setPendingSend(null);
+        setState(initialLinkingState());
+        setRevokedNotice(PENDING_DEVICE_REVOKED_MESSAGE);
+        try {
+            onOwnListPublished(revoked.signedListBytes, revoked.deviceList.version, revoked.deviceList.devices);
+        } catch {
+            // The caller's own state update failed. This screen is already
+            // consistent (v+2 published, pending send dropped), so the failure is
+            // not reported as a revoke failure.
         }
     };
 
