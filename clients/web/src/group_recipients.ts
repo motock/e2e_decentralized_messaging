@@ -270,7 +270,7 @@ function assertHeldVersion(version: unknown): void {
  * the list was signed by the account, not that every entry decodes to a usable
  * key, so the shape is re-checked here before the key is emitted.
  */
-function isWellFormedIdentityKey(identityKey: unknown): identityKey is Uint8Array {
+export function isWellFormedIdentityKey(identityKey: unknown): identityKey is Uint8Array {
     return (
         identityKey instanceof Uint8Array &&
         identityKey.length === IDENTITY_KEY_LEN &&
