@@ -531,6 +531,42 @@ describe('resolveGroupRecipients', () => {
         expect(result.unresolvedMembers).toEqual([]);
     });
 
+    it('never lets a held version shadow a higher version applied in the same call', async () => {
+        const aliceKey = key(0xa1);
+        // First entry: version 5, which has revoked device 7.
+        mocks.verify_device_list
+            .mockReturnValueOnce(
+                packEntries(5, [
+                    { deviceId: 0, identityKey: key(0x01), bundleBytes: new Uint8Array([0x01]) },
+                ]),
+            )
+            // Second entry: a replayed version 4 that still lists device 7.
+            .mockReturnValueOnce(
+                packEntries(4, [
+                    { deviceId: 0, identityKey: key(0x01), bundleBytes: new Uint8Array([0x01]) },
+                    { deviceId: 7, identityKey: key(0x07), bundleBytes: new Uint8Array([0x01]) },
+                ]),
+            );
+
+        const result = await resolveGroupRecipients({
+            members: [
+                { accountHandle: 'alice', identityKey: aliceKey },
+                { accountHandle: 'alice', identityKey: aliceKey },
+            ],
+            ownDevices: [],
+            ownAccountHandle: 'me',
+            currentDeviceId: 0,
+            discovery: transportWith({ alice: SIGNED_BLOB }),
+            // The caller's floor (3) is *lower* than the version this call has
+            // already applied (5). The higher of the two must win, or the
+            // replayed v4 list resurrects the device v5 revoked (§8.4).
+            heldVersions: new Map([['alice', 3]]),
+        });
+
+        expect(result.recipients.map((r) => r.address)).toEqual(['alice']);
+        expect(result.unresolvedMembers).toEqual(['alice']);
+    });
+
     it('does not log the raw account handle', async () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
         try {
@@ -548,6 +584,43 @@ describe('resolveGroupRecipients', () => {
                 .join(' ');
             expect(text).not.toContain('alice');
             expect(text).toContain('handleRef');
+        } finally {
+            warn.mockRestore();
+        }
+    });
+
+    it('trims member and own handles to their canonical form', async () => {
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList([{ deviceId: 0, identityKey: key(0x01) }]),
+        );
+
+        const result = await resolveGroupRecipients({
+            members: [{ accountHandle: '  alice  ', identityKey: key(0xa1) }],
+            ownDevices: [{ deviceId: 1, identityKey: key(0x21) }],
+            ownAccountHandle: ' me ',
+            currentDeviceId: 0,
+            discovery: transportWith({ alice: SIGNED_BLOB }),
+        });
+
+        expect(result.recipients.map((r) => r.accountHandle)).toEqual(['alice', 'me']);
+        expect(result.recipients.map((r) => r.address)).toEqual(['alice', 'me:1']);
+    });
+
+    it('reports a missing list as no-fresh-list, not as a stale list', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            await resolveGroupRecipients({
+                members: [{ accountHandle: 'alice', identityKey: key(0xa1) }],
+                ownDevices: [],
+                ownAccountHandle: 'me',
+                currentDeviceId: 0,
+                discovery: transportWith({}),
+            });
+
+            const reasons = warn.mock.calls.map(
+                (args) => (args[1] as { reason?: string } | undefined)?.reason,
+            );
+            expect(reasons).toEqual(['no-fresh-list']);
         } finally {
             warn.mockRestore();
         }

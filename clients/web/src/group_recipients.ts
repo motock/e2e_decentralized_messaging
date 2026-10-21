@@ -28,8 +28,13 @@
  *    suppress) a real linked-device mailbox in the de-duplication step.
  *  - **Monotonic device lists.** The caller's held versions are passed through
  *    to `lookupDeviceList`, so a replayed stale list cannot resurrect a revoked
- *    device (§8.4). Versions applied during this call become the floor for any
- *    later member entry with the same handle.
+ *    device (§8.4). The effective floor for a handle is the *higher* of the
+ *    caller's held version and any version already applied in this call, so a
+ *    repeated handle can never be walked backwards.
+ *  - **Canonical handles.** Handles are trimmed before use, so the handles in
+ *    the returned recipients are canonical even if the caller's roster is not;
+ *    callers matching recipients back to roster entries should compare against
+ *    the trimmed form.
  *  - **No sensitive data in logs.** Only a non-reversible handle reference, a
  *    coarse reason code, and an error *class* are logged; account handles,
  *    identity keys, prekey bundles, and list bytes never are.
@@ -78,9 +83,12 @@ export interface ResolveGroupRecipientsArgs {
      *
      * Passed straight through to `lookupDeviceList` as its monotonic floor, so
      * a relay replaying an older (but validly signed) list cannot resurrect a
-     * device the user has revoked. Callers should persist the versions they
-     * observe across sends; when a handle is absent the first version seen in
-     * this call becomes the floor for any later entry with the same handle.
+     * device the user has revoked. This is a *per-call* floor: the resolver
+     * never mutates the map, and the versions it applies are not returned, so a
+     * caller cannot populate it from a previous resolution. Within one call the
+     * effective floor for a handle is the higher of this map's entry and any
+     * version already applied for that handle, so a repeated handle can never
+     * be walked backwards.
      */
     heldVersions?: ReadonlyMap<string, number>;
 }
@@ -104,8 +112,14 @@ const ADDRESS_SEPARATOR = ':';
 const FORBIDDEN_HANDLE_CHARS =
     /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
 
-/** Why a member fell back to its bare handle. */
-type UnresolvedReason = 'no-verified-list' | 'stale-list' | 'verification-failed';
+/**
+ * Why a member fell back to its bare handle.
+ *
+ * `no-fresh-list` covers both "the relay holds no list" and "the list it holds
+ * is not newer than the floor" — `lookupDeviceList` returns `null` for both and
+ * the resolver cannot tell them apart without a second lookup.
+ */
+type UnresolvedReason = 'no-fresh-list' | 'verification-failed';
 
 /** Mailbox address for one device of `handle` (MD-17a/17b). */
 function deviceAddress(handle: string, deviceId: number): string {
@@ -125,6 +139,8 @@ function deviceAddress(handle: string, deviceId: number): string {
  * linked device.
  *
  * The message names only the structural failure — never the handle itself.
+ *
+ * The returned handle is the trimmed input, so callers see the canonical form.
  */
 function assertAccountHandle(value: unknown, role: string): string {
     if (typeof value !== 'string') {
@@ -241,10 +257,18 @@ export async function resolveGroupRecipients({
 
     for (const [index, member] of members.entries()) {
         const handle = memberHandles[index];
-        const heldVersion = heldVersions?.get(handle) ?? appliedVersions.get(handle) ?? null;
+        // The floor is the *highest* version we know of for this handle: a
+        // caller-supplied version must never shadow a higher version already
+        // applied in this call, or a replayed older list would be accepted and
+        // resurrect a device revoked by the newer one (§8.4).
+        const floor = Math.max(
+            heldVersions?.get(handle) ?? -1,
+            appliedVersions.get(handle) ?? -1,
+        );
+        const heldVersion = floor < 0 ? null : floor;
 
         let verified: Awaited<ReturnType<typeof lookupDeviceList>> = null;
-        let reason: UnresolvedReason = 'no-verified-list';
+        let reason: UnresolvedReason = 'no-fresh-list';
         try {
             verified = await lookupDeviceList(discovery, handle, member.identityKey, heldVersion);
         } catch (error) {
@@ -262,13 +286,10 @@ export async function resolveGroupRecipients({
         }
 
         if (verified === null) {
-            // No list, a stale list rejected by the monotonic check, or a
-            // failed verification: fall back to the bare handle rather than
-            // silently dropping the member. The primary is still reachable;
-            // its linked devices are not, and the caller can surface that.
-            if (reason === 'no-verified-list' && heldVersion !== null) {
-                reason = 'stale-list';
-            }
+            // No list, a list no newer than the floor, or a failed
+            // verification: fall back to the bare handle rather than silently
+            // dropping the member. The primary is still reachable; its linked
+            // devices are not, and the caller can surface that.
             emit({
                 accountHandle: handle,
                 deviceId: 0,
@@ -298,7 +319,7 @@ export async function resolveGroupRecipients({
             unresolvedMembers.push(handle);
             console.warn('group recipients: member device list names no devices; using primary handle', {
                 handleRef: handleRef(handle),
-                reason: 'no-verified-list',
+                reason: 'no-fresh-list',
             });
             continue;
         }
