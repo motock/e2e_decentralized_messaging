@@ -69,6 +69,36 @@ function verifiedList(
     );
 }
 
+/**
+ * Hand-build the same buffer without `packEntries`' validation.
+ *
+ * `packEntries` refuses to encode a malformed identity key, so the only way to
+ * model a *verified* list that still carries a bad key — the case the resolver
+ * must defend against — is to write the bytes directly.
+ */
+function rawVerifiedList(
+    version: number,
+    entries: Array<{ deviceId: number; identityKey: Uint8Array }>,
+): Uint8Array {
+    const chunks: number[] = [];
+    const pushU32 = (value: number) => {
+        chunks.push(value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff);
+    };
+    const pushU64 = (value: number) => {
+        pushU32(value >>> 0);
+        pushU32(Math.floor(value / 0x100000000));
+    };
+    pushU64(version);
+    for (const entry of entries) {
+        pushU32(entry.deviceId);
+        pushU32(entry.identityKey.length);
+        chunks.push(...entry.identityKey);
+        pushU32(2);
+        chunks.push(0x01, 0x02);
+    }
+    return new Uint8Array(chunks);
+}
+
 describe('resolveGroupRecipients — applied versions', () => {
     beforeEach(() => {
         mocks.verify_device_list.mockReset();
