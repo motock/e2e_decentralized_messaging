@@ -280,6 +280,7 @@ describe('buildAndPublishLinkedList with no current list', () => {
             safetyNumber: SAFETY_NUMBER,
             linkKey: LINK_KEY,
             newDeviceBundle: NEW_BUNDLE,
+            devices: entries,
         });
     });
 });

@@ -111,6 +111,14 @@ function buildResult(deviceId: number): BuildAndPublishLinkedListResult {
         safetyNumber: SAFETY_NUMBER,
         linkKey: LINK_KEY,
         newDeviceBundle: NEW_DEVICE_BUNDLE,
+        devices: [
+            { deviceId: 0, identityKey: LOCAL_KEY, bundleBytes: PRIMARY_BUNDLE },
+            {
+                deviceId,
+                identityKey: NEW_DEVICE_IDENTITY_KEY,
+                bundleBytes: NEW_DEVICE_BUNDLE,
+            },
+        ],
     };
 }
 
@@ -208,9 +216,17 @@ describe('DeviceLinking pending-device revoke: success', () => {
         expect(revokeMock.mock.calls[0][0].currentListBytes).toBe(SIGNED_LIST);
         expect(revokeMock.mock.calls[0][0].deviceId).toBe(ASSIGNED_DEVICE_ID);
 
-        // The fresh v+2 bytes/version go back to the caller in one step.
-        await waitFor(() => expect(onOwnListPublished).toHaveBeenCalledTimes(1));
-        expect(onOwnListPublished).toHaveBeenCalledWith(
+        // The link hand-off (v+1) and then the revoke hand-off (v+2) reach the
+        // caller, in that order, so App never holds a stale base.
+        await waitFor(() => expect(onOwnListPublished).toHaveBeenCalledTimes(2));
+        expect(onOwnListPublished).toHaveBeenNthCalledWith(
+            1,
+            SIGNED_LIST,
+            HELD_LIST_VERSION + 1,
+            BUILD_RESULT.devices,
+        );
+        expect(onOwnListPublished).toHaveBeenNthCalledWith(
+            2,
             REVOKED_LIST,
             HELD_LIST_VERSION + 2,
             REVOKED_DEVICES,
@@ -259,8 +275,14 @@ describe('DeviceLinking pending-device revoke: failure', () => {
         fireEvent.click(screen.getByText('Revoke pending device'));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledTimes(1));
 
-        // Fail closed: nothing handed back, nothing persisted, no second publish.
-        expect(onOwnListPublished).not.toHaveBeenCalled();
+        // Fail closed: the failed revoke hands nothing back. The link hand-off
+        // (v+1) did run, and is the only call.
+        expect(onOwnListPublished).toHaveBeenCalledTimes(1);
+        expect(onOwnListPublished).toHaveBeenCalledWith(
+            SIGNED_LIST,
+            HELD_LIST_VERSION + 1,
+            BUILD_RESULT.devices,
+        );
         expect(revokeMock).toHaveBeenCalledTimes(1);
         expect(gate.put).not.toHaveBeenCalled();
 
@@ -282,7 +304,8 @@ describe('DeviceLinking pending-device revoke: primary is never revoked', () => 
     it('refuses to hand device 0 to revokeDevice', async () => {
         const gate = makeStorageGate();
         const onOwnListPublished = vi.fn();
-        buildMock.mockResolvedValue(buildResult(0));
+        const zeroBuild = buildResult(0);
+        buildMock.mockResolvedValue(zeroBuild);
 
         await failTheSend(gate, onOwnListPublished);
 
@@ -290,7 +313,13 @@ describe('DeviceLinking pending-device revoke: primary is never revoked', () => 
 
         await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
         expect(revokeMock).not.toHaveBeenCalled();
-        expect(onOwnListPublished).not.toHaveBeenCalled();
+        // Only the link hand-off (v+1) ran; device 0 was never revoked.
+        expect(onOwnListPublished).toHaveBeenCalledTimes(1);
+        expect(onOwnListPublished).toHaveBeenCalledWith(
+            SIGNED_LIST,
+            HELD_LIST_VERSION + 1,
+            zeroBuild.devices,
+        );
         // The pending send is still there, so the user can retry instead.
         expect(screen.getByText('Retry send')).toBeTruthy();
     });

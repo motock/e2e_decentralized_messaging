@@ -216,6 +216,17 @@ const REVOKE_UNAVAILABLE_MESSAGE =
     'The pending device cannot be revoked from this screen. Retry the send to finish linking it.';
 
 /**
+ * DL-1: what the user sees when the freshly published list could not be handed
+ * back to the caller. The list is already on the relay, so the pending send is
+ * kept and the copy points at the recovery controls. Static, for the same
+ * reason as {@link SEND_FAILED_MESSAGE}: the thrown message must never reach the
+ * UI.
+ */
+const OWN_LIST_PUBLISH_FAILED_MESSAGE =
+    'The device list was updated, but this screen could not record the new version. ' +
+    'Retry the send to finish linking it, or revoke the pending device if it cannot be reached.';
+
+/**
  * The device id the verified list binds to this device.
  *
  * The primary assigns the id when it signs the list, so the verified list — not
@@ -333,6 +344,14 @@ export function useDeviceLinkingHandshake({
      */
     const revokingRef = useRef(false);
     /**
+     * DL-1: build results whose signed entry set has already been handed to the
+     * caller. A WeakSet keeps the hand-off idempotent: the initial send and a
+     * retry both call it, but the caller's callback runs once per published
+     * build. A callback that throws is NOT recorded, so the next retry
+     * re-attempts it before re-sending.
+     */
+    const handedOffRef = useRef(new WeakSet<object>());
+    /**
      * Bumped whenever the user aborts. An in-flight handshake captures the
      * value it started with and drops its result if it changed, so a response
      * that arrives after Cancel can never open the confirmation panel.
@@ -354,7 +373,11 @@ export function useDeviceLinkingHandshake({
         transport && identityHandle && storageGate && accountHandle,
     );
     const handshakeScanReady = Boolean(
-        transport && identityHandle && storageGate && accountHandle && primaryBundleBytes,
+        transport &&
+            identityHandle &&
+            storageGate &&
+            accountHandle &&
+            primaryBundleBytes,
     );
 
     useEffect(() => {
@@ -459,6 +482,44 @@ export function useDeviceLinkingHandshake({
         }
     };
 
+    /**
+     * DL-1: hand the published list to the caller exactly once per build.
+     *
+     * Returns false when the caller's callback threw; the caller then keeps
+     * `pendingSend`, shows the static error, and does not send. The retry path
+     * calls this again before sending, so a callback failure cannot leave the
+     * caller on the pre-link list while v+1 is live.
+     */
+    function handOff(built: BuildAndPublishLinkedListResult): boolean {
+        // No caller to update: the optional-prop path keeps its old behaviour.
+        if (!onOwnListPublished) return true;
+        // The caller IS wired: a missing signed entry set must fail closed, not
+        // silently skip — otherwise the send proceeds and the caller stays on
+        // the stale pre-link list (the bug this story exists to remove).
+        if (!built.devices) {
+            setState({
+                ...initialLinkingState(),
+                error: OWN_LIST_PUBLISH_FAILED_MESSAGE,
+            });
+            return false;
+        }
+        if (handedOffRef.current.has(built)) return true;
+        try {
+            onOwnListPublished(built.signedListBytes, built.version, built.devices);
+            handedOffRef.current.add(built);
+            return true;
+        } catch {
+            // Security-relevant outcome with no payload: the version was
+            // published but the caller did not record it. Keep the data out.
+            console.warn('device-list hand-off failed; the caller was not updated');
+            setState({
+                ...initialLinkingState(),
+                error: OWN_LIST_PUBLISH_FAILED_MESSAGE,
+            });
+            return false;
+        }
+    }
+
     const handleScan = async () => {
         if (!scanInput.trim()) {
             setState({ ...state, error: 'Enter a linking code' });
@@ -503,11 +564,38 @@ export function useDeviceLinkingHandshake({
             });
             if (attempt !== attemptRef.current) return;
 
-            // 2. Send the new device its encrypted response, bound to the
+            // The list is now live on the relay. Keep the build result so the
+            // retry/revoke recovery survives even if the hand-off below fails:
+            // the orphaned device must stay revocable from this screen.
+            setPendingSend(built);
+
+            // 2. DL-1: hand the caller the version that was just published,
+            //    BEFORE the send. The list is already on the relay, so the
+            //    caller must hold it even if the send fails or is retried —
+            //    otherwise the next publish (a second link, or a revoke) is
+            //    built on the stale pre-link list and drops this device.
+            //
+            //    The devices come from the build result that was signed
+            //    (`built.devices`), so the caller's held list describes exactly
+            //    what was signed, and the version is the one that was published.
+            //    An absent callback skips the hand-off (backward compatible);
+            //    a throwing caller callback keeps `pendingSend` and surfaces
+            //    the static error without sending.
+            //
+            //    `handOff` is idempotent and re-attempted by `deliverResponse`
+            //    on retry. It returns false only when the caller's callback
+            //    threw: keep `pendingSend` (the retry/revoke controls stay
+            //    available) and stop before sending.
+            //    The callback is OPTIONAL for backward compatibility: a caller
+            //    that does not supply it (direct component use, tests) keeps
+            //    the previous behaviour. App supplies it for the primary, which
+            //    is where the stale-base bug existed.
+            if (!handOff(built)) return;
+
+            // 3. Send the new device its encrypted response, bound to the
             //    identity the QR named (never to whatever the relay served).
             //    From here on the list is already published, so a send failure
             //    must keep `built` for a retry instead of discarding it.
-            setPendingSend(built);
             await deliverResponse(built, attempt);
         } catch (e: unknown) {
             // Fail closed: a rejected build (e.g. a stale held version) publishes
@@ -535,6 +623,11 @@ export function useDeviceLinkingHandshake({
         built: BuildAndPublishLinkedListResult,
         attempt: number,
     ): Promise<void> => {
+        // DL-1: re-attempt the caller hand-off before (re)sending. On the
+        // initial path this is already recorded and returns immediately; after
+        // a callback failure on the first attempt, the retry gets another
+        // chance before any response is sent.
+        if (!handOff(built)) return;
         sendingRef.current = true;
         setSending(true);
         try {
