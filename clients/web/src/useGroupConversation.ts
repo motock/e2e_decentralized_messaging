@@ -97,10 +97,18 @@ export interface GroupMessage {
     // messages can be grouped instead of collapsing into one flat log.
     groupId?: string;
     // ── GRP-7: send outcome ─────────────────────────────────────────────
-    // How the fan-out to the group's real members actually went. `sent` only
-    // when every member's sendEnvelope resolved; `partial` when some did and
-    // some did not; `failed` when none did. Undefined for received messages.
+    // How the per-DEVICE fan-out actually went. A group envelope carries one
+    // ciphertext that is delivered to every recipient device mailbox — the bare
+    // handle for device 0, `${handle}:${deviceId}` for each linked device,
+    // including the sender's own other devices. `sent` when every device of
+    // every real member resolved; `partial` when some did and some did not (a
+    // member with two devices and one failure is partial); `failed` when none
+    // did. The sender's own devices are delivered to but are not members, so
+    // they never affect the status or the counts. Undefined for received
+    // messages.
     sendStatus?: 'sent' | 'partial' | 'failed';
+    // Real members with at least one failed device, and real members addressed
+    // (never devices, and never the sender's own handle).
     sendFailures?: number;
     sendTotal?: number;
     sendError?: string;
@@ -1134,6 +1142,10 @@ export function useGroupConversation({
                 });
             },
             unresolvedMembers: resolved.unresolvedMembers,
+            // The sender's own other devices are delivery targets, not members:
+            // excluding the handle keeps `sendTotal` equal to the real member
+            // count and keeps an own-device failure out of `sendFailures`.
+            ownAccountHandle: ownHandle,
         });
         const { sendStatus, sendFailures, sendTotal, failureMessage } = fanout;
         // A member whose device list could not be used is only reachable at its

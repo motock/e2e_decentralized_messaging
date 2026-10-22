@@ -651,17 +651,19 @@ export interface GroupDeviceSendResult {
 /** The aggregate outcome of a fan-out, in the shape `GroupMessage` records. */
 export interface GroupFanoutOutcome {
     /**
-     * `sent` when every device of every member was delivered to, `failed` when
-     * no device of any member was, `partial` otherwise.
+     * `sent` when every device of every real member was delivered to, `failed`
+     * when no device of any real member was, `partial` otherwise.
      *
      * This is counted per DEVICE, not per member: a member with two devices and
      * one failure is `partial`, not `sent` (its second device never got the
-     * message) and not `failed` (its first device did).
+     * message) and not `failed` (its first device did). The sender's own
+     * devices are delivered to but are not members, so they never affect this
+     * status.
      */
     sendStatus: GroupMemberSendStatus;
-    /** Members with at least one failed device. */
+    /** Real members with at least one failed device. */
     sendFailures: number;
-    /** Members addressed, not devices. */
+    /** Real members addressed, not devices. Excludes the sender's own handle. */
     sendTotal: number;
     /** The first device failure's message, for the user-facing error copy. */
     failureMessage?: string;
@@ -695,8 +697,19 @@ export async function fanOutGroupCiphertext(args: {
     onDeviceFailure?: (result: GroupDeviceSendResult) => void;
     /** Handles reported by the resolver as primary-only. */
     unresolvedMembers?: ReadonlyArray<string>;
+    /**
+     * The sender's own account handle.
+     *
+     * The resolver emits the sender's *other* devices as recipients with
+     * `accountHandle = ownAccountHandle`, so they are delivery targets but not
+     * group members. Excluding them from the member counts keeps `sendTotal`
+     * equal to the number of real members (the UI renders "sent to X of Y") and
+     * stops a failure of the sender's own second device from being reported as
+     * a member failure. Their devices are still delivered to.
+     */
+    ownAccountHandle?: string;
 }): Promise<GroupFanoutOutcome> {
-    const { plan, ciphertext, send, onDeviceFailure, unresolvedMembers } = args;
+    const { plan, ciphertext, send, onDeviceFailure, unresolvedMembers, ownAccountHandle } = args;
 
     const settled = await Promise.allSettled(
         plan.addresses.map((address) => send(address, new Uint8Array(ciphertext))),
@@ -717,20 +730,34 @@ export async function fanOutGroupCiphertext(args: {
         onDeviceFailure?.({ address, ok: false, error: outcome.reason });
     });
 
+    // The sender's own devices are delivered to above, but they are not group
+    // members: counting them would inflate `sendTotal` by one for every user
+    // with a linked device and turn a failure of the user's own second device
+    // into a member failure.
+    const memberFanouts = plan.members.filter(
+        (member) => member.accountHandle !== ownAccountHandle,
+    );
+
     let sendFailures = 0;
-    for (const member of plan.members) {
+    let memberDeviceTotal = 0;
+    let memberDeviceFailures = 0;
+    for (const member of memberFanouts) {
         const failed = member.addresses.filter((address) => failedAddresses.has(address)).length;
         if (failed > 0) sendFailures += 1;
+        memberDeviceTotal += member.addresses.length;
+        memberDeviceFailures += failed;
     }
 
-    const sendTotal = plan.members.length;
-    const deviceTotal = plan.addresses.length;
-    const deviceFailures = failedAddresses.size;
+    const sendTotal = memberFanouts.length;
     const sendStatus: GroupMemberSendStatus =
-        deviceFailures === 0 ? 'sent' : deviceFailures === deviceTotal ? 'failed' : 'partial';
+        memberDeviceFailures === 0
+            ? 'sent'
+            : memberDeviceFailures === memberDeviceTotal
+              ? 'failed'
+              : 'partial';
 
     const unresolved = new Set(unresolvedMembers ?? []);
-    const primaryOnlyMembers = plan.members
+    const primaryOnlyMembers = memberFanouts
         .filter((member) => unresolved.has(member.accountHandle))
         .map((member) => member.accountHandle);
 

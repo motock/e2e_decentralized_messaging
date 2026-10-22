@@ -110,7 +110,6 @@ const CIPHERTEXT = new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]);
 interface Harness {
     sent: Array<{ address: string; ciphertext: Uint8Array }>;
     gate: { open: () => Promise<void>; get: () => Promise<null>; put: ReturnType<typeof vi.fn> };
-    transport: GroupTransport;
 }
 
 /**
@@ -182,7 +181,7 @@ async function runSend(options: {
         await result.current.send();
     });
 
-    return { sent, gate, transport, result };
+    return { sent, gate, result };
 }
 
 describe('GF-3 group device fan-out', () => {
@@ -222,6 +221,65 @@ describe('GF-3 group device fan-out', () => {
         const ownDeliveries = sent.filter((s) => s.address.startsWith('me'));
         expect(ownDeliveries.map((s) => s.address)).toEqual(['me:3']);
         expect(Array.from(ownDeliveries[0].ciphertext)).toEqual(Array.from(CIPHERTEXT));
+    });
+
+    it("does not count the sender's own devices as a member in the outcome", async () => {
+        const { result } = await runSend({
+            ownDevices: [
+                { deviceId: 0, identityKey: key(0x11), bundleBytes: new Uint8Array([0x01]) },
+                { deviceId: 3, identityKey: key(0x13), bundleBytes: new Uint8Array([0x01]) },
+            ],
+        });
+
+        // One real member (`alice`), so the UI must say "sent to 1 of 1", not
+        // "sent to 1 of 2": the sender's own linked device is a delivery
+        // target, never a member of the group.
+        const message = result.current.messages.at(-1);
+        expect(message?.sendStatus).toBe('sent');
+        expect(message?.sendTotal).toBe(1);
+        expect(message?.sendFailures).toBe(0);
+        expect(result.current.sendError).toBeNull();
+    });
+
+    it("reports sent when only the sender's own second device fails", async () => {
+        const { sent, result } = await runSend({
+            ownDevices: [
+                { deviceId: 0, identityKey: key(0x11), bundleBytes: new Uint8Array([0x01]) },
+                { deviceId: 3, identityKey: key(0x13), bundleBytes: new Uint8Array([0x01]) },
+            ],
+            sendEnvelope: async (address) => {
+                if (address === 'me:3') throw new Error('relay unavailable');
+            },
+        });
+
+        // The own device was still attempted...
+        expect(sent.map((s) => s.address).sort()).toEqual(['alice', 'alice:2', 'me:3']);
+        // ...but its failure is not a member failure: every real member got it.
+        const message = result.current.messages.at(-1);
+        expect(message?.sendStatus).toBe('sent');
+        expect(message?.sendTotal).toBe(1);
+        expect(message?.sendFailures).toBe(0);
+        expect(result.current.sendError).toBeNull();
+    });
+
+    it("counts a real member's device failure but not the sender's own", async () => {
+        const { result } = await runSend({
+            ownDevices: [
+                { deviceId: 0, identityKey: key(0x11), bundleBytes: new Uint8Array([0x01]) },
+                { deviceId: 3, identityKey: key(0x13), bundleBytes: new Uint8Array([0x01]) },
+            ],
+            sendEnvelope: async (address) => {
+                if (address === 'me:3' || address === 'alice:2') {
+                    throw new Error('relay unavailable');
+                }
+            },
+        });
+
+        const message = result.current.messages.at(-1);
+        expect(message?.sendStatus).toBe('partial');
+        expect(message?.sendTotal).toBe(1);
+        expect(message?.sendFailures).toBe(1);
+        expect(result.current.sendError).toBe('Sent to 0 of 1 members.');
     });
 
     it('encrypts once and persists the session once per send, not once per device', async () => {
@@ -311,7 +369,10 @@ describe('GF-3 group device fan-out', () => {
             // The identity keys and the signed list blob must never appear.
             expect(logged).not.toContain(Array.from(key(0xa1)).join(','));
             expect(logged).not.toContain(Array.from(key(0xa2)).join(','));
-            expect(logged).not.toContain('222,222');
+            // The signed device-list blob is `[0xde, 0xad]`; it must not leak as
+            // a comma-joined array, as JSON (`{"0":222,"1":173}`) or as hex.
+            expect(logged).not.toContain('222,173');
+            expect(logged).not.toContain('"0":222');
             expect(logged).not.toContain('dead');
         } finally {
             warn.mockRestore();
