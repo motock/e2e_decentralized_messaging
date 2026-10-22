@@ -6,8 +6,10 @@ Ratchet, and Sender Keys for groups — over a peer-to-peer transport (`libp2p`)
 store-and-forward relays for offline delivery. That paragraph is the **target architecture**;
 what is built and tested today is the Rust core, the relay, the WASM/UniFFI bindings, and the
 web and desktop clients — the iOS, Android, and scaffolded desktop clients are not implemented
-yet (see `PLAN.md` §6.5 for the current-state vs target-state breakdown). See `PLAN.md` for the
-full design rationale and `docs/threat-model.md` for the adversary model.
+yet (see `PLAN.md` §6.5 for the current-state vs target-state breakdown). Group messages are
+addressed per recipient device, so a member's linked devices receive them too, not just their
+primary (see `spec/v0.md` §7.2). See `PLAN.md` for the full design rationale and
+`docs/threat-model.md` for the adversary model.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
