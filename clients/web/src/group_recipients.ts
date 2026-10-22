@@ -578,3 +578,167 @@ export async function resolveGroupRecipients({
 
     return { recipients, unresolvedMembers, appliedVersions, appliedLists };
 }
+
+// ── GF-3: fan the one ciphertext out to every recipient device ──────────────
+
+/** One member's device addresses, in the order they were resolved. */
+export interface GroupMemberFanout {
+    accountHandle: string;
+    /** De-duplicated device addresses for this member, primary first. */
+    addresses: string[];
+}
+
+/** The per-device send plan derived from a resolved recipient set. */
+export interface GroupFanoutPlan {
+    /**
+     * Every distinct device address to deliver to, in first-seen order.
+     *
+     * A group envelope carries ONE ciphertext: the per-message key is wrapped
+     * separately for each roster identity key, so the same bytes are delivered
+     * to every device mailbox. The relay keys its tag map by
+     * `(recipient_id, envelope hash)`, so N deliveries of identical bytes stay
+     * independent.
+     */
+    addresses: string[];
+    /** The same addresses grouped by member, for per-member outcome reporting. */
+    members: GroupMemberFanout[];
+}
+
+/**
+ * Turn a resolved recipient set into the per-device send plan.
+ *
+ * Addresses are de-duplicated (first wins) because a member can legitimately
+ * appear twice — the resolver de-dupes its own output, but a caller that
+ * appends a fallback recipient for a malformed roster key does not, and a
+ * duplicate delivery would double-count in the outcome. Members are keyed by
+ * `accountHandle`, so a member's devices are always reported together.
+ */
+export function planGroupFanout(
+    recipients: ReadonlyArray<GroupDeviceRecipient>,
+): GroupFanoutPlan {
+    const addresses: string[] = [];
+    const seen = new Set<string>();
+    const members: GroupMemberFanout[] = [];
+    const byHandle = new Map<string, GroupMemberFanout>();
+
+    for (const recipient of recipients) {
+        if (seen.has(recipient.address)) continue;
+        seen.add(recipient.address);
+        addresses.push(recipient.address);
+
+        let member = byHandle.get(recipient.accountHandle);
+        if (member === undefined) {
+            member = { accountHandle: recipient.accountHandle, addresses: [] };
+            byHandle.set(recipient.accountHandle, member);
+            members.push(member);
+        }
+        member.addresses.push(recipient.address);
+    }
+
+    return { addresses, members };
+}
+
+/** How one member's devices fared: every device, some, or none. */
+export type GroupMemberSendStatus = 'sent' | 'partial' | 'failed';
+
+/** The result of one device delivery. */
+export interface GroupDeviceSendResult {
+    address: string;
+    ok: boolean;
+    error?: unknown;
+}
+
+/** The aggregate outcome of a fan-out, in the shape `GroupMessage` records. */
+export interface GroupFanoutOutcome {
+    /**
+     * `sent` when every device of every member was delivered to, `failed` when
+     * no device of any member was, `partial` otherwise.
+     *
+     * This is counted per DEVICE, not per member: a member with two devices and
+     * one failure is `partial`, not `sent` (its second device never got the
+     * message) and not `failed` (its first device did).
+     */
+    sendStatus: GroupMemberSendStatus;
+    /** Members with at least one failed device. */
+    sendFailures: number;
+    /** Members addressed, not devices. */
+    sendTotal: number;
+    /** The first device failure's message, for the user-facing error copy. */
+    failureMessage?: string;
+    /**
+     * Members that were only reachable at their primary device because their
+     * signed device list could not be used (`unresolvedMembers`). Their linked
+     * devices were not addressed, so the send is not full coverage for them.
+     */
+    primaryOnlyMembers: string[];
+}
+
+/**
+ * Deliver one ciphertext to every device address in `plan`, then summarise.
+ *
+ * The ciphertext is encrypted ONCE by the caller and passed to every device
+ * unchanged (a fresh copy per send, so a transport that transfers or mutates
+ * its buffer cannot corrupt the others). Nothing here re-encrypts or
+ * re-persists: the ratchet advanced once, before the fan-out.
+ *
+ * Deliveries are awaited together and failures are collected per device rather
+ * than thrown: one device's relay failure must not be reported as a blanket
+ * failure of a send that did reach the others, and a rejected delivery must
+ * not be counted as a success either.
+ */
+export async function fanOutGroupCiphertext(args: {
+    plan: GroupFanoutPlan;
+    ciphertext: Uint8Array;
+    /** Deliver `ciphertext` to one device mailbox. */
+    send: (address: string, ciphertext: Uint8Array) => Promise<void>;
+    /** Called once per failed device, for logging. Never receives key bytes. */
+    onDeviceFailure?: (result: GroupDeviceSendResult) => void;
+    /** Handles reported by the resolver as primary-only. */
+    unresolvedMembers?: ReadonlyArray<string>;
+}): Promise<GroupFanoutOutcome> {
+    const { plan, ciphertext, send, onDeviceFailure, unresolvedMembers } = args;
+
+    const settled = await Promise.allSettled(
+        plan.addresses.map((address) => send(address, new Uint8Array(ciphertext))),
+    );
+
+    const failedAddresses = new Set<string>();
+    let failureMessage: string | undefined;
+    settled.forEach((outcome, index) => {
+        if (outcome.status === 'fulfilled') return;
+        const address = plan.addresses[index];
+        failedAddresses.add(address);
+        if (failureMessage === undefined) {
+            failureMessage =
+                outcome.reason instanceof Error
+                    ? outcome.reason.message
+                    : String(outcome.reason);
+        }
+        onDeviceFailure?.({ address, ok: false, error: outcome.reason });
+    });
+
+    let sendFailures = 0;
+    for (const member of plan.members) {
+        const failed = member.addresses.filter((address) => failedAddresses.has(address)).length;
+        if (failed > 0) sendFailures += 1;
+    }
+
+    const sendTotal = plan.members.length;
+    const deviceTotal = plan.addresses.length;
+    const deviceFailures = failedAddresses.size;
+    const sendStatus: GroupMemberSendStatus =
+        deviceFailures === 0 ? 'sent' : deviceFailures === deviceTotal ? 'failed' : 'partial';
+
+    const unresolved = new Set(unresolvedMembers ?? []);
+    const primaryOnlyMembers = plan.members
+        .filter((member) => unresolved.has(member.accountHandle))
+        .map((member) => member.accountHandle);
+
+    return {
+        sendStatus,
+        sendFailures,
+        sendTotal,
+        failureMessage,
+        primaryOnlyMembers,
+    };
+}

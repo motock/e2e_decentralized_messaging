@@ -10,6 +10,8 @@ import type { DiscoveryTransport } from './discovery';
 import {
     resolveGroupRecipients,
     isWellFormedIdentityKey,
+    planGroupFanout,
+    fanOutGroupCiphertext,
     type HeldDeviceList,
 } from './group_recipients';
 import {
@@ -1099,46 +1101,52 @@ export function useGroupConversation({
             setError('Could not save session state; message not sent');
             return;
         }
-        // Deliver the ciphertext to every real group member via sendEnvelope
-        // over the relay, addressed by each member's recipient ID — mirroring
-        // Conversation.tsx's send path.
+        // ── GF-3: fan the one ciphertext out to every recipient DEVICE ──────
+        // A group envelope carries ONE ciphertext whose per-message key is
+        // wrapped separately for each roster identity key, so the same bytes go
+        // to every device mailbox: the bare handle for device 0 and
+        // `${handle}:${deviceId}` for each linked device (including the
+        // sender's own other devices, which the resolver emits). The relay keys
+        // its tag map by `(recipient_id, envelope hash)`, so N deliveries of
+        // identical bytes keep independent tags.
         //
-        // GRP-7: this fan-out is AWAITED and its per-member outcome is recorded
+        // Nothing here re-encrypts or re-persists per device: the ratchet
+        // advanced once, above, and the blob was saved once. The fan-out only
+        // delivers.
+        //
+        // GRP-7: the fan-out is AWAITED and its per-member outcome is recorded
         // rather than swallowed by a fire-and-forget `.catch(console.warn)`.
-        // `allSettled` (not `all`) is deliberate: one member's relay failure
-        // must not be reported as a blanket failure of a send that did reach
-        // the others, and a rejected entry must not be silently counted as a
-        // success either.
-        const sendOutcomes = await Promise.allSettled(
-            realMembers.map((member) =>
-                runTransportOp(() =>
-                    transportRef.current.sendEnvelope(member.recipientId, new Uint8Array(ciphertext)),
-                ).catch((e) => {
-                    console.warn('sendEnvelope failed for group member', {
-                        recipientId: member.recipientId,
-                        error: e instanceof Error ? e.message : String(e),
-                    });
-                    throw e;
-                }),
-            ),
-        );
-        const sendTotal = sendOutcomes.length;
-        const sendFailures = sendOutcomes.filter((o) => o.status === 'rejected').length;
-        const sendStatus: GroupMessage['sendStatus'] =
-            sendFailures === 0 ? 'sent' : sendFailures === sendTotal ? 'failed' : 'partial';
-        const firstFailure = sendOutcomes.find((o) => o.status === 'rejected') as
-            | PromiseRejectedResult
-            | undefined;
-        const failureMessage = firstFailure
-            ? firstFailure.reason instanceof Error
-                ? firstFailure.reason.message
-                : String(firstFailure.reason)
-            : undefined;
+        // Failures are collected per device, so one device's relay failure is
+        // not reported as a blanket failure of a send that did reach the
+        // others, and a rejected delivery is never counted as a success.
+        const fanout = await fanOutGroupCiphertext({
+            plan: planGroupFanout(resolved.recipients),
+            ciphertext,
+            send: (address, bytes) =>
+                runTransportOp(() => transportRef.current.sendEnvelope(address, bytes)),
+            onDeviceFailure: ({ address, error }) => {
+                // Only the address and the error class: an address is a public
+                // mailbox id, and a transport error message is not guaranteed
+                // to be free of payload detail.
+                console.warn('sendEnvelope failed for group recipient device', {
+                    address,
+                    errorClass: error instanceof Error ? error.constructor.name : typeof error,
+                });
+            },
+            unresolvedMembers: resolved.unresolvedMembers,
+        });
+        const { sendStatus, sendFailures, sendTotal, failureMessage } = fanout;
+        // A member whose device list could not be used is only reachable at its
+        // primary device. Say so without naming keys or list contents.
+        const primaryOnlyNote =
+            fanout.primaryOnlyMembers.length > 0
+                ? ` Only the primary device of ${fanout.primaryOnlyMembers.length} member(s) could be reached.`
+                : '';
         setSendError(
             sendStatus === 'sent'
-                ? null
+                ? primaryOnlyNote.trim() || null
                 : sendStatus === 'partial'
-                  ? `Sent to ${sendTotal - sendFailures} of ${sendTotal} members.`
+                  ? `Sent to ${sendTotal - sendFailures} of ${sendTotal} members.${primaryOnlyNote}`
                   : `Failed to send: ${failureMessage ?? 'relay unavailable'}`,
         );
         setMessages((prev) => [
