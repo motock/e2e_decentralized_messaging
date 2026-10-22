@@ -249,6 +249,33 @@ function findSenderFromRoster(
  * state the component renders plus the handlers its controls call.
  */
 /**
+ * The mailbox this device polls for inbound group envelopes (GF-4).
+ *
+ * A group message is addressed per *device*, not per account, so the receive
+ * loop must poll this device's own mailbox rather than the account's bare
+ * handle. The rule is the same one the direct Conversation loop uses (MD-17b):
+ * the primary device (id 0) is addressed by the bare account handle, while a
+ * linked device (id >= 1) is addressed as `${accountHandle}:${deviceId}`.
+ *
+ * Fails safe: with no account handle, or a device id that is absent/null/
+ * negative, the caller's `selfRecipientId` is polled exactly as before GF-4.
+ */
+export function groupReceiveAddress({
+    accountHandle,
+    deviceId,
+    selfRecipientId,
+}: {
+    accountHandle?: string;
+    deviceId?: number;
+    selfRecipientId?: string;
+}): string | undefined {
+    if (accountHandle && typeof deviceId === 'number' && deviceId >= 1) {
+        return `${accountHandle}:${deviceId}`;
+    }
+    return selfRecipientId;
+}
+
+/**
  * The arguments `useGroupConversation` accepts.
  *
  * The first four are the component's own props. `ownDevices` and `discovery`
@@ -287,6 +314,22 @@ export interface UseGroupConversationArgs
      * which is the only device that can exist before device linking.
      */
     currentDeviceId?: number;
+    /**
+     * The account handle this device's mailbox is published under (GF-4).
+     *
+     * Together with `deviceId` this selects the *receive* address: the primary
+     * polls the bare handle, a linked device polls `${accountHandle}:${deviceId}`
+     * (see `groupReceiveAddress`). Distinct from `ownAccountHandle`, which the
+     * send path uses to fan a message out to the sender's other devices.
+     * Defaults to `selfRecipientId`, i.e. today's behaviour.
+     */
+    accountHandle?: string;
+    /**
+     * The device id this client is running as, for the receive address (GF-4).
+     * 0 is the primary (bare handle); >= 1 is a linked device. Absent or null
+     * falls back to `selfRecipientId` — fail safe, never a crash.
+     */
+    deviceId?: number;
 }
 
 export function useGroupConversation({
@@ -298,6 +341,8 @@ export function useGroupConversation({
     discovery,
     ownAccountHandle,
     currentDeviceId,
+    accountHandle,
+    deviceId,
 }: UseGroupConversationArgs) {
     const [ready, setReady] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -682,6 +727,9 @@ export function useGroupConversation({
     useEffect(() => {
         if (!identityProp || !selfRecipientId) return;
 
+        // GF-4: poll *this device's* mailbox, not the account's bare handle.
+        const receiveAddress = groupReceiveAddress({ accountHandle, deviceId, selfRecipientId });
+
         let cancelled = false;
         let timer: ReturnType<typeof setInterval> | null = null;
         const POLL_INTERVAL_MS = 5000;
@@ -703,7 +751,7 @@ export function useGroupConversation({
                 if (!currentGroup || !currentSelf) return;
 
                 const picked = await runTransportOp(() =>
-                    transportRef.current.pickupEnvelope(selfRecipientId!),
+                    transportRef.current.pickupEnvelope(receiveAddress!),
                 );
 
                 // ── Envelope-kind routing (GRP-6, out-of-band) ──────────────
@@ -813,7 +861,7 @@ export function useGroupConversation({
             if (timer) clearInterval(timer);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [identityProp, selfRecipientId]);
+    }, [identityProp, selfRecipientId, accountHandle, deviceId]);
 
     const createGroup = () => {
         if (!selfIdentity) return;

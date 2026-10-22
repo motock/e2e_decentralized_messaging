@@ -3,6 +3,7 @@ import { SealGlyph } from './design/SealGlyph';
 import { useGroupConversation } from './useGroupConversation';
 import type { IdentityHandle } from '../../../core/bindings/wasm/pkg/index.js';
 import type { StorageGate } from './storage';
+import type { DeviceListEntry } from './Conversation';
 import './GroupConversation.css';
 
 // The state machine and side effects (group crypto, StorageGate persistence,
@@ -97,6 +98,26 @@ export interface GroupConversationProps {
      * addressed to this ID. Omitting either prop fails closed.
      */
     selfRecipientId?: string;
+    /**
+     * The account handle this device's mailbox is published under (GF-4).
+     *
+     * With `deviceId` this selects the *receive* address: the primary device
+     * polls the bare handle, a linked device polls `${accountHandle}:${deviceId}`
+     * — the same rule the direct Conversation loop uses. Optional and backward
+     * compatible: absent, the receive loop polls `selfRecipientId` as before.
+     */
+    accountHandle?: string;
+    /**
+     * The device id this client is running as (GF-4). 0 is the primary (bare
+     * handle); >= 1 is a linked device. Absent or null falls back to
+     * `selfRecipientId` — fail safe, never a crash.
+     */
+    deviceId?: number;
+    /**
+     * The sender's own devices, as published in its signed device list (GF-2).
+     * Optional; absent means the sender does not address itself.
+     */
+    ownDevices?: DeviceListEntry[];
 }
 
 export const GroupConversation: React.FC<GroupConversationProps> = ({
@@ -104,6 +125,8 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
     storageGate,
     identity: identityProp,
     selfRecipientId,
+    accountHandle,
+    deviceId,
 }) => {
     const {
         ready,
@@ -125,7 +148,20 @@ export const GroupConversation: React.FC<GroupConversationProps> = ({
         removePeer,
         reAddPeer,
         send,
-    } = useGroupConversation({ transport, storageGate, identity: identityProp, selfRecipientId });
+    } = useGroupConversation({
+        transport,
+        storageGate,
+        identity: identityProp,
+        selfRecipientId,
+        // GF-4: the receive address. The primary (deviceId 0) polls the bare
+        // handle, a linked device polls `${accountHandle}:${deviceId}`.
+        accountHandle,
+        deviceId,
+        // `ownDevices` is deliberately NOT forwarded yet: the hook's send path
+        // uses it to fan a group message out to the sender's own devices, and
+        // GF-4 must not change send behavior. It is accepted here so App can
+        // pass it at the render site for the send-path story.
+    });
 
     if (error) {
         return <div role="alert" className="group-error">Group conversation unavailable: {error}</div>;

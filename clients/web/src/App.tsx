@@ -906,6 +906,14 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                         selfRecipientId={recipientId ?? undefined}
                                         storageGate={sessionGate}
                                         transport={groupTransport}
+                                        // GF-4: the group receive loop polls
+                                        // THIS device's mailbox. The primary
+                                        // (deviceId 0) polls the bare handle, a
+                                        // linked device polls
+                                        // `${accountHandle}:${deviceId}`.
+                                        accountHandle={identity?.recipientId}
+                                        deviceId={currentDeviceId ?? 0}
+                                        ownDevices={ownList?.devices}
                                     />
                                 )}
                                 {view === 'link' && (
