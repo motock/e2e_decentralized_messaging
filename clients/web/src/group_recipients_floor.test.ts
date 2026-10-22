@@ -703,4 +703,277 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
         expect(transport.sent).toEqual([]);
         expect(view.result.current.error).toMatch(/Could not save session state/);
     });
+
+    /** The group object handed to the encrypt call, as a key list. */
+    function encryptedRoster(): Uint8Array[] {
+        const group = mocks.group_encrypt.mock.calls[0][0] as { members: Uint8Array[] };
+        return group.members;
+    }
+
+    it('evicts a removed member\'s linked device from the roster immediately', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({
+            gate,
+            transport,
+            discovery: discoveryWith({ 'member-b': new Uint8Array([0x01]) }),
+        });
+
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // The linked device was added to the roster and remembered, so the
+        // eviction below can find it even though the roster cannot be listed.
+        const trackedWrite = [...gate.writes].reverse().find((w) => w.id === 'group-state');
+        const trackedState = trackedWrite!.value as {
+            rosterDeviceKeys?: Array<[string, number[]]>;
+        };
+        expect(
+            trackedState.rosterDeviceKeys?.some(
+                ([handle, key]) =>
+                    handle === 'member-b' && sameKey(new Uint8Array(key), idKey(0x03)),
+            ),
+        ).toBe(true);
+
+        mocks.group_remove_member.mockClear();
+        await act(async () => {
+            view.result.current.removePeer('member-b');
+        });
+        await flush();
+
+        // Removing the peer evicts the account key AND its linked device.
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x02)))).toBe(true);
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+
+        // The tracked set no longer remembers a key for that handle.
+        const afterRemoval = [...gate.writes].reverse().find((w) => w.id === 'group-state');
+        const persisted = afterRemoval!.value as {
+            rosterDeviceKeys?: Array<[string, number[]]>;
+        };
+        expect(
+            (persisted.rosterDeviceKeys ?? []).some(([handle]) => handle === 'member-b'),
+        ).toBe(false);
+    });
+
+    it('evicts a revoked device from the roster on the next send', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view, selfBytes } = await setupHook({
+            gate,
+            transport,
+            discovery: discoveryWith({ 'member-b': new Uint8Array([0x01]) }),
+        });
+
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // The account revokes device 3: the next verified list is v8 and no
+        // longer names it.
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(8, [{ deviceId: 0, identityKey: idKey(0x02) }]),
+        );
+        mocks.group_remove_member.mockClear();
+        mocks.group_encrypt.mockClear();
+
+        await act(async () => {
+            view.result.current.setInput('second');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // The revoked device was removed from the roster and got no wrapper.
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+        const roster = encryptedRoster();
+        expect(roster.some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+
+        // The sender's own key is never evicted.
+        expect(roster.some((key) => sameKey(key, selfBytes))).toBe(true);
+        expect(removedKeys.some((key) => sameKey(key, selfBytes))).toBe(false);
+
+        // The eviction is durable: the tracked set no longer carries the key.
+        const lastWrite = [...gate.writes].reverse().find((w) => w.id === 'group-state');
+        const persisted = lastWrite!.value as {
+            rosterDeviceKeys?: Array<[string, number[]]>;
+        };
+        expect(
+            (persisted.rosterDeviceKeys ?? []).some(([, key]) =>
+                sameKey(new Uint8Array(key), idKey(0x03)),
+            ),
+        ).toBe(false);
+    });
+
+    it('keeps the eviction record when persisting the reconcile fails', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+        const workingPut = gate.put.getMockImplementation()!;
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({
+            gate,
+            transport,
+            discovery: discoveryWith({ 'member-b': new Uint8Array([0x01]) }),
+        });
+
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // Device 3 is revoked, but the persisted reconcile write now fails.
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(8, [{ deviceId: 0, identityKey: idKey(0x02) }]),
+        );
+        gate.put.mockImplementation(async () => {
+            throw new Error('storage unavailable');
+        });
+
+        await act(async () => {
+            view.result.current.setInput('second');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+        expect(view.result.current.error).toMatch(/Could not save session state/);
+
+        // Storage recovers. The failed attempt must not have forgotten that
+        // device 3 is in the still-unsaved roster, so the next send evicts it.
+        gate.put.mockImplementation(workingPut);
+        mocks.group_encrypt.mockClear();
+        mocks.group_remove_member.mockClear();
+
+        await act(async () => {
+            view.result.current.setInput('third');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+        expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+    });
+
+    it('still evicts a revoked device after a reload, from the persisted tracked keys', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+        const discovery = discoveryWith({ 'member-b': new Uint8Array([0x01]) });
+
+        // Round-trip the group handle through the same object, so the restored
+        // hook resumes the exact roster the first session persisted (including
+        // device 3).
+        let lastSerialized: { members: Uint8Array[] } | null = null;
+        mocks.group_to_bytes.mockImplementation((group: { members: Uint8Array[] }) => {
+            lastSerialized = group;
+            return new Uint8Array([0x01]);
+        });
+        mocks.group_from_bytes.mockImplementation(() => lastSerialized);
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({ gate, transport, discovery });
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        const persistedRecord = [...gate.writes].reverse().find((w) => w.id === 'group-state')!
+            .value;
+        view.unmount();
+
+        // A fresh hook, as after a page reload: the gate serves the persisted
+        // record and the restored blob still names device 3.
+        const writes: Array<{ store: string; id: string; value: unknown }> = [];
+        const reloadGate = {
+            writes,
+            put: vi.fn(async (store: string, id: string, value: unknown) => {
+                writes.push({ store, id, value });
+            }),
+            open: async () => {},
+            get: async (_store: string, id: string) =>
+                id === 'group-state' ? persistedRecord : null,
+        };
+        const selfBytes = idKey(0x01);
+        const identity = { public_bytes: () => selfBytes } as never;
+        const reloaded = renderHook(() =>
+            useGroupConversation({
+                transport: transport as never,
+                storageGate: reloadGate as never,
+                identity,
+                selfRecipientId: 'group-a',
+                discovery: discovery as never,
+                ownDevices: undefined as never,
+                ownAccountHandle: 'group-a',
+                currentDeviceId: 0,
+            }),
+        );
+        await flush();
+
+        // The account now serves the v8 list without device 3.
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(8, [{ deviceId: 0, identityKey: idKey(0x02) }]),
+        );
+        mocks.group_remove_member.mockClear();
+        mocks.group_encrypt.mockClear();
+
+        await act(async () => {
+            reloaded.result.current.setInput('second');
+        });
+        await act(async () => {
+            await reloaded.result.current.send();
+        });
+
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+        expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+    });
 });
