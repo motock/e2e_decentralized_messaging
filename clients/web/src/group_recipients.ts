@@ -13,10 +13,18 @@
  *    account identity key and throws on tampered, foreign-signed, or malformed
  *    bytes. Nothing from an unverified blob is ever returned to the caller.
  *  - **Partial coverage is explicit, not silent.** A member with no published
- *    list — or whose list fails verification or lookup — still gets a single
- *    recipient at its bare handle (the primary is reachable; linked devices are
- *    not) and is reported in `unresolvedMembers` so the caller can surface the
- *    gap. One member's failure never fails the whole send.
+ *    list — and no cached contents — or whose list fails verification or
+ *    lookup still gets a single recipient at its bare handle (the primary is
+ *    reachable; linked devices are not) and is reported in `unresolvedMembers`
+ *    so the caller can surface the gap. One member's failure never fails the
+ *    whole send.
+ *  - **A cached verified list beats no list.** When `lookupDeviceList` returns
+ *    null (no list, a lookup failure, or a version no newer than the floor),
+ *    the caller's cached contents for that handle are used instead. The floor
+ *    makes every unchanged list "not newer", so without the cache a member's
+ *    linked devices would drop out of the fan-out on every send after the
+ *    first. Cached keys are shape-checked again before they are emitted; only
+ *    unverified bytes are never used, and none are in this path.
  *  - **Fail closed on malformed input.** Every identity key must be exactly 33
  *    bytes with the `0x05` Curve25519 type byte, and every account handle must
  *    pass the shared handle rules (non-empty, ≤64 chars, no C0/C1/bidi/

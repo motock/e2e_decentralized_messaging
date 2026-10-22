@@ -1092,4 +1092,82 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
         expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
         expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(false);
     });
+
+    it('keeps a linked device across a reload when its list is unchanged', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+        const discovery = discoveryWith({ 'member-b': new Uint8Array([0x01]) });
+
+        let lastSerialized: { members: Uint8Array[] } | null = null;
+        mocks.group_to_bytes.mockImplementation((group: { members: Uint8Array[] }) => {
+            lastSerialized = group;
+            return new Uint8Array([0x01]);
+        });
+        mocks.group_from_bytes.mockImplementation(() => lastSerialized);
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({ gate, transport, discovery });
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        const persistedRecord = [...gate.writes].reverse().find((w) => w.id === 'group-state')!
+            .value as { deviceLists?: unknown };
+        // The verified contents were cached beside the floor.
+        expect(persistedRecord.deviceLists).toBeDefined();
+        view.unmount();
+
+        const writes: Array<{ store: string; id: string; value: unknown }> = [];
+        const reloadGate = {
+            writes,
+            put: vi.fn(async (store: string, id: string, value: unknown) => {
+                writes.push({ store, id, value });
+            }),
+            open: async () => {},
+            get: async (_store: string, id: string) =>
+                id === 'group-state' ? persistedRecord : null,
+        };
+        const selfBytes = idKey(0x01);
+        const identity = { public_bytes: () => selfBytes } as never;
+        const reloaded = renderHook(() =>
+            useGroupConversation({
+                transport: transport as never,
+                storageGate: reloadGate as never,
+                identity,
+                selfRecipientId: 'group-a',
+                discovery: discovery as never,
+                ownDevices: undefined as never,
+                ownAccountHandle: 'group-a',
+                currentDeviceId: 0,
+            }),
+        );
+        await flush();
+
+        // The relay still serves the same v7 list, which the restored floor
+        // makes "not newer". The restored cache must keep the linked device.
+        mocks.group_remove_member.mockClear();
+        mocks.group_encrypt.mockClear();
+
+        await act(async () => {
+            reloaded.result.current.setInput('second');
+        });
+        await act(async () => {
+            await reloaded.result.current.send();
+        });
+
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+        expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+    });
 });
