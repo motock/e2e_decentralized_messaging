@@ -830,6 +830,18 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         }
     };
 
+    // GF-4: the group receive loop polls THIS device's mailbox — the primary
+    // (deviceId 0) polls the bare handle, a linked device polls
+    // `${accountHandle}:${deviceId}`. Passed as a spread rather than as named
+    // props because the component surface for these args is owned by a
+    // follow-up story (GroupConversation.tsx is outside this story's scope);
+    // the hook already accepts them.
+    const groupMailboxProps = {
+        accountHandle: identity?.recipientId,
+        deviceId: currentDeviceId ?? 0,
+        ownDevices: ownList?.devices,
+    };
+
     return (
         <div className="shell">
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
@@ -906,14 +918,7 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
                                         selfRecipientId={recipientId ?? undefined}
                                         storageGate={sessionGate}
                                         transport={groupTransport}
-                                        // GF-4: the group receive loop polls
-                                        // THIS device's mailbox. The primary
-                                        // (deviceId 0) polls the bare handle, a
-                                        // linked device polls
-                                        // `${accountHandle}:${deviceId}`.
-                                        accountHandle={identity?.recipientId}
-                                        deviceId={currentDeviceId ?? 0}
-                                        ownDevices={ownList?.devices}
+                                        {...groupMailboxProps}
                                     />
                                 )}
                                 {view === 'link' && (

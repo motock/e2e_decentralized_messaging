@@ -15,7 +15,7 @@
 
 import '@testing-library/jest-dom';
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act, fireEvent } from '@testing-library/react';
+import { renderHook, act } from '@testing-library/react';
 
 async function flush() {
     await act(async () => {
@@ -48,7 +48,7 @@ vi.mock('../src/storage', () => {
 vi.mock('../src/wasm_init', () => ({ ensureWasmInit: async () => {} }));
 vi.mock('../src/storage_key', () => ({ getStorageKey: () => new Uint8Array(32) }));
 
-import { GroupConversation } from '../src/GroupConversation';
+import { useGroupConversation } from '../src/useGroupConversation';
 import { StorageGate as MockStorageGate } from '../src/storage';
 import { generate_identity, generate_prekey_bundle } from '../../../core/bindings/wasm/pkg/index.js';
 
@@ -82,23 +82,23 @@ async function mountWithGroup(
         generate_prekey_bundle(peerIdentity) as unknown as Uint8Array<ArrayBuffer>,
     );
 
-    const view = render(
-        <GroupConversation
-            transport={transport}
-            identity={selfIdentity}
-            selfRecipientId={selfRecipientId}
-            {...extraProps}
-        />,
+    const { result } = renderHook(() =>
+        useGroupConversation({
+            transport,
+            identity: selfIdentity,
+            selfRecipientId,
+            ...extraProps,
+        }),
     );
     await flush();
-    fireEvent.click(screen.getByTestId('create-group-button'));
-    await flush();
-    fireEvent.change(screen.getByTestId('group-peer-id-input'), {
-        target: { value: peerRecipientId },
+    // The receive loop only polls once a group handle exists (it must not
+    // consume envelopes it cannot yet decrypt). Creating the group is enough:
+    // the loop needs `groupRef` and `selfIdentityRef`, not any peer.
+    await act(async () => {
+        result.current.createGroup();
     });
-    fireEvent.click(screen.getByTestId('add-peer-button'));
     await flush();
-    return view;
+    return result;
 }
 
 /** The distinct addresses the receive loop has polled so far. */
