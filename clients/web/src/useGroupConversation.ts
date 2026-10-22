@@ -7,7 +7,22 @@ import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import type { GroupConversationProps, GroupTransport } from './GroupConversation';
 import type { DeviceListEntry } from './Conversation';
 import type { DiscoveryTransport } from './discovery';
-import { resolveGroupRecipients, isWellFormedIdentityKey } from './group_recipients';
+import {
+    resolveGroupRecipients,
+    isWellFormedIdentityKey,
+    type HeldDeviceList,
+} from './group_recipients';
+import {
+    reconcileRoster,
+    validatedRosterDeviceKeys,
+    type TrackedRosterKey,
+} from './group_roster';
+import {
+    validatedDeviceListVersions,
+    validatedGroupBlob,
+    validatedHeldDeviceLists,
+    type PersistedGroupState,
+} from './group_state';
 
 // The state machine and side effects behind GroupConversation.tsx: the Sender
 // Keys group crypto calls (group_create/group_add_member/group_remove_member/
@@ -101,58 +116,6 @@ interface RealMember {
 }
 
 /**
- * The persisted group state record. Stored via StorageGate (AES-256-GCM at
- * rest) so membership AND the sender-key ratchet state survive a page reload.
- * Public keys are stored as number arrays (JSON-serializable).
- *
- * `blob` is the group_to_bytes serialization of the group handle at the time
- * of the last persist — secret ratchet state (chain key + position), stored
- * encrypted, never logged. It is absent only in records written before
- * ratchet persistence existed; such a legacy record is restored by replaying
- * group_create + group_add_member (the pre-GRP-4 behavior).
- */
-interface PersistedGroupState {
-    members: Array<{ recipientId: string; publicBytes: number[] }>;
-    /** group_to_bytes(group) as of the last persist; absent in legacy records. */
-    blob?: number[];
-    /**
-     * Highest device-list version applied per account handle (GF-2).
-     *
-     * This is the durable monotonic floor for `resolveGroupRecipients`. It has
-     * to survive a reload: without it every send starts at `null`, and a relay
-     * replaying an older (validly signed) device list would resurrect a device
-     * the user has revoked (§8.4). Absent in records written before GF-2.
-     *
-     * Stored as an array of `[handle, version]` pairs so it is JSON-serializable
-     * and keeps its insertion order.
-     */
-    deviceListVersions?: Array<[string, number]>;
-    /**
-     * Device identity keys this client added to the group roster, as
-     * `[accountHandle, identityKeyBytes]` pairs (GF-2).
-     *
-     * The roster is a key set with no enumeration API, so a key that is no
-     * longer a recipient — a removed member's linked device, or a device the
-     * account revoked — can only be evicted if we remember what we put there.
-     * This is that record. It has to survive a reload for the same reason the
-     * floor does: otherwise a device removed in one session stays in the
-     * restored roster for the next one and keeps receiving wrappers.
-     *
-     * Absent in records written before this tracking existed.
-     */
-    rosterDeviceKeys?: Array<[string, number[]]>;
-}
-
-/** A roster identity key remembered so a later reconciliation can evict it. */
-interface TrackedRosterKey {
-    accountHandle: string;
-    identityKey: Uint8Array;
-}
-
-/** Largest serialized group state accepted on restore (1 MiB). */
-const MAX_GROUP_BLOB_LENGTH = 1048576;
-
-/**
  * The wire format's cap on wrapper recipients in one group envelope.
  *
  * `GroupSession::encrypt_as` seals the per-message key to every identity key in
@@ -174,85 +137,6 @@ const NO_DISCOVERY: DiscoveryTransport = {
     publishDiscovery: async () => {},
     lookupDiscovery: async () => null,
 };
-
-/** True for a value that is a valid byte (integer in 0..255). */
-function isByte(entry: unknown): entry is number {
-    return Number.isInteger(entry) && (entry as number) >= 0 && (entry as number) <= 255;
-}
-
-/**
- * Validate a stored group blob before handing any bytes to WASM.
- *
- * Returns the bytes, or `null` when the record simply has no blob (a legacy
- * record from before ratchet persistence). Throws on a blob that is present
- * but structurally invalid — the caller must fail closed rather than build a
- * fresh session: a fresh session starts a different chain, and silently
- * dropping the persisted state is the very failure this persistence prevents.
- */
-function validatedGroupBlob(blob: unknown): Uint8Array | null {
-    if (blob === undefined || blob === null) return null;
-    if (!Array.isArray(blob) || blob.length === 0) {
-        throw new Error('invalid persisted group state');
-    }
-    if (blob.length > MAX_GROUP_BLOB_LENGTH) {
-        throw new Error('invalid persisted group state');
-    }
-    if (!blob.every(isByte)) {
-        throw new Error('invalid persisted group state');
-    }
-    return new Uint8Array(blob);
-}
-
-/**
- * Read the persisted device-list version floor, ignoring unusable entries.
- *
- * The floor is security-critical, so the failure modes are asymmetric: a
- * *missing* entry only means "no floor for that handle" (the resolver then
- * accepts whatever the relay serves, which is the pre-GF-2 behaviour), while a
- * *lowered* entry would let a replayed list through. So an unreadable record
- * contributes nothing rather than a guessed value, and a value that is not a
- * non-negative safe integer is dropped instead of being coerced — a `NaN` floor
- * would disable the replay guard entirely.
- *
- * The caller merges the result into the live floor with `Math.max`, so a
- * restored record can never lower a floor already held in memory.
- */
-function validatedDeviceListVersions(raw: unknown): Map<string, number> {
-    const versions = new Map<string, number>();
-    if (!Array.isArray(raw)) return versions;
-    for (const entry of raw) {
-        if (!Array.isArray(entry) || entry.length !== 2) continue;
-        const [handle, version] = entry as [unknown, unknown];
-        if (typeof handle !== 'string' || handle.length === 0) continue;
-        if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 0) continue;
-        versions.set(handle, version);
-    }
-    return versions;
-}
-
-/**
- * Read the persisted tracked roster keys, dropping unusable entries.
- *
- * The tracked set only ever causes a key to be *removed* from the roster when
- * it is no longer a recipient, so a dropped entry is a missed eviction, not a
- * wrong one. A malformed key would be refused by `group_remove_member` anyway,
- * and passing arbitrary bytes to WASM is not worth the risk: validate the same
- * shape the resolver emits (33-byte, 0x05 Curve25519) and ignore the rest.
- */
-function validatedRosterDeviceKeys(raw: unknown): TrackedRosterKey[] {
-    const keys: TrackedRosterKey[] = [];
-    if (!Array.isArray(raw)) return keys;
-    for (const entry of raw) {
-        if (!Array.isArray(entry) || entry.length !== 2) continue;
-        const [handle, rawBytes] = entry as [unknown, unknown];
-        if (typeof handle !== 'string' || handle.length === 0) continue;
-        if (!Array.isArray(rawBytes) || !rawBytes.every(isByte)) continue;
-        const bytes = new Uint8Array(rawBytes);
-        if (!isWellFormedIdentityKey(bytes)) continue;
-        keys.push({ accountHandle: handle, identityKey: bytes });
-    }
-    return keys;
-}
 
 const GROUP_STORE = 'session' as const;const GROUP_RECORD_ID = 'group-state';
 const GROUP_MESSAGES_STORE = 'messages' as const;
@@ -438,6 +322,11 @@ export function useGroupConversation({
     // device, or a revoked device). Persisted alongside the group state; a
     // reload without it would leave those keys in the restored roster.
     const rosterDeviceKeysRef = useRef<Map<string, TrackedRosterKey>>(new Map());
+    // GF-2: the last verified device list contents per handle, persisted beside
+    // the version floor. The floor makes an unchanged list "not newer", so
+    // without the contents every send after the first would resolve the member
+    // to its bare primary and the sweep would evict its linked devices.
+    const heldDeviceListsRef = useRef<Map<string, HeldDeviceList>>(new Map());
 
     // GRP-6: when no transport is injected (the App-level wiring was scoped out
     // of this story), build the default transport tagged with THIS loop's
@@ -598,6 +487,17 @@ export function useGroupConversation({
                             rosterDeviceKeysRef.current.set(hex, tracked);
                         }
                     }
+                    // GF-2: restore the cached device lists. Merged by version
+                    // so an older record can never replace a newer list already
+                    // held in memory.
+                    for (const [handle, list] of validatedHeldDeviceLists(
+                        persisted?.deviceLists,
+                    )) {
+                        const held = heldDeviceListsRef.current.get(handle);
+                        if (held === undefined || list.version > held.version) {
+                            heldDeviceListsRef.current.set(handle, list);
+                        }
+                    }
                     if (persisted?.members?.length) {
                         const restored: RealMember[] = persisted.members.map((m) => ({
                             recipientId: m.recipientId,
@@ -722,6 +622,22 @@ export function useGroupConversation({
             if (rosterDeviceKeysRef.current.size > 0) {
                 state.rosterDeviceKeys = Array.from(rosterDeviceKeysRef.current.values()).map(
                     (tracked) => [tracked.accountHandle, Array.from(tracked.identityKey)],
+                );
+            }
+            // GF-2: cache the verified list contents too. The floor alone makes
+            // an unchanged list resolve to the bare primary on the next send.
+            if (heldDeviceListsRef.current.size > 0) {
+                state.deviceLists = Array.from(heldDeviceListsRef.current.entries()).map(
+                    ([handle, list]) => [
+                        handle,
+                        {
+                            version: list.version,
+                            devices: list.devices.map((device) => [
+                                device.deviceId,
+                                Array.from(device.identityKey),
+                            ]),
+                        },
+                    ],
                 );
             }
             await gate.put(GROUP_STORE, GROUP_RECORD_ID, state);
@@ -968,13 +884,20 @@ export function useGroupConversation({
         // decrypt that message; the send-time sweep is the second line of
         // defence, not the first. The sender's own key is never tracked, but
         // guard it explicitly so a corrupt persisted record cannot remove it.
+        // Collect the entries first: if a removal throws, the handle is
+        // unchanged, so the tracking that matches it must be too.
         const selfPublicBytes = selfIdentity?.public_bytes();
-        for (const [hex, tracked] of [...rosterDeviceKeysRef.current]) {
+        const purgedKeys: string[] = [];
+        for (const [hex, tracked] of rosterDeviceKeysRef.current) {
             if (tracked.accountHandle !== recipientId) continue;
-            rosterDeviceKeysRef.current.delete(hex);
+            purgedKeys.push(hex);
             if (selfPublicBytes && bytesEqual(tracked.identityKey, selfPublicBytes)) continue;
+            // The member's account key was removed above; a tracked device-0
+            // entry for the same key would only rotate the chain again.
+            if (bytesEqual(tracked.identityKey, member.publicBytes)) continue;
             updatedGroup = group_remove_member(updatedGroup, tracked.identityKey);
         }
+        for (const hex of purgedKeys) rosterDeviceKeysRef.current.delete(hex);
         setGroup(updatedGroup);
         const updatedMembers = realMembers.filter((m) => m.recipientId !== recipientId);
         setRealMembers(updatedMembers);
@@ -1049,6 +972,7 @@ export function useGroupConversation({
                 ownIdentityKey: selfPublicBytes,
                 discovery: discoveryTransport ?? NO_DISCOVERY,
                 heldVersions: deviceListVersionsRef.current,
+                heldLists: heldDeviceListsRef.current,
             });
         } catch (e) {
             // A bad held version or an ambiguous duplicate handle: fail closed
@@ -1100,84 +1024,38 @@ export function useGroupConversation({
         // can never diverge.
         deviceListVersionsRef.current = mergedHeldVersions;
 
+        // Cache the contents of every list this resolution applied, so the next
+        // send can resolve the same recipients even though the floor now makes
+        // those lists "not newer". Monotonic by version, like the floor.
+        for (const [handle, list] of resolved.appliedLists) {
+            const held = heldDeviceListsRef.current.get(handle);
+            if (held === undefined || list.version > held.version) {
+                heldDeviceListsRef.current.set(handle, list);
+            }
+        }
+
         // ── Reconcile the group handle's roster to those keys ───────────────
         // `group_add_member` appends a key and `group_remove_member` removes one
         // (rotating the chain key), so the handle is brought in line with the
-        // recipient set before it encrypts.
-        let reconciled = group;
-        const rosterKeys: Uint8Array[] = [selfPublicBytes, ...realMembers.map((m) => m.publicBytes)];
-        const hasKey = (key: Uint8Array) => rosterKeys.some((existing) => bytesEqual(existing, key));
-        const isRecipient = (key: Uint8Array) =>
-            resolved.recipients.some((recipient) => bytesEqual(recipient.identityKey, key));
-
-        // Work on a copy of the tracked set and commit it only once the
-        // reconciled roster has been persisted. The group handle is pure
-        // (`group_add_member`/`group_remove_member` return a clone), so a failed
-        // persist leaves the in-memory roster unchanged and still holding the
-        // evicted keys; dropping their tracking entries here would leave them
-        // in the roster forever, since only a tracked key can ever be evicted.
+        // recipient set before it encrypts. The reconcile is pure and builds a
+        // new tracked set; nothing is committed until the roster is persisted.
         const previousTrackedRosterKeys = rosterDeviceKeysRef.current;
-        const trackedRosterKeys = new Map(previousTrackedRosterKeys);
-        rosterDeviceKeysRef.current = trackedRosterKeys;
-
+        let reconciled: GroupHandle;
+        let nextTrackedRosterKeys: Map<string, TrackedRosterKey>;
         try {
-            for (const recipient of resolved.recipients) {
-                if (hasKey(recipient.identityKey)) continue;
-                reconciled = group_add_member(reconciled, recipient.identityKey);
-                rosterKeys.push(recipient.identityKey);
-            }
-
-            // Track every recipient device key currently in the roster, so a
-            // later send can evict it once it stops being a recipient. The
-            // roster has no enumeration API, so an untracked key can never be
-            // removed. The sender's own key is deliberately not tracked: it
-            // must never be evicted.
-            for (const recipient of resolved.recipients) {
-                if (bytesEqual(recipient.identityKey, selfPublicBytes)) continue;
-                const hex = toHex(recipient.identityKey);
-                if (!trackedRosterKeys.has(hex)) {
-                    trackedRosterKeys.set(hex, {
-                        accountHandle: recipient.accountHandle,
-                        identityKey: recipient.identityKey,
-                    });
-                }
-            }
-
-            // Evict every tracked key that is no longer a recipient — a linked
-            // device of a removed member, or a device its account revoked.
-            // Without this the key stays in the roster and keeps receiving a
-            // wrapper for every message, so the device can still decrypt.
-            for (const [hex, tracked] of [...trackedRosterKeys]) {
-                if (bytesEqual(tracked.identityKey, selfPublicBytes)) {
-                    trackedRosterKeys.delete(hex);
-                    continue;
-                }
-                if (isRecipient(tracked.identityKey)) continue;
-                reconciled = group_remove_member(reconciled, tracked.identityKey);
-                const index = rosterKeys.findIndex((key) =>
-                    bytesEqual(key, tracked.identityKey),
-                );
-                if (index >= 0) rosterKeys.splice(index, 1);
-                trackedRosterKeys.delete(hex);
-            }
-
-            // Remove every member-account key that is no longer a recipient (a
-            // revoked or removed device). The sender's own key is never
-            // removed: `group_create(self)` put it there and the sender must
-            // stay able to decrypt its own group.
-            for (const member of realMembers) {
-                if (bytesEqual(member.publicBytes, selfPublicBytes)) continue;
-                if (!hasKey(member.publicBytes)) continue;
-                if (isRecipient(member.publicBytes)) continue;
-                reconciled = group_remove_member(reconciled, member.publicBytes);
-                const index = rosterKeys.findIndex((key) => bytesEqual(key, member.publicBytes));
-                if (index >= 0) rosterKeys.splice(index, 1);
-            }
+            const result = reconcileRoster({
+                group,
+                selfPublicBytes,
+                recipients: resolved.recipients,
+                memberKeys: realMembers.map((member) => member.publicBytes),
+                unresolvedHandles: new Set(resolved.unresolvedMembers),
+                tracked: previousTrackedRosterKeys,
+            });
+            reconciled = result.group;
+            nextTrackedRosterKeys = result.tracked;
         } catch (e) {
             // Reconciliation could not be completed: fail closed rather than
             // encrypt against a roster that does not match the recipient set.
-            // The handle is unchanged, so keep the tracking that matches it.
-            rosterDeviceKeysRef.current = previousTrackedRosterKeys;
             setError(
                 `Could not reconcile the group roster; message not sent: ${
                     e instanceof Error ? e.message : String(e)
@@ -1185,6 +1063,7 @@ export function useGroupConversation({
             );
             return;
         }
+        rosterDeviceKeysRef.current = nextTrackedRosterKeys;
 
         // ── Persist the reconciled roster AND the floor BEFORE encrypting ───
         // A skipped ratchet step is safe; a reused message key is not, and a
@@ -1203,6 +1082,12 @@ export function useGroupConversation({
         try {
             ciphertext = group_encrypt(reconciled, selfIdentity, plaintextBytes);
         } catch (e) {
+            // `setGroup` never ran, so the in-memory handle still holds the
+            // keys the reconcile evicted. Keep the tracking entries that match
+            // it — dropping them would make those keys permanently
+            // un-evictable, and the next send would re-persist the stale
+            // roster.
+            rosterDeviceKeysRef.current = previousTrackedRosterKeys;
             setError(e instanceof Error ? e.message : String(e));
             return;
         }

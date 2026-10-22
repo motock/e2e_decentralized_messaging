@@ -106,6 +106,22 @@ export interface ResolvedGroupRecipients {
      * left exactly as it was.
      */
     appliedVersions: Map<string, number>;
+    /**
+     * The verified device list contents applied for each handle in this call.
+     *
+     * Callers should cache these beside the version floor and pass them back as
+     * `heldLists`. `lookupDeviceList` returns null for a list no newer than the
+     * floor, so without the contents every send after the first would resolve
+     * the member to its bare primary and the linked devices would be dropped
+     * from the roster even though nothing changed.
+     */
+    appliedLists: Map<string, HeldDeviceList>;
+}
+
+/** A verified device list's usable contents. */
+export interface HeldDeviceList {
+    version: number;
+    devices: Array<{ deviceId: number; identityKey: Uint8Array }>;
 }
 
 /** Arguments for {@link resolveGroupRecipients}. */
@@ -146,6 +162,17 @@ export interface ResolveGroupRecipientsArgs {
      * silently disabling the replay guard.
      */
     heldVersions?: ReadonlyMap<string, number>;
+    /**
+     * The last verified device list contents per account handle.
+     *
+     * Used when `lookupDeviceList` returns null — the relay served no list, the
+     * lookup failed, or the served version is no newer than the floor. Those
+     * contents are the best known truth for the handle, so the member keeps its
+     * linked devices instead of silently falling back to the bare primary on
+     * every send after the first. A handle with no cached contents keeps the
+     * documented bare-primary fallback and is reported in `unresolvedMembers`.
+     */
+    heldLists?: ReadonlyMap<string, HeldDeviceList>;
 }
 
 /** Length of a serialized identity public key. */
@@ -331,6 +358,7 @@ export async function resolveGroupRecipients({
     ownIdentityKey,
     discovery,
     heldVersions,
+    heldLists,
 }: ResolveGroupRecipientsArgs): Promise<ResolvedGroupRecipients> {
     // Validate the whole input before doing any I/O: a malformed key or handle
     // must not leave the caller with a half-resolved fan-out, and an ambiguous
@@ -376,11 +404,39 @@ export async function resolveGroupRecipients({
     // Versions applied in this call, so a repeated handle cannot be walked
     // backwards within a single resolution.
     const appliedVersions = new Map<string, number>();
+    const appliedLists = new Map<string, HeldDeviceList>();
 
     const emit = (recipient: GroupDeviceRecipient): void => {
         if (seenAddresses.has(recipient.address)) return;
         seenAddresses.add(recipient.address);
         recipients.push(recipient);
+    };
+    const emitDevices = (
+        handle: string,
+        member: GroupMemberAccount,
+        devices: ReadonlyArray<{ deviceId: number; identityKey: Uint8Array }>,
+    ): void => {
+        // A member whose handle is the sender's own account handle *and* whose
+        // identity key is the sender's own account key is the sender's own
+        // account (a self-add, or a roster that lists the sender). Its devices
+        // are the sender's devices, so the device this client is running as
+        // must be excluded here too — otherwise the sender would address a
+        // wrapper to itself at the mailbox it is already reading. A roster
+        // entry that merely reuses the sender's handle with a different key is
+        // a different account and keeps all of its devices.
+        const isOwnAccount =
+            handle === ownHandle &&
+            ownIdentityKey !== undefined &&
+            bytesEqual(ownIdentityKey, member.identityKey);
+        for (const device of devices) {
+            if (isOwnAccount && device.deviceId === currentDeviceId) continue;
+            emit({
+                accountHandle: handle,
+                deviceId: device.deviceId,
+                identityKey: device.identityKey,
+                address: deviceAddress(handle, device.deviceId),
+            });
+        }
     };
 
     for (const [index, member] of members.entries()) {
@@ -415,9 +471,25 @@ export async function resolveGroupRecipients({
 
         if (verified === null) {
             // No list, a list no newer than the floor, or a failed
-            // verification: fall back to the bare handle rather than silently
-            // dropping the member. The primary is still reachable; its linked
-            // devices are not, and the caller can surface that.
+            // verification. The cached contents are the last list this handle
+            // verified, so prefer them: falling back to the bare primary would
+            // drop every linked device on each send whose list is unchanged.
+            const cached = heldLists?.get(handle);
+            const cachedUsable =
+                cached !== undefined &&
+                cached.devices.length > 0 &&
+                cached.devices.every(
+                    (device) =>
+                        isWellFormedIdentityKey(device.identityKey) && isU32(device.deviceId),
+                );
+            if (cachedUsable) {
+                emitDevices(handle, member, cached.devices);
+                continue;
+            }
+
+            // Nothing cached either: fall back to the bare handle rather than
+            // silently dropping the member. The primary is still reachable; its
+            // linked devices are not, and the caller can surface that.
             emit({
                 accountHandle: handle,
                 deviceId: 0,
@@ -476,27 +548,14 @@ export async function resolveGroupRecipients({
             continue;
         }
 
-        // A member whose handle is the sender's own account handle *and* whose
-        // identity key is the sender's own account key is the sender's own
-        // account (a self-add, or a roster that lists the sender). Its devices
-        // are the sender's devices, so the device this client is running as
-        // must be excluded here too — otherwise the sender would address a
-        // wrapper to itself at the mailbox it is already reading. A roster
-        // entry that merely reuses the sender's handle with a different key is
-        // a different account and keeps all of its devices.
-        const isOwnAccount =
-            handle === ownHandle &&
-            ownIdentityKey !== undefined &&
-            bytesEqual(ownIdentityKey, member.identityKey);
-        for (const device of devices) {
-            if (isOwnAccount && device.deviceId === currentDeviceId) continue;
-            emit({
-                accountHandle: handle,
+        appliedLists.set(handle, {
+            version: verified.version,
+            devices: devices.map((device) => ({
                 deviceId: device.deviceId,
                 identityKey: device.identityKey,
-                address: deviceAddress(handle, device.deviceId),
-            });
-        }
+            })),
+        });
+        emitDevices(handle, member, devices);
     }
 
     for (const device of ownDevices) {
@@ -509,5 +568,5 @@ export async function resolveGroupRecipients({
         });
     }
 
-    return { recipients, unresolvedMembers, appliedVersions };
+    return { recipients, unresolvedMembers, appliedVersions, appliedLists };
 }

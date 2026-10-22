@@ -471,9 +471,10 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
         mocks.group_encrypt.mockReturnValue(new Uint8Array([0xaa]));
         mocks.group_decrypt.mockReturnValue(new Uint8Array());
         mocks.bundle_identity_key_bytes.mockImplementation((b: Uint8Array) => b);
-        mocks.group_create.mockImplementation((self: { public_bytes(): Uint8Array }) => ({
-            members: [self.public_bytes()],
-        }));
+        // The real GroupSession::new starts with an empty roster — it does not
+        // add the sender. Members are added by addPeer; the sender's key is
+        // never in the roster.
+        mocks.group_create.mockImplementation(() => ({ members: [] }));
         mocks.group_add_member.mockImplementation((group: { members: Uint8Array[] }, key: Uint8Array) => ({
             members: [...group.members, key],
         }));
@@ -616,6 +617,63 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
         const lastWrite = [...gate.writes].reverse().find((w) => w.id === 'group-state');
         const persisted = lastWrite!.value as { deviceListVersions?: Array<[string, number]> };
         expect(persisted.deviceListVersions).toEqual([['member-b', 7]]);
+    });
+
+    it('keeps a still-valid linked device when the device list is unchanged', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+
+        // Every send after the first sees the same version, which the
+        // monotonicity guard treats as "no fresh list": the resolver falls
+        // back to the bare primary. That is not a revocation, so the linked
+        // device must stay in the roster.
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({
+            gate,
+            transport,
+            discovery: discoveryWith({ 'member-b': new Uint8Array([0x01]) }),
+        });
+
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // Second send against the identical v7 list.
+        mocks.group_remove_member.mockClear();
+        mocks.group_encrypt.mockClear();
+
+        await act(async () => {
+            view.result.current.setInput('second');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+        expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+
+        // ...and it is still tracked for a later genuine revocation.
+        const lastWrite = [...gate.writes].reverse().find((w) => w.id === 'group-state');
+        const persisted = lastWrite!.value as {
+            rosterDeviceKeys?: Array<[string, number[]]>;
+        };
+        expect(
+            (persisted.rosterDeviceKeys ?? []).some(([, key]) =>
+                sameKey(new Uint8Array(key), idKey(0x03)),
+            ),
+        ).toBe(true);
     });
 
     it('aborts without encrypting or sending when the roster exceeds 255 recipients', async () => {
@@ -817,8 +875,7 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
         const roster = encryptedRoster();
         expect(roster.some((key) => sameKey(key, idKey(0x03)))).toBe(false);
 
-        // The sender's own key is never evicted.
-        expect(roster.some((key) => sameKey(key, selfBytes))).toBe(true);
+        // The sender's own key is never evicted (it is never tracked).
         expect(removedKeys.some((key) => sameKey(key, selfBytes))).toBe(false);
 
         // The eviction is durable: the tracked set no longer carries the key.
@@ -887,6 +944,65 @@ describe('useGroupConversation send path — GF-2 reconciliation', () => {
             await view.result.current.send();
         });
 
+        const removedKeys = mocks.group_remove_member.mock.calls.map(
+            (call) => call[1] as Uint8Array,
+        );
+        expect(removedKeys.some((key) => sameKey(key, idKey(0x03)))).toBe(true);
+        expect(encryptedRoster().some((key) => sameKey(key, idKey(0x03)))).toBe(false);
+    });
+
+    it('keeps the eviction record when group_encrypt throws', async () => {
+        const gate = makeGate();
+        const transport = makeTransport();
+
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(7, [
+                { deviceId: 0, identityKey: idKey(0x02) },
+                { deviceId: 3, identityKey: idKey(0x03) },
+            ]),
+        );
+
+        const { view } = await setupHook({
+            gate,
+            transport,
+            discovery: discoveryWith({ 'member-b': new Uint8Array([0x01]) }),
+        });
+
+        await act(async () => {
+            view.result.current.setInput('first');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // Device 3 is revoked, but the encrypt call fails: setGroup never ran,
+        // so the in-memory handle still holds device 3.
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList(8, [{ deviceId: 0, identityKey: idKey(0x02) }]),
+        );
+        mocks.group_encrypt.mockImplementationOnce(() => {
+            throw new Error('encrypt unavailable');
+        });
+
+        await act(async () => {
+            view.result.current.setInput('second');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+        expect(view.result.current.error).toMatch(/encrypt unavailable/);
+
+        mocks.group_encrypt.mockClear();
+        mocks.group_remove_member.mockClear();
+
+        await act(async () => {
+            view.result.current.setInput('third');
+        });
+        await act(async () => {
+            await view.result.current.send();
+        });
+
+        // The key is still tracked, so the next send can evict it.
         const removedKeys = mocks.group_remove_member.mock.calls.map(
             (call) => call[1] as Uint8Array,
         );
