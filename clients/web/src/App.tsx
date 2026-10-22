@@ -830,6 +830,15 @@ export default function App({ deviceList: deviceListProp }: { deviceList?: Devic
         }
     };
 
+    // GF-4: the group receive loop polls THIS device's mailbox — the primary
+    // (deviceId 0) polls the bare handle, a linked device polls
+    // `${accountHandle}:${deviceId}`. `useGroupConversation` accepts
+    // `accountHandle`/`deviceId` for that, but `GroupConversationProps` does
+    // not declare them yet, so App cannot hand them to the group view without
+    // the props being silently dropped by the component. Wiring the render
+    // site is therefore deferred to the follow-up story that extends
+    // `GroupConversationProps`; until then the group view keeps polling
+    // `selfRecipientId` exactly as it did before GF-4.
     return (
         <div className="shell">
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
