@@ -1,13 +1,19 @@
 /** @vitest-environment jsdom */
 //
-// GF-4 — App-level wiring for the group receive address.
+// GF-4 — App-level guard against dead mailbox wiring.
 //
-// The hook-level unit test (src/group_receive_address.test.ts) proves the
-// address rule. This test proves the *shipped app* actually supplies the
-// inputs to that rule: App must hand GroupConversation this device's account
-// handle, its device id, and the account's own device list. Without this
-// wiring the group receive loop polls the bare handle on a linked device and
-// never sees its own mail.
+// The address rule itself is covered by src/group_receive_address.test.ts
+// (unit) and tests/group_receive_device_mailbox.test.tsx (the receive loop
+// hands the computed address to `pickupEnvelope`).
+//
+// This test covers the render site. `GroupConversationProps` does not declare
+// `accountHandle`/`deviceId`/`ownDevices` (that component is outside GF-4's
+// file scope), so App must not spread them into `<GroupConversation>`: a JSX
+// spread of excess props type-checks and is then silently dropped by the
+// component, which makes the app look wired while a linked device still polls
+// the bare handle. The assertions below pin that App passes only props the
+// group view actually declares. The follow-up story that extends
+// `GroupConversationProps` should flip them to positive assertions.
 //
 // Only external boundaries are mocked (WASM, the encrypted store, the relay
 // transport, the storage key) plus GroupConversation itself, which is stubbed
@@ -148,41 +154,54 @@ beforeEach(() => {
     if (dbs && typeof dbs.clear === 'function') dbs.clear();
 });
 
-describe('App wires this device\'s mailbox into the group view', () => {
-    test('the primary device passes its bare handle and device id 0', async () => {
+describe('App does not hand the group view props its surface cannot accept', () => {
+    // GF-4's receive-address rule lives in `useGroupConversation`
+    // (`groupReceiveAddress`, covered by src/group_receive_address.test.ts and
+    // tests/group_receive_device_mailbox.test.tsx). Wiring it into the shipped
+    // app needs `GroupConversationProps` to declare `accountHandle`/`deviceId`/
+    // `ownDevices` and forward them to the hook; that component is outside
+    // GF-4's file scope, so the render-site wiring is deferred to the follow-up
+    // story.
+    //
+    // Until then App must NOT spread those props into `<GroupConversation>`:
+    // TypeScript lets excess props through a JSX spread, so the component would
+    // silently drop them and the app would look wired while a linked device
+    // still polled the bare handle. These assertions are the regression guard
+    // for exactly that dead wiring. The follow-up story should flip them to
+    // positive assertions once the component surface accepts the props.
+
+    test('the primary device passes no undeclared mailbox props', async () => {
         seedLink(0, 'primary-handle');
 
         const props = await renderGroupView();
 
-        // App passes `identity.recipientId` as the account handle (DELIVER 3),
-        // which is also the self recipient id — so the primary polls the bare
-        // handle.
-        expect(props.accountHandle).toBe(props.selfRecipientId);
-        expect(props.accountHandle).toBeTruthy();
-        expect(props.deviceId).toBe(0);
+        expect(props).not.toHaveProperty('accountHandle');
+        expect(props).not.toHaveProperty('deviceId');
+        expect(props).not.toHaveProperty('ownDevices');
     });
 
-    test('a linked device passes its device-qualified handle and device id', async () => {
+    test('a linked device passes no undeclared mailbox props', async () => {
         seedLink(2, 'linked-handle');
 
         const props = await renderGroupView();
 
-        expect(props.accountHandle).toBe(props.selfRecipientId);
-        expect(props.accountHandle).toBeTruthy();
-        expect(props.deviceId).toBe(2);
+        expect(props).not.toHaveProperty('accountHandle');
+        expect(props).not.toHaveProperty('deviceId');
+        expect(props).not.toHaveProperty('ownDevices');
     });
 
-    test('passes the account\'s own device list to the group view', async () => {
-        seedLink(0, 'primary-handle');
+    test('still passes the props the group view does declare', async () => {
+        seedLink(2, 'linked-handle');
 
         const props = await renderGroupView();
 
-        // ownDevices is either the loaded list or undefined before discovery
-        // resolves — never a crash, and never a non-array.
-        expect(props.ownDevices === undefined || Array.isArray(props.ownDevices)).toBe(true);
+        // The pre-existing surface must keep working: the receive loop still
+        // has a self recipient id to poll, and the transport is injected.
+        expect(props.selfRecipientId).toBeTruthy();
+        expect(props.transport).toBeTruthy();
     });
 
-    test('never logs key material while wiring the group view', async () => {
+    test('never logs key material while rendering the group view', async () => {
         const errorSpy = vi.spyOn(console, 'error').mockImplementation((...args) => {
             h.console.push(args.map(String).join(' '));
         });

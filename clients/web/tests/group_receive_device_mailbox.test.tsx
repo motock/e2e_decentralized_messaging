@@ -2,11 +2,12 @@
 //
 // GF-4 — the group receive loop polls THIS device's mailbox.
 //
-// The unit test (src/group_receive_address.test.ts) pins the address rule and
-// the App test (tests/app_group_device_mailbox_wiring.test.tsx) pins the
-// render-site props. This test closes the loop: it mounts the REAL
-// GroupConversation (real WASM group crypto, mocked transport) and asserts the
-// address the receive loop actually hands to `pickupEnvelope`.
+// This is a HOOK-level test: it renders `useGroupConversation` directly (real
+// WASM group crypto, mocked transport) and asserts the address the receive loop
+// actually hands to `pickupEnvelope`. It does not mount `GroupConversation`, so
+// it does not exercise the App -> component -> hook seam; the render site is
+// covered by tests/app_group_device_mailbox_wiring.test.tsx and the address
+// rule by src/group_receive_address.test.ts.
 //
 // Positive: a linked device (deviceId 2) polls `${handle}:2`; the primary
 // (deviceId 0) polls the bare handle.
