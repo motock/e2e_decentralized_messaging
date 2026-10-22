@@ -5,6 +5,24 @@ import { StorageGate } from './storage';
 import { getStorageKey } from './storage_key';
 import { getRelayWsUrl, RelayTransport } from './relay_transport';
 import type { GroupConversationProps, GroupTransport } from './GroupConversation';
+import type { DeviceListEntry } from './Conversation';
+import type { DiscoveryTransport } from './discovery';
+import {
+    resolveGroupRecipients,
+    isWellFormedIdentityKey,
+    type HeldDeviceList,
+} from './group_recipients';
+import {
+    reconcileRoster,
+    validatedRosterDeviceKeys,
+    type TrackedRosterKey,
+} from './group_roster';
+import {
+    validatedDeviceListVersions,
+    validatedGroupBlob,
+    validatedHeldDeviceLists,
+    type PersistedGroupState,
+} from './group_state';
 
 // The state machine and side effects behind GroupConversation.tsx: the Sender
 // Keys group crypto calls (group_create/group_add_member/group_remove_member/
@@ -98,55 +116,29 @@ interface RealMember {
 }
 
 /**
- * The persisted group state record. Stored via StorageGate (AES-256-GCM at
- * rest) so membership AND the sender-key ratchet state survive a page reload.
- * Public keys are stored as number arrays (JSON-serializable).
+ * The wire format's cap on wrapper recipients in one group envelope.
  *
- * `blob` is the group_to_bytes serialization of the group handle at the time
- * of the last persist — secret ratchet state (chain key + position), stored
- * encrypted, never logged. It is absent only in records written before
- * ratchet persistence existed; such a legacy record is restored by replaying
- * group_create + group_add_member (the pre-GRP-4 behavior).
+ * `GroupSession::encrypt_as` seals the per-message key to every identity key in
+ * the roster, and the envelope carries one wrapper per recipient. Past this the
+ * envelope cannot be encoded, so a send that would exceed it is refused with a
+ * clear error instead of producing an undeliverable message.
  */
-interface PersistedGroupState {
-    members: Array<{ recipientId: string; publicBytes: number[] }>;
-    /** group_to_bytes(group) as of the last persist; absent in legacy records. */
-    blob?: number[];
-}
-
-/** Largest serialized group state accepted on restore (1 MiB). */
-const MAX_GROUP_BLOB_LENGTH = 1048576;
-
-/** True for a value that is a valid byte (integer in 0..255). */
-function isByte(entry: unknown): entry is number {
-    return Number.isInteger(entry) && (entry as number) >= 0 && (entry as number) <= 255;
-}
+const MAX_GROUP_RECIPIENTS = 255;
 
 /**
- * Validate a stored group blob before handing any bytes to WASM.
+ * The discovery transport used when the caller injected none.
  *
- * Returns the bytes, or `null` when the record simply has no blob (a legacy
- * record from before ratchet persistence). Throws on a blob that is present
- * but structurally invalid — the caller must fail closed rather than build a
- * fresh session: a fresh session starts a different chain, and silently
- * dropping the persisted state is the very failure this persistence prevents.
+ * It serves no lists, so every member resolves to its bare handle — the
+ * resolver's documented fallback, and the pre-GF-2 addressing. It exists so
+ * reconciliation can run unconditionally: the recipient-limit check and the
+ * roster/floor persistence must not depend on a transport being supplied.
  */
-function validatedGroupBlob(blob: unknown): Uint8Array | null {
-    if (blob === undefined || blob === null) return null;
-    if (!Array.isArray(blob) || blob.length === 0) {
-        throw new Error('invalid persisted group state');
-    }
-    if (blob.length > MAX_GROUP_BLOB_LENGTH) {
-        throw new Error('invalid persisted group state');
-    }
-    if (!blob.every(isByte)) {
-        throw new Error('invalid persisted group state');
-    }
-    return new Uint8Array(blob);
-}
+const NO_DISCOVERY: DiscoveryTransport = {
+    publishDiscovery: async () => {},
+    lookupDiscovery: async () => null,
+};
 
-const GROUP_STORE = 'session' as const;
-const GROUP_RECORD_ID = 'group-state';
+const GROUP_STORE = 'session' as const;const GROUP_RECORD_ID = 'group-state';
 const GROUP_MESSAGES_STORE = 'messages' as const;
 const GROUP_MESSAGES_ID = 'group-messages';
 
@@ -246,12 +238,57 @@ function findSenderFromRoster(
  * The state machine and side effects behind `GroupConversation`. Returns the
  * state the component renders plus the handlers its controls call.
  */
+/**
+ * The arguments `useGroupConversation` accepts.
+ *
+ * The first four are the component's own props. `ownDevices` and `discovery`
+ * are GF-2 additions and are deliberately *optional*: the component does not
+ * pass them yet (wiring them through `GroupConversation.tsx` is out of this
+ * story's scope), and with neither supplied the send path keeps its pre-GF-2
+ * behaviour of addressing the roster as-is.
+ */
+export interface UseGroupConversationArgs
+    extends Pick<GroupConversationProps, 'transport' | 'storageGate' | 'identity' | 'selfRecipientId'> {
+    /**
+     * The sender's own devices, as published in its own signed device list.
+     *
+     * Used to fan a group message out to the sender's *other* devices so they
+     * can decrypt it too. Defaults to empty: with no list the sender simply
+     * does not address itself.
+     */
+    ownDevices?: DeviceListEntry[];
+    /**
+     * Transport for signed device-list discovery (MD-9).
+     *
+     * `RelayTransport` satisfies it. When omitted, the resolver cannot look up
+     * any member's device list, so every member falls back to its bare handle
+     * and the send addresses the roster exactly as it did before GF-2.
+     */
+    discovery?: DiscoveryTransport;
+    /**
+     * The sender's own account handle (the discovery key its signed device list
+     * is published under). Defaults to `selfRecipientId`, which is the account
+     * handle this app uses (`App.tsx` passes `identity.recipientId` as the
+     * account handle when publishing its own list).
+     */
+    ownAccountHandle?: string;
+    /**
+     * The device id this client is running as. Defaults to 0 (the primary),
+     * which is the only device that can exist before device linking.
+     */
+    currentDeviceId?: number;
+}
+
 export function useGroupConversation({
     transport,
     storageGate,
     identity: identityProp,
     selfRecipientId,
-}: Pick<GroupConversationProps, 'transport' | 'storageGate' | 'identity' | 'selfRecipientId'>) {
+    ownDevices,
+    discovery,
+    ownAccountHandle,
+    currentDeviceId,
+}: UseGroupConversationArgs) {
     const [ready, setReady] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selfIdentity, setSelfIdentity] = useState<InstanceType<typeof IdentityHandle> | null>(null);
@@ -271,6 +308,25 @@ export function useGroupConversation({
     // Per-message outcomes live on the message itself, so a later successful
     // send never hides an earlier failure.
     const [sendError, setSendError] = useState<string | null>(null);
+    // GF-2: the durable monotonic floor for member device lists — the highest
+    // version applied per account handle. Kept in a ref (not state) because it
+    // is read and written inside the send path, never rendered, and must not
+    // trigger a re-render mid-send. Persisted alongside the group state so a
+    // reload cannot reset it to empty and let a replayed list through.
+    const deviceListVersionsRef = useRef<Map<string, number>>(new Map());
+    // GF-2: every device identity key this client added to the group roster,
+    // keyed by hex so the set stays de-duplicated, together with the account it
+    // belongs to so `removePeer` can purge that member's keys immediately. The
+    // roster itself cannot be enumerated, so this tracked set is the only way
+    // to evict a key that stops being a recipient (a removed member's linked
+    // device, or a revoked device). Persisted alongside the group state; a
+    // reload without it would leave those keys in the restored roster.
+    const rosterDeviceKeysRef = useRef<Map<string, TrackedRosterKey>>(new Map());
+    // GF-2: the last verified device list contents per handle, persisted beside
+    // the version floor. The floor makes an unchanged list "not newer", so
+    // without the contents every send after the first would resolve the member
+    // to its bare primary and the sweep would evict its linked devices.
+    const heldDeviceListsRef = useRef<Map<string, HeldDeviceList>>(new Map());
 
     // GRP-6: when no transport is injected (the App-level wiring was scoped out
     // of this story), build the default transport tagged with THIS loop's
@@ -340,6 +396,20 @@ export function useGroupConversation({
         if (storageGate) gateRef.current = storageGate;
     }, [transport, storageGate]);
 
+    // GF-2: the sender's own devices and the discovery transport are read by
+    // the send path only, so they live in refs kept fresh per render rather
+    // than in the init effect's dependency list (which must stay identity-only).
+    const ownDevicesRef = useRef<DeviceListEntry[]>(ownDevices ?? []);
+    const discoveryRef = useRef<DiscoveryTransport | undefined>(discovery);
+    const ownAccountHandleRef = useRef<string | undefined>(ownAccountHandle);
+    const currentDeviceIdRef = useRef<number>(currentDeviceId ?? 0);
+    useEffect(() => {
+        ownDevicesRef.current = ownDevices ?? [];
+        discoveryRef.current = discovery;
+        ownAccountHandleRef.current = ownAccountHandle;
+        currentDeviceIdRef.current = currentDeviceId ?? 0;
+    }, [ownDevices, discovery, ownAccountHandle, currentDeviceId]);
+
     useEffect(() => {
         let cancelled = false;
         // Criterion 3 — fail closed. With no identity/selfRecipientId the group
@@ -391,6 +461,43 @@ export function useGroupConversation({
                               | PersistedGroupState
                               | null)
                         : null;
+                    // GF-2: restore the device-list version floor. Merged with
+                    // `Math.max` so a restored record can never *lower* a floor
+                    // already held in memory (an unreadable or stale record must
+                    // not re-open the replay window).
+                    const restoredVersions = validatedDeviceListVersions(
+                        persisted?.deviceListVersions,
+                    );
+                    for (const [handle, version] of restoredVersions) {
+                        const held = deviceListVersionsRef.current.get(handle);
+                        if (held === undefined || version > held) {
+                            deviceListVersionsRef.current.set(handle, version);
+                        }
+                    }
+                    // GF-2: restore the tracked roster keys so a device removed
+                    // before the reload can still be evicted from the restored
+                    // blob. Merged rather than replaced: a key already tracked
+                    // in this session is identical, and dropping it would lose
+                    // the eviction record for the roster the blob carries.
+                    for (const tracked of validatedRosterDeviceKeys(
+                        persisted?.rosterDeviceKeys,
+                    )) {
+                        const hex = toHex(tracked.identityKey);
+                        if (!rosterDeviceKeysRef.current.has(hex)) {
+                            rosterDeviceKeysRef.current.set(hex, tracked);
+                        }
+                    }
+                    // GF-2: restore the cached device lists. Merged by version
+                    // so an older record can never replace a newer list already
+                    // held in memory.
+                    for (const [handle, list] of validatedHeldDeviceLists(
+                        persisted?.deviceLists,
+                    )) {
+                        const held = heldDeviceListsRef.current.get(handle);
+                        if (held === undefined || list.version > held.version) {
+                            heldDeviceListsRef.current.set(handle, list);
+                        }
+                    }
                     if (persisted?.members?.length) {
                         const restored: RealMember[] = persisted.members.map((m) => ({
                             recipientId: m.recipientId,
@@ -502,6 +609,36 @@ export function useGroupConversation({
             };
             if (handle) {
                 state.blob = Array.from(group_to_bytes(handle));
+            }
+            // GF-2: carry the device-list version floor forward. Without this
+            // the floor would reset to empty on reload and a replayed older
+            // (validly signed) list could resurrect a revoked device.
+            if (deviceListVersionsRef.current.size > 0) {
+                state.deviceListVersions = Array.from(deviceListVersionsRef.current.entries());
+            }
+            // GF-2: carry the tracked roster keys forward. Without them a
+            // reload cannot tell which roster entries were added for a device
+            // that is later removed, and the eviction never happens.
+            if (rosterDeviceKeysRef.current.size > 0) {
+                state.rosterDeviceKeys = Array.from(rosterDeviceKeysRef.current.values()).map(
+                    (tracked) => [tracked.accountHandle, Array.from(tracked.identityKey)],
+                );
+            }
+            // GF-2: cache the verified list contents too. The floor alone makes
+            // an unchanged list resolve to the bare primary on the next send.
+            if (heldDeviceListsRef.current.size > 0) {
+                state.deviceLists = Array.from(heldDeviceListsRef.current.entries()).map(
+                    ([handle, list]) => [
+                        handle,
+                        {
+                            version: list.version,
+                            devices: list.devices.map((device) => [
+                                device.deviceId,
+                                Array.from(device.identityKey),
+                            ]),
+                        },
+                    ],
+                );
             }
             await gate.put(GROUP_STORE, GROUP_RECORD_ID, state);
             return true;
@@ -741,7 +878,26 @@ export function useGroupConversation({
         if (!group) return;
         const member = realMembers.find((m) => m.recipientId === recipientId);
         if (!member) return; // already removed — no-op, not an error
-        const updatedGroup = group_remove_member(group, member.publicBytes);
+        let updatedGroup = group_remove_member(group, member.publicBytes);
+        // Evict the removed member's tracked device keys now. Leaving them for
+        // the next send would keep a removed member's linked devices able to
+        // decrypt that message; the send-time sweep is the second line of
+        // defence, not the first. The sender's own key is never tracked, but
+        // guard it explicitly so a corrupt persisted record cannot remove it.
+        // Collect the entries first: if a removal throws, the handle is
+        // unchanged, so the tracking that matches it must be too.
+        const selfPublicBytes = selfIdentity?.public_bytes();
+        const purgedKeys: string[] = [];
+        for (const [hex, tracked] of rosterDeviceKeysRef.current) {
+            if (tracked.accountHandle !== recipientId) continue;
+            purgedKeys.push(hex);
+            if (selfPublicBytes && bytesEqual(tracked.identityKey, selfPublicBytes)) continue;
+            // The member's account key was removed above; a tracked device-0
+            // entry for the same key would only rotate the chain again.
+            if (bytesEqual(tracked.identityKey, member.publicBytes)) continue;
+            updatedGroup = group_remove_member(updatedGroup, tracked.identityKey);
+        }
+        for (const hex of purgedKeys) rosterDeviceKeysRef.current.delete(hex);
         setGroup(updatedGroup);
         const updatedMembers = realMembers.filter((m) => m.recipientId !== recipientId);
         setRealMembers(updatedMembers);
@@ -767,19 +923,179 @@ export function useGroupConversation({
 
     const send = async () => {
         if (!group || !selfIdentity || !input.trim()) return;
+        const selfPublicBytes = selfIdentity.public_bytes();
+
+        // ── GF-2: reconcile the roster to the recipient device set ──────────
+        // A group message is addressed per device, not per account: the sender
+        // seals the per-message key to every identity key in the group roster,
+        // so a device that is not in the roster gets no wrapper and cannot
+        // decrypt, while a revoked device that is still in the roster keeps
+        // receiving wrappers. The roster is therefore reconciled to the
+        // resolved recipient set before every send.
+        //
+        // Reconciliation is UNCONDITIONAL. It must not be skipped just because
+        // no discovery transport was injected: the recipient-limit check and
+        // the roster/floor persistence are security-relevant regardless, and a
+        // transport-less caller simply resolves every member to its bare
+        // handle (the resolver's documented fallback).
+        const discoveryTransport = discoveryRef.current;
+        const ownHandle = ownAccountHandleRef.current ?? selfRecipientId ?? '';
+
+        // A roster key that is not a well-formed 33-byte 0x05 identity key
+        // cannot be looked up or addressed. Rather than failing the whole send
+        // (which would make one bad roster entry a denial of service), such a
+        // member is resolved as "no list available": it keeps its bare handle
+        // and is reported in `unresolvedMembers`, exactly as a member with no
+        // published list is.
+        const resolvableMembers = realMembers.filter((member) =>
+            isWellFormedIdentityKey(member.publicBytes),
+        );
+        const malformedMembers = realMembers.filter(
+            (member) => !isWellFormedIdentityKey(member.publicBytes),
+        );
+
+        let resolved: Awaited<ReturnType<typeof resolveGroupRecipients>>;
+        try {
+            resolved = await resolveGroupRecipients({
+                members: resolvableMembers.map((member) => ({
+                    accountHandle: member.recipientId,
+                    identityKey: member.publicBytes,
+                })),
+                ownDevices: ownDevicesRef.current
+                    .filter((device) => isWellFormedIdentityKey(device.identityKey))
+                    .map((device) => ({
+                        deviceId: device.deviceId,
+                        identityKey: device.identityKey,
+                    })),
+                ownAccountHandle: ownHandle,
+                currentDeviceId: currentDeviceIdRef.current,
+                ownIdentityKey: selfPublicBytes,
+                discovery: discoveryTransport ?? NO_DISCOVERY,
+                heldVersions: deviceListVersionsRef.current,
+                heldLists: heldDeviceListsRef.current,
+            });
+        } catch (e) {
+            // A bad held version or an ambiguous duplicate handle: fail closed
+            // and send nothing rather than address a half-resolved fan-out.
+            setError(
+                `Could not resolve group recipients; message not sent: ${
+                    e instanceof Error ? e.message : String(e)
+                }`,
+            );
+            return;
+        }
+
+        // Members whose roster key is malformed still need an address, and the
+        // resolver never saw them, so add their bare handle back here. They are
+        // reported as unresolved, matching the resolver's own fallback.
+        for (const member of malformedMembers) {
+            resolved.recipients.push({
+                accountHandle: member.recipientId,
+                deviceId: 0,
+                identityKey: member.publicBytes,
+                address: member.recipientId,
+            });
+            resolved.unresolvedMembers.push(member.recipientId);
+        }
+
+        // The wire format caps a group at 255 wrapper recipients. Exceeding it
+        // would produce an envelope the relay (and every recipient) rejects, so
+        // refuse before anything is encrypted, persisted, or sent.
+        if (resolved.recipients.length > MAX_GROUP_RECIPIENTS) {
+            setError(
+                `Group has ${resolved.recipients.length} recipient devices, which exceeds the ` +
+                    `${MAX_GROUP_RECIPIENTS}-recipient limit; message not sent.`,
+            );
+            return;
+        }
+
+        // ── Merge the applied versions into the durable floor ───────────────
+        // Monotonic per handle: keep the greater of the floor already held and
+        // the version just applied. A resolution can never lower a floor, and
+        // handles this resolution did not touch keep their existing entry.
+        const mergedHeldVersions = new Map(deviceListVersionsRef.current);
+        for (const [handle, version] of resolved.appliedVersions) {
+            const held = mergedHeldVersions.get(handle);
+            if (held === undefined || version > held) {
+                mergedHeldVersions.set(handle, version);
+            }
+        }
+        // One snapshot for both the in-memory ref and persistence, so the two
+        // can never diverge.
+        deviceListVersionsRef.current = mergedHeldVersions;
+
+        // Cache the contents of every list this resolution applied, so the next
+        // send can resolve the same recipients even though the floor now makes
+        // those lists "not newer". Monotonic by version, like the floor.
+        for (const [handle, list] of resolved.appliedLists) {
+            const held = heldDeviceListsRef.current.get(handle);
+            if (held === undefined || list.version > held.version) {
+                heldDeviceListsRef.current.set(handle, list);
+            }
+        }
+
+        // ── Reconcile the group handle's roster to those keys ───────────────
+        // `group_add_member` appends a key and `group_remove_member` removes one
+        // (rotating the chain key), so the handle is brought in line with the
+        // recipient set before it encrypts. The reconcile is pure and builds a
+        // new tracked set; nothing is committed until the roster is persisted.
+        const previousTrackedRosterKeys = rosterDeviceKeysRef.current;
+        let reconciled: GroupHandle;
+        let nextTrackedRosterKeys: Map<string, TrackedRosterKey>;
+        try {
+            const result = reconcileRoster({
+                group,
+                selfPublicBytes,
+                recipients: resolved.recipients,
+                memberKeys: realMembers.map((member) => member.publicBytes),
+                unresolvedHandles: new Set(resolved.unresolvedMembers),
+                tracked: previousTrackedRosterKeys,
+            });
+            reconciled = result.group;
+            nextTrackedRosterKeys = result.tracked;
+        } catch (e) {
+            // Reconciliation could not be completed: fail closed rather than
+            // encrypt against a roster that does not match the recipient set.
+            setError(
+                `Could not reconcile the group roster; message not sent: ${
+                    e instanceof Error ? e.message : String(e)
+                }`,
+            );
+            return;
+        }
+        rosterDeviceKeysRef.current = nextTrackedRosterKeys;
+
+        // ── Persist the reconciled roster AND the floor BEFORE encrypting ───
+        // A skipped ratchet step is safe; a reused message key is not, and a
+        // floor that was applied but never saved would let a replayed list
+        // through on the next send. A failed save aborts the send.
+        if (!(await persistGroupState(realMembers, reconciled))) {
+            // The reconcile was not saved either, so `group` still carries the
+            // old roster: roll the tracking back with it.
+            rosterDeviceKeysRef.current = previousTrackedRosterKeys;
+            setError('Could not save session state; message not sent');
+            return;
+        }
+
         const plaintextBytes = new TextEncoder().encode(input);
         let ciphertext: Uint8Array;
         try {
-            ciphertext = group_encrypt(group, selfIdentity, plaintextBytes);
+            ciphertext = group_encrypt(reconciled, selfIdentity, plaintextBytes);
         } catch (e) {
+            // `setGroup` never ran, so the in-memory handle still holds the
+            // keys the reconcile evicted. Keep the tracking entries that match
+            // it — dropping them would make those keys permanently
+            // un-evictable, and the next send would re-persist the stale
+            // roster.
+            rosterDeviceKeysRef.current = previousTrackedRosterKeys;
             setError(e instanceof Error ? e.message : String(e));
             return;
         }
-        // Persist the advanced ratchet BEFORE the envelope leaves the device. A
-        // skipped ratchet step is safe; a reused message key is not -- a failed
-        // save must abort the send rather than deliver a message whose key
-        // material was never recorded (mirrors Conversation.tsx).
-        if (!(await persistGroupState(realMembers, group))) {
+        setGroup(reconciled);
+        // The ratchet advanced on encrypt, so re-persist the new position. The
+        // roster and floor were already written above; this second write keeps
+        // the blob in step with the ciphertext that is about to leave.
+        if (!(await persistGroupState(realMembers, reconciled))) {
             setError('Could not save session state; message not sent');
             return;
         }

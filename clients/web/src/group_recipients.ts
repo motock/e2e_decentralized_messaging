@@ -13,10 +13,18 @@
  *    account identity key and throws on tampered, foreign-signed, or malformed
  *    bytes. Nothing from an unverified blob is ever returned to the caller.
  *  - **Partial coverage is explicit, not silent.** A member with no published
- *    list — or whose list fails verification or lookup — still gets a single
- *    recipient at its bare handle (the primary is reachable; linked devices are
- *    not) and is reported in `unresolvedMembers` so the caller can surface the
- *    gap. One member's failure never fails the whole send.
+ *    list — and no cached contents — or whose list fails verification or
+ *    lookup still gets a single recipient at its bare handle (the primary is
+ *    reachable; linked devices are not) and is reported in `unresolvedMembers`
+ *    so the caller can surface the gap. One member's failure never fails the
+ *    whole send.
+ *  - **A cached verified list beats no list.** When `lookupDeviceList` returns
+ *    null (no list, a lookup failure, or a version no newer than the floor),
+ *    the caller's cached contents for that handle are used instead. The floor
+ *    makes every unchanged list "not newer", so without the cache a member's
+ *    linked devices would drop out of the fan-out on every send after the
+ *    first. Cached keys are shape-checked again before they are emitted; only
+ *    unverified bytes are never used, and none are in this path.
  *  - **Fail closed on malformed input.** Every identity key must be exactly 33
  *    bytes with the `0x05` Curve25519 type byte, and every account handle must
  *    pass the shared handle rules (non-empty, ≤64 chars, no C0/C1/bidi/
@@ -30,14 +38,39 @@
  *    to `lookupDeviceList`, so a replayed stale list cannot resurrect a revoked
  *    device (§8.4). The effective floor for a handle is the *higher* of the
  *    caller's held version and any version already applied in this call, so a
- *    repeated handle can never be walked backwards.
+ *    repeated handle can never be walked backwards. The versions actually
+ *    applied are returned in `appliedVersions` so the caller can persist a
+ *    durable floor: a floor that lives only for one call restarts at `null` on
+ *    the next send, and a relay replaying an older (validly signed) list would
+ *    then resurrect a device the user has revoked.
+ *  - **A floor is never silently disabled.** Every caller-supplied
+ *    `heldVersions` value must be a non-negative safe integer. A `NaN` (or
+ *    negative, or fractional) value would make every `version <= floor`
+ *    comparison false — i.e. accept *any* list, including a replayed one — so
+ *    it is rejected outright rather than coerced.
+ *  - **List-derived devices are validated too.** A verified list is only as
+ *    trustworthy as the codec that decoded it; a device whose identity key is
+ *    not a 33-byte `0x05` key, or whose device id is not a u32, makes the whole
+ *    list unusable. Such a list is reported (and the member falls back to its
+ *    bare handle) rather than emitting a key that could never decrypt.
+ *  - **One handle, one account.** A roster that names the same handle twice
+ *    with *different* identity keys is ambiguous — the first-wins de-dupe would
+ *    silently drop the genuine account — so it fails closed.
  *  - **Canonical handles.** Handles are trimmed before use, so the handles in
  *    the returned recipients are canonical even if the caller's roster is not;
  *    callers matching recipients back to roster entries should compare against
- *    the trimmed form.
- *  - **No sensitive data in logs.** Only a non-reversible handle reference, a
- *    coarse reason code, and an error *class* are logged; account handles,
- *    identity keys, prekey bundles, and list bytes never are.
+ *    the trimmed form. Trimming happens *before* the duplicate-handle check, so
+ *    `"alice"` and `" alice "` are recognised as the same account.
+ *  - **The fallback path emits the roster key.** When a member's list is
+ *    missing or unusable, the single recipient emitted for it carries the
+ *    identity key from the caller's roster — the key the group handle was built
+ *    with — not a key taken from any list. That is what keeps the fallback
+ *    addressable by the existing roster.
+ *  - **No sensitive data in logs.** Only a pseudonymous correlation id for a
+ *    handle (a 32-bit FNV-1a digest — stable enough to tie one send's log lines
+ *    together, and not a handle), a coarse reason code, and an error *class* are
+ *    logged; account handles, identity keys, prekey bundles, and list bytes
+ *    never are.
  */
 
 import { lookupDeviceList, type DiscoveryTransport } from './discovery';
@@ -68,6 +101,35 @@ export interface ResolvedGroupRecipients {
     recipients: GroupDeviceRecipient[];
     /** Handles that fell back to the bare primary address. */
     unresolvedMembers: string[];
+    /**
+     * The device-list version applied for each handle in this call.
+     *
+     * Callers must persist these as a durable monotonic floor and pass them
+     * back as `heldVersions` on the next resolution. Without that, every send
+     * starts at `null` and a relay replaying an older (validly signed) list can
+     * resurrect a device the user has revoked (§8.4).
+     *
+     * A handle whose list was absent, stale, or unusable has no entry: there is
+     * no new version to record, and the caller's existing floor for it must be
+     * left exactly as it was.
+     */
+    appliedVersions: Map<string, number>;
+    /**
+     * The verified device list contents applied for each handle in this call.
+     *
+     * Callers should cache these beside the version floor and pass them back as
+     * `heldLists`. `lookupDeviceList` returns null for a list no newer than the
+     * floor, so without the contents every send after the first would resolve
+     * the member to its bare primary and the linked devices would be dropped
+     * from the roster even though nothing changed.
+     */
+    appliedLists: Map<string, HeldDeviceList>;
+}
+
+/** A verified device list's usable contents. */
+export interface HeldDeviceList {
+    version: number;
+    devices: Array<{ deviceId: number; identityKey: Uint8Array }>;
 }
 
 /** Arguments for {@link resolveGroupRecipients}. */
@@ -77,20 +139,48 @@ export interface ResolveGroupRecipientsArgs {
     ownAccountHandle: string;
     /** The device this client is running as; excluded from the fan-out. */
     currentDeviceId: number;
+    /**
+     * The sender's own account (device 0) identity key, when known.
+     *
+     * Used to recognise a roster entry that *is* the sender's own account: a
+     * member whose handle equals `ownAccountHandle` **and** whose identity key
+     * equals this key. Only such a member has `currentDeviceId` excluded from
+     * its devices — otherwise the sender would address a wrapper to the mailbox
+     * it is already reading. A roster entry that merely reuses the sender's
+     * handle with a different key is a different account and is left untouched.
+     */
+    ownIdentityKey?: Uint8Array;
     discovery: DiscoveryTransport;
     /**
      * Highest device-list version already applied, per account handle.
      *
      * Passed straight through to `lookupDeviceList` as its monotonic floor, so
      * a relay replaying an older (but validly signed) list cannot resurrect a
-     * device the user has revoked. This is a *per-call* floor: the resolver
-     * never mutates the map, and the versions it applies are not returned, so a
-     * caller cannot populate it from a previous resolution. Within one call the
-     * effective floor for a handle is the higher of this map's entry and any
-     * version already applied for that handle, so a repeated handle can never
-     * be walked backwards.
+     * device the user has revoked. Within one call the effective floor for a
+     * handle is the higher of this map's entry and any version already applied
+     * for that handle, so a repeated handle can never be walked backwards.
+     *
+     * The map is never mutated. The versions this call applies are returned in
+     * {@link ResolvedGroupRecipients.appliedVersions}; callers persist those to
+     * make the floor durable across sends.
+     *
+     * Every value must be a non-negative safe integer. A `NaN` (or negative, or
+     * fractional) value is rejected with a throw: treated as a floor it would
+     * make every `version <= floor` comparison false and accept *any* list,
+     * silently disabling the replay guard.
      */
     heldVersions?: ReadonlyMap<string, number>;
+    /**
+     * The last verified device list contents per account handle.
+     *
+     * Used when `lookupDeviceList` returns null — the relay served no list, the
+     * lookup failed, or the served version is no newer than the floor. Those
+     * contents are the best known truth for the handle, so the member keeps its
+     * linked devices instead of silently falling back to the bare primary on
+     * every send after the first. A handle with no cached contents keeps the
+     * documented bare-primary fallback and is reported in `unresolvedMembers`.
+     */
+    heldLists?: ReadonlyMap<string, HeldDeviceList>;
 }
 
 /** Length of a serialized identity public key. */
@@ -192,6 +282,52 @@ function assertDeviceId(deviceId: number, role: string): void {
 }
 
 /**
+ * Reject a held device-list version that is not a non-negative safe integer.
+ *
+ * A `NaN` floor is the dangerous case: `version <= NaN` is always false, so
+ * `lookupDeviceList` would accept *every* list it is served — including a
+ * replayed older one — and the replay guard would be silently off. A negative
+ * or fractional value is equally meaningless as a version, so all three are
+ * rejected rather than coerced to something plausible.
+ */
+function assertHeldVersion(version: unknown): void {
+    if (typeof version !== 'number' || !Number.isSafeInteger(version) || version < 0) {
+        throw new Error(
+            'group recipients: held device-list version must be a non-negative safe integer',
+        );
+    }
+}
+
+/**
+ * True when `identityKey` is a well-formed serialized Curve25519 identity key.
+ *
+ * Used for keys that come out of a *verified* device list. Verification proves
+ * the list was signed by the account, not that every entry decodes to a usable
+ * key, so the shape is re-checked here before the key is emitted.
+ */
+export function isWellFormedIdentityKey(identityKey: unknown): identityKey is Uint8Array {
+    return (
+        identityKey instanceof Uint8Array &&
+        identityKey.length === IDENTITY_KEY_LEN &&
+        identityKey[0] === IDENTITY_KEY_TYPE_BYTE
+    );
+}
+
+/** True when `deviceId` is a u32. */
+function isU32(deviceId: unknown): deviceId is number {
+    return typeof deviceId === 'number' && Number.isInteger(deviceId) && deviceId >= 0 && deviceId <= 0xffffffff;
+}
+
+/** Byte-wise equality for two identity keys. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
+/**
  * Non-reversible reference to a handle, for logs.
  *
  * CLAUDE.md forbids PII in logs, and a handle is user-visible identity. A
@@ -219,14 +355,18 @@ function handleRef(handle: string): string {
  *   or contains the `:` address separator. Lookup and verification failures do
  *   not throw: they degrade to the member's bare handle and are reported in
  *   `unresolvedMembers`.
+ * @throws if any `heldVersions` value is not a non-negative safe integer, or if
+ *   the same (trimmed) handle appears twice with different identity keys.
  */
 export async function resolveGroupRecipients({
     members,
     ownDevices,
     ownAccountHandle,
     currentDeviceId,
+    ownIdentityKey,
     discovery,
     heldVersions,
+    heldLists,
 }: ResolveGroupRecipientsArgs): Promise<ResolvedGroupRecipients> {
     // Validate the whole input before doing any I/O: a malformed key or handle
     // must not leave the caller with a half-resolved fan-out, and an ambiguous
@@ -241,6 +381,30 @@ export async function resolveGroupRecipients({
         assertIdentityKey(device.identityKey, 'own-device');
         assertDeviceId(device.deviceId, 'own-device');
     }
+    // A floor that is not a non-negative safe integer would disable the replay
+    // guard (see `assertHeldVersion`), so it is rejected before any lookup.
+    if (heldVersions) {
+        for (const version of heldVersions.values()) {
+            assertHeldVersion(version);
+        }
+    }
+    // One handle must name one account. Two roster entries with the same
+    // (trimmed) handle but different identity keys are ambiguous: the
+    // first-wins address de-dupe would silently drop the genuine account and
+    // route its ciphertext to whoever was listed first. Fail closed instead.
+    const keyByHandle = new Map<string, Uint8Array>();
+    for (const [index, handle] of memberHandles.entries()) {
+        const previous = keyByHandle.get(handle);
+        if (previous === undefined) {
+            keyByHandle.set(handle, members[index].identityKey);
+            continue;
+        }
+        if (!bytesEqual(previous, members[index].identityKey)) {
+            throw new Error(
+                'group recipients: the same member account handle appears with different identity keys',
+            );
+        }
+    }
 
     const recipients: GroupDeviceRecipient[] = [];
     const unresolvedMembers: string[] = [];
@@ -248,11 +412,39 @@ export async function resolveGroupRecipients({
     // Versions applied in this call, so a repeated handle cannot be walked
     // backwards within a single resolution.
     const appliedVersions = new Map<string, number>();
+    const appliedLists = new Map<string, HeldDeviceList>();
 
     const emit = (recipient: GroupDeviceRecipient): void => {
         if (seenAddresses.has(recipient.address)) return;
         seenAddresses.add(recipient.address);
         recipients.push(recipient);
+    };
+    const emitDevices = (
+        handle: string,
+        member: GroupMemberAccount,
+        devices: ReadonlyArray<{ deviceId: number; identityKey: Uint8Array }>,
+    ): void => {
+        // A member whose handle is the sender's own account handle *and* whose
+        // identity key is the sender's own account key is the sender's own
+        // account (a self-add, or a roster that lists the sender). Its devices
+        // are the sender's devices, so the device this client is running as
+        // must be excluded here too — otherwise the sender would address a
+        // wrapper to itself at the mailbox it is already reading. A roster
+        // entry that merely reuses the sender's handle with a different key is
+        // a different account and keeps all of its devices.
+        const isOwnAccount =
+            handle === ownHandle &&
+            ownIdentityKey !== undefined &&
+            bytesEqual(ownIdentityKey, member.identityKey);
+        for (const device of devices) {
+            if (isOwnAccount && device.deviceId === currentDeviceId) continue;
+            emit({
+                accountHandle: handle,
+                deviceId: device.deviceId,
+                identityKey: device.identityKey,
+                address: deviceAddress(handle, device.deviceId),
+            });
+        }
     };
 
     for (const [index, member] of members.entries()) {
@@ -287,9 +479,25 @@ export async function resolveGroupRecipients({
 
         if (verified === null) {
             // No list, a list no newer than the floor, or a failed
-            // verification: fall back to the bare handle rather than silently
-            // dropping the member. The primary is still reachable; its linked
-            // devices are not, and the caller can surface that.
+            // verification. The cached contents are the last list this handle
+            // verified, so prefer them: falling back to the bare primary would
+            // drop every linked device on each send whose list is unchanged.
+            const cached = heldLists?.get(handle);
+            const cachedUsable =
+                cached !== undefined &&
+                cached.devices.length > 0 &&
+                cached.devices.every(
+                    (device) =>
+                        isWellFormedIdentityKey(device.identityKey) && isU32(device.deviceId),
+                );
+            if (cachedUsable) {
+                emitDevices(handle, member, cached.devices);
+                continue;
+            }
+
+            // Nothing cached either: fall back to the bare handle rather than
+            // silently dropping the member. The primary is still reachable; its
+            // linked devices are not, and the caller can surface that.
             emit({
                 accountHandle: handle,
                 deviceId: 0,
@@ -324,14 +532,38 @@ export async function resolveGroupRecipients({
             continue;
         }
 
-        for (const device of devices) {
+        // Verification proves the list was signed by the account; it does not
+        // prove every entry decodes to a usable key. A single malformed device
+        // makes the whole list unusable — emitting a key that is not a 33-byte
+        // 0x05 Curve25519 key would put an undecryptable wrapper in the roster
+        // and, worse, could displace the genuine device at that address. Report
+        // the member as partially covered and fall back to its roster key.
+        const malformed = devices.find(
+            (device) => !isWellFormedIdentityKey(device.identityKey) || !isU32(device.deviceId),
+        );
+        if (malformed !== undefined) {
             emit({
                 accountHandle: handle,
+                deviceId: 0,
+                identityKey: member.identityKey,
+                address: handle,
+            });
+            unresolvedMembers.push(handle);
+            console.warn('group recipients: member device list contains a malformed device', {
+                handleRef: handleRef(handle),
+                reason: 'verification-failed',
+            });
+            continue;
+        }
+
+        appliedLists.set(handle, {
+            version: verified.version,
+            devices: devices.map((device) => ({
                 deviceId: device.deviceId,
                 identityKey: device.identityKey,
-                address: deviceAddress(handle, device.deviceId),
-            });
-        }
+            })),
+        });
+        emitDevices(handle, member, devices);
     }
 
     for (const device of ownDevices) {
@@ -344,5 +576,5 @@ export async function resolveGroupRecipients({
         });
     }
 
-    return { recipients, unresolvedMembers };
+    return { recipients, unresolvedMembers, appliedVersions, appliedLists };
 }

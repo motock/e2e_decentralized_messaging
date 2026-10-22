@@ -625,6 +625,67 @@ describe('resolveGroupRecipients', () => {
             warn.mockRestore();
         }
     });
+
+    it('returns the verified list contents so the caller can cache them', async () => {
+        const aliceDevice2 = key(0x02);
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList([
+                { deviceId: 0, identityKey: key(0x01) },
+                { deviceId: 2, identityKey: aliceDevice2 },
+            ]),
+        );
+
+        const result = await resolveGroupRecipients({
+            members: [{ accountHandle: 'alice', identityKey: key(0xa1) }],
+            ownDevices: [],
+            ownAccountHandle: 'me',
+            currentDeviceId: 0,
+            discovery: transportWith({ alice: SIGNED_BLOB }),
+        });
+
+        const cached = result.appliedLists.get('alice');
+        expect(cached?.version).toBe(1);
+        expect(cached?.devices.map((device) => device.deviceId)).toEqual([0, 2]);
+        expect(cached?.devices[1].identityKey).toEqual(aliceDevice2);
+    });
+
+    it('resolves from the cached list when the served version is not newer', async () => {
+        // The floor makes the served v1 list "not newer", so lookupDeviceList
+        // returns null. The cached contents must still reach the linked device.
+        const aliceDevice2 = key(0x02);
+        mocks.verify_device_list.mockReturnValue(
+            verifiedList([
+                { deviceId: 0, identityKey: key(0x01) },
+                { deviceId: 2, identityKey: aliceDevice2 },
+            ]),
+        );
+        const result = await resolveGroupRecipients({
+            members: [{ accountHandle: 'alice', identityKey: key(0xa1) }],
+            ownDevices: [],
+            ownAccountHandle: 'me',
+            currentDeviceId: 0,
+            discovery: transportWith({ alice: SIGNED_BLOB }),
+            heldVersions: new Map([['alice', 1]]),
+            heldLists: new Map([
+                [
+                    'alice',
+                    {
+                        version: 1,
+                        devices: [
+                            { deviceId: 0, identityKey: key(0x01) },
+                            { deviceId: 2, identityKey: aliceDevice2 },
+                        ],
+                    },
+                ],
+            ]),
+        });
+
+        expect(result.unresolvedMembers).toEqual([]);
+        expect(result.recipients.map((recipient) => recipient.address)).toEqual([
+            'alice',
+            'alice:2',
+        ]);
+    });
 });
 
 /** True when `value` is, or structurally contains, raw bytes. */
